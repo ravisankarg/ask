@@ -1,0 +1,25 @@
+.gradle-user/
+.cargo-home/
+.native-target/
+.gradle/
+build/
+**/build/
+.cxx/
+local.properties
+.idea/
+*.iml
+__pycache__/
+*.py[cod]
+.DS_Store
+.agents/
+.codex/
+*.apk
+*.aab
+*.tvim
+*.tv
+native/askgalaxy-native/target/
+.hf-cache/
+model-artifacts/
+# Local legacy GGUF experiment; the shipped app uses LiteRT-LM and does not
+# compile or package this vendored tree.
+app/src/main/cpp/third_party/

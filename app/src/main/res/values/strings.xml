@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ask Galaxy</string>
+    <string name="personal_context_service_label">Ask Galaxy personal context</string>
+</resources>

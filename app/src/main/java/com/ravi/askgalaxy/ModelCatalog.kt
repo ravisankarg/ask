@@ -1,0 +1,149 @@
+package com.ravi.askgalaxy
+
+import android.content.Context
+import java.io.File
+
+data class ModelArtifact(
+    val name: String,
+    val relativePath: String,
+    val runtime: String,
+    val required: Boolean,
+    val downloadUrl: String? = null,
+    val packagedAssetPath: String? = null,
+    val expectedBytes: Long = 0L,
+    val sha256: String? = null,
+    val sourceLabel: String = "Automatic background download",
+) {
+    fun file(context: Context): File = File(context.filesDir, relativePath)
+    fun partFile(context: Context): File = File(context.filesDir, "$relativePath.part")
+
+    fun isInstalled(context: Context): Boolean {
+        val target = file(context)
+        return target.isFile && (expectedBytes <= 0L || target.length() == expectedBytes)
+    }
+
+    fun hasDownloadSource(): Boolean = !downloadUrl.isNullOrBlank()
+}
+
+object ModelCatalog {
+    val siglipVision = ModelArtifact(
+        name = "SigLIP2 ViT-B/16 224 image encoder",
+        relativePath = "models/siglip2/siglip2_base_224_fp16.tflite",
+        runtime = "LiteRT FP16",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/SigLIP2-base-patch16-224/resolve/8444633b1c0570814ea6074ae09fcb8734ff79f0/siglip2_base_224_fp16.tflite?download=true",
+        packagedAssetPath = "siglip2_base_224_fp16.tflite",
+        expectedBytes = 185_437_744L,
+        sha256 = "a30ebb7b3ee15eaa68a18f9ab6a2ed740c15c343d25d898dc482317473320854",
+        sourceLabel = "LiteRT Community direct SigLIP2 FP16 artifact, pinned revision",
+    )
+
+    val siglipText = ModelArtifact(
+        name = "SigLIP2 ViT-B/16 224 text encoder",
+        relativePath = "models/siglip2/siglip2_text_224_wi8.tflite",
+        runtime = "LiteRT weight-only INT8",
+        required = true,
+        packagedAssetPath = "siglip2_text_224_wi8.tflite",
+        expectedBytes = 485_673_120L,
+        sha256 = "e8f2ab209cb23df590565ae4c39cd89c97124d52fca767c705bb3fc2038fcc45",
+        sourceLabel = "Generated from the pinned SigLIP2 text-only checkpoint; weight-only INT8",
+    )
+
+    val siglipTokenizer = ModelArtifact(
+        name = "SigLIP2 text tokenizer",
+        relativePath = "models/siglip2/tokenizer.json",
+        runtime = "Rust tokenizers BPE",
+        required = true,
+        downloadUrl = "https://huggingface.co/m-toman/siglip2-base-patch16-224-text/resolve/7deedba28e0edb4fa9c22c889509447ddce7b23c/tokenizer.json?download=true",
+        packagedAssetPath = "tokenizer.json",
+        expectedBytes = 34_363_039L,
+        sha256 = "cb9140fae3ac5122c972d37adf83e1248471a38147ad76f8215c8872c6fd8322",
+        sourceLabel = "Same pinned SigLIP2 text-only repository revision",
+    )
+
+    val ocrDetector = ModelArtifact(
+        name = "PP-OCRv5 detector",
+        relativePath = "models/ocr/ppocrv5_det_fp16.tflite",
+        runtime = "LiteRT",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocr_det_fp16.tflite?download=true",
+        expectedBytes = 10_094_464L,
+        sha256 = "b635b1d7f0e171a19beda7e8f386a62d4f0a3a1c46ed42a09603a902f2059ccc",
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val ocrRecognizer = ModelArtifact(
+        name = "PP-OCRv5 recognizer",
+        relativePath = "models/ocr/ppocrv5_rec_fp16.tflite",
+        runtime = "LiteRT",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocr_rec_fp16.tflite?download=true",
+        expectedBytes = 17_173_552L,
+        sha256 = "ef7bb5aba20a1717101f0f112dd8cb1ed8b043ebaf96af05a395c6905ca66456",
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val ocrDictionary = ModelArtifact(
+        name = "PP-OCRv5 dictionary",
+        relativePath = "models/ocr/ppocrv5_dict.txt",
+        runtime = "Kotlin OCR decoder",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocrv5_dict.txt?download=true",
+        expectedBytes = 74_012L,
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val faceDetector = ModelArtifact(
+        name = "YuNet face detector",
+        relativePath = "models/face/yunet_fp16.tflite",
+        runtime = "LiteRT",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/YuNet-Face-LiteRT/resolve/1931986764a60851e641956294b569bea5dd818d/yunet_fp16.tflite?download=true",
+        expectedBytes = 256_228L,
+        sha256 = "ced5f52bef6e76ad4a66d1055b2b404336ceafbae8eeac8fed6aa9c7b2e4d776",
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val faceEmbedder = ModelArtifact(
+        name = "FaceNet 512-D face embedding model",
+        relativePath = "models/face/facenet_512.tflite",
+        runtime = "LiteRT FLOAT32",
+        required = true,
+        downloadUrl = "https://raw.githubusercontent.com/shubham0204/FaceRecognition_With_FaceNet_Android/48493131e12c4c171c7ea531da476428ba5959c8/app/src/main/assets/facenet_512.tflite",
+        packagedAssetPath = "facenet_512.tflite",
+        expectedBytes = 24_394_880L,
+        sha256 = "4ff97d406893bc4aae2d922c28287045d58fa9fbcbfeb731b975fd2debbf1a80",
+        sourceLabel = "Pinned Apache-2.0 Android FaceNet TFLite artifact",
+    )
+
+    val gemma = ModelArtifact(
+        name = "Gemma 4 E4B instruction",
+        relativePath = "models/gemma-4-E4B-it.litertlm",
+        runtime = "LiteRT-LM",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/f7ad3343bd6ebc9607f4dc3bc4f2398bd5749bc5/gemma-4-E4B-it.litertlm?download=true",
+        expectedBytes = 3_659_530_240L,
+        sha256 = "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0",
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val all: List<ModelArtifact> = listOf(
+        siglipVision,
+        siglipText,
+        siglipTokenizer,
+        ocrDetector,
+        ocrRecognizer,
+        ocrDictionary,
+        faceDetector,
+        faceEmbedder,
+        gemma,
+    )
+
+    fun installedCount(context: Context): Int = all.count { it.isInstalled(context) }
+
+    fun missingRequired(context: Context): List<ModelArtifact> =
+        all.filter { it.required && !it.isInstalled(context) }
+
+    fun missingSources(context: Context): List<ModelArtifact> =
+        missingRequired(context).filterNot { it.hasDownloadSource() }
+}
