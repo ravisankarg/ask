@@ -59,6 +59,7 @@ class MainActivity : Activity() {
     private var expandedSourceId: String? = null
     private var facePromptRequested = false
     private var searchReady = false
+    private var plannerPreloadStarted = false
     private var resultAdapter: SearchResultAdapter? = null
     private var lastSubmittedQuery = ""
     private var lastSubmittedAtMs = 0L
@@ -76,18 +77,51 @@ class MainActivity : Activity() {
         PreparationNotifier.createChannel(this)
         galleryIndexer = GalleryIndexer(this)
         setContentView(createContent())
-        if (!PreparationStore(this).read().isPrepared) {
-            PreparationScheduler.enqueue(this)
-        }
         if (!hasGalleryPermission()) {
-            requestPermissions(galleryPermissions(), PERMISSION_REQUEST)
+            requestPermissions(galleryPermissions(), GALLERY_PERMISSION_REQUEST)
+        } else if (!requestPhotoLocationPermissionIfNeeded()) {
+            startBackgroundMaintenance()
         }
         refreshPreparation()
+    }
+
+    private fun startBackgroundMaintenance() {
+        GemmaDownloadScheduler.enqueueIfNeeded(this)
+        val preparation = PreparationStore(this).read()
+        val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
+        val visualWorkerStale =
+            !visual.completed &&
+                visual.current > 0L &&
+                visual.updatedAtMs > 0L &&
+                System.currentTimeMillis() - visual.updatedAtMs > STALE_WORKER_TIMEOUT_MS
+        if (!preparation.isPrepared) {
+            if (visualWorkerStale) {
+                PreparationScheduler.restart(this)
+            } else {
+                PreparationScheduler.enqueue(this)
+            }
+        } else {
+            // OCR has an independent versioned index and can migrate in the
+            // background without rerunning the rest of gallery preparation.
+            OcrReindexScheduler.enqueueIfNeeded(this)
+        }
+        LocationReindexScheduler.enqueueIfNeeded(this)
+    }
+
+    private fun requestPhotoLocationPermissionIfNeeded(): Boolean {
+        if (!MediaLocationAccess.shouldRequest(this)) return false
+        MediaLocationAccess.markRequested(this)
+        requestPermissions(
+            arrayOf(Manifest.permission.ACCESS_MEDIA_LOCATION),
+            LOCATION_PERMISSION_REQUEST,
+        )
+        return true
     }
 
     override fun onResume() {
         super.onResume()
         facePromptRequested = false
+        LocationReindexScheduler.enqueueIfNeeded(this)
         handler.post(refresh)
     }
 
@@ -113,10 +147,12 @@ class MainActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == PERMISSION_REQUEST) {
-            if (!PreparationStore(this).read().isPrepared) {
-                PreparationScheduler.enqueue(this)
-            }
+        if (requestCode == GALLERY_PERMISSION_REQUEST) {
+            if (hasGalleryPermission() && requestPhotoLocationPermissionIfNeeded()) return
+            startBackgroundMaintenance()
+            refreshPreparation()
+        } else if (requestCode == LOCATION_PERMISSION_REQUEST) {
+            startBackgroundMaintenance()
             refreshPreparation()
         }
     }
@@ -132,13 +168,34 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
+        val titleGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val title = TextView(this).apply {
             text = "Ask Galaxy"
             textSize = 30f
             setTextColor(Color.rgb(17, 19, 25))
             setTypeface(typeface, Typeface.BOLD)
         }
-        header.addView(title, LinearLayout.LayoutParams(0, dp(56), 1f))
+        titleGroup.addView(title, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            dp(56),
+        ))
+        titleGroup.addView(TextView(this).apply {
+            text = "v${BuildConfig.VERSION_NAME}"
+            textSize = 12f
+            setTextColor(Color.rgb(91, 95, 110))
+            gravity = Gravity.CENTER
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+            background = roundedBackground(Color.rgb(240, 242, 248), dp(12).toFloat())
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply {
+            leftMargin = dp(9)
+        })
+        header.addView(titleGroup, LinearLayout.LayoutParams(0, dp(56), 1f))
         header.addView(ImageButton(this).apply {
             setImageResource(android.R.drawable.ic_menu_manage)
             setContentDescription("Settings")
@@ -426,7 +483,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
         )
         // Keep the full search browser ahead of the bounded answer context.
-        // The 16 images selected for Gemma must never look like a replacement
+        // The 8 records selected for Gemma must never look like a replacement
         // for the user-visible result set.
         resultPanel.addView(sourcePanel, matchWrap())
         searchPanel.addView(
@@ -446,12 +503,32 @@ class MainActivity : Activity() {
 
     private fun refreshPreparation() {
         val snapshot = PreparationStore(this).read()
-        preparationProgress.isIndeterminate = snapshot.total <= 0L && !snapshot.isReady
-        preparationProgress.progress = snapshot.percent
+        val indexPrepared = snapshot.isPrepared
+        val gemmaReady = ModelCatalog.gemma.isInstalled(this)
+        val gemmaPart = ModelCatalog.gemma.partFile(this)
+        val gemmaBytes = gemmaPart.takeIf { it.isFile }?.length() ?: 0L
+        val gemmaPercent = if (ModelCatalog.gemma.expectedBytes > 0L) {
+            ((gemmaBytes * 100L) / ModelCatalog.gemma.expectedBytes).toInt().coerceIn(0, 100)
+        } else {
+            0
+        }
         val waitingForFaceTags = snapshot.phase == PreparationPhase.WAITING_FOR_FACE_TAGS
-        val ready = snapshot.isReady
+        val ready = snapshot.isReady && gemmaReady
+        val gemmaOnly = indexPrepared && !gemmaReady
+        preparationProgress.isIndeterminate = if (gemmaOnly) false else snapshot.total <= 0L && !ready
+        preparationProgress.progress = if (gemmaOnly) gemmaPercent else snapshot.percent
         preparationStatus.text = if (waitingForFaceTags) {
-            "Face groups are ready. Review the complete set once, merge duplicates, then name the people you know."
+            if (gemmaOnly) {
+                "Face groups are ready. Gemma 4 is still downloading (${gemmaPercent}%). You can review groups now."
+            } else {
+                "Face groups are ready. Review the complete set once, merge duplicates, then name the people you know."
+            }
+        } else if (gemmaOnly) {
+            if (gemmaBytes > 0L) {
+                "Gallery index is ready. Installing Gemma 4: ${formatBytes(gemmaBytes)} / ${formatBytes(ModelCatalog.gemma.expectedBytes)}"
+            } else {
+                "Gallery index is ready. Gemma 4 download is queued…"
+            }
         } else {
             snapshot.message
         }
@@ -460,13 +537,36 @@ class MainActivity : Activity() {
         searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
         if (ready && !searchReady) {
             searchReady = true
-            GemmaRuntime.preloadPlannerAsync(this, QueryPlannerRuntime.plannerSystemInstruction())
             SigLipTextEncoder.preloadAsync(this)
             NativeVectorIndex.preloadAsync(this)
         } else if (!ready) {
             searchReady = false
+            plannerPreloadStarted = false
+        }
+        if (ready && !plannerPreloadStarted) {
+            // Gemma occupies several GiB of mapped/native state on the target
+            // device. Do not make it compete with the one-time OCR migration;
+            // a user search can still load it on demand.
+            val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
+                .getOrDefault(Int.MAX_VALUE)
+            if (pendingOcr == 0) {
+                plannerPreloadStarted = true
+                GemmaRuntime.preloadPlannerAsync(
+                    this,
+                    QueryPlannerRuntime.plannerSystemInstruction(),
+                )
+            }
         }
         if (waitingForFaceTags && !facePromptRequested) refreshFacePrompt()
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1_024L * 1_024L) return "${bytes / 1_024L} KB"
+        return String.format(
+            java.util.Locale.US,
+            "%.1f GB",
+            bytes / (1_024.0 * 1_024.0 * 1_024.0),
+        )
     }
 
     private fun search() {
@@ -513,11 +613,8 @@ class MainActivity : Activity() {
                     setModelLoading(
                         true,
                         when (progress.stage) {
-                            SearchStage.QUERY_PLANNING -> if (GemmaRuntime.isModelInstalled(this)) {
+                            SearchStage.QUERY_PLANNING ->
                                 "Gemma 4 E4B is planning this query locally…"
-                            } else {
-                                "Preparing the local search query…"
-                            }
                             SearchStage.QUERY_PLANNED -> {
                                 renderQpOutput(progress.effectivePlanJson)
                                 renderTimeStats(progress.timings, "Planning")
@@ -533,11 +630,7 @@ class MainActivity : Activity() {
                             }
                             SearchStage.DIVERSE_EVIDENCE -> {
                                 renderTimeStats(progress.timings, "Search")
-                                if (progress.answerEvidenceScope.needsVisual) {
-                                    "Choosing up to 16 diverse evidence images from ${progress.candidateCount} matches…"
-                                } else {
-                                    "Preparing ${progress.answerEvidenceScope.label()} evidence from the top ${progress.candidateCount} matches…"
-                                }
+                                "Preparing answer context across ${progress.candidateCount} matches…"
                             }
                         },
                     )
@@ -546,10 +639,17 @@ class MainActivity : Activity() {
         ) { result ->
             runOnUiThread {
                 if (generation != searchGeneration) return@runOnUiThread
-                val response = result.getOrElse {
+                val response = result.getOrElse { error ->
                     setModelLoading(false, "")
                     renderQpFailure()
-                    answer.text = "Search paused while the on-device index is unavailable."
+                    answer.text = if (
+                        error.message.orEmpty().contains("Gemma 4 E4B", ignoreCase = true) ||
+                        error.cause?.message.orEmpty().contains("Gemma 4 E4B", ignoreCase = true)
+                    ) {
+                        "Gemma 4 E4B couldn't prepare this search query yet."
+                    } else {
+                        "Search paused while the on-device index is unavailable."
+                    }
                     return@runOnUiThread
                 }
                 renderQpOutput(response.effectivePlanJson)
@@ -566,18 +666,25 @@ class MainActivity : Activity() {
                 } else {
                     answer.text = "I found relevant personal context."
                 }
-                val imageCount = (response.answerGallery.size.takeIf { it > 0 } ?: response.gallery.size)
-                    .coerceAtMost(16)
-                val evidenceLabel = response.answerEvidenceScope.label()
-                val hasVisualContext = imageCount > 0
+                val contextCount = response.answerContext?.items?.size
+                    ?: response.answerGallery.size.coerceAtMost(8)
+                val hasVisualContext = response.answerContext?.includeVisuals == true &&
+                    contextCount > 0
+                val visualCount = if (hasVisualContext) {
+                    contextCount.coerceAtMost(
+                        QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_LIMIT,
+                    )
+                } else {
+                    0
+                }
                 setModelLoading(
                     true,
                     if (hasVisualContext && response.personalContext.isNotEmpty()) {
-                        "Gemma 4 E4B is joining up to $imageCount diverse images with $evidenceLabel and personal context…"
+                        "Gemma 4 E4B is joining $visualCount downscaled scenery images with $contextCount text records and personal context…"
                     } else if (hasVisualContext) {
-                        "Gemma 4 E4B is joining up to $imageCount diverse images with $evidenceLabel…"
+                        "Gemma 4 E4B is joining $visualCount downscaled scenery images with $contextCount text records…"
                     } else {
-                        "Gemma 4 E4B is reading scoped $evidenceLabel evidence…"
+                        "Gemma 4 E4B is reading $contextCount scoped OCR/metadata record${if (contextCount == 1) "" else "s"}…"
                     },
                 )
                 galleryIndexer.answerAsync(text, response) { answerResult ->
@@ -589,7 +696,7 @@ class MainActivity : Activity() {
                                 answer.text = it.text.ifBlank {
                                     "I couldn't find enough photos or details to answer that yet."
                                 }
-                                // The top-16 Context Picker output is private
+                                // The top-8 Context Picker output is private
                                 // answer input, not a second user-facing result
                                 // set. Keep only the full search browser visible.
                                 sourcePanel.visibility = View.GONE
@@ -672,7 +779,7 @@ class MainActivity : Activity() {
         val phaseRows = listOf(
             "Query planning" to timings.queryPlanningMs,
             "Search / hybrid retrieval" to timings.searchMs,
-            "Top 16 multimodal reranking" to timings.diverseRerankingMs,
+            "Top 8 context selection" to timings.diverseRerankingMs,
             "Evidence curation" to timings.evidenceCurationMs,
             "Answer generation" to timings.answerGenerationMs,
             "Follow-up query/actions" to timings.followUpMs,
@@ -1057,9 +1164,11 @@ class MainActivity : Activity() {
     )
 
     companion object {
-        private const val PERMISSION_REQUEST = 1001
+        private const val GALLERY_PERMISSION_REQUEST = 1001
+        private const val LOCATION_PERMISSION_REQUEST = 1002
         private const val MAX_SOURCE_DETAIL_CHARS = 1_400
         private const val RESULT_THUMBNAIL_CACHE_KB = 24 * 1024
+        private const val STALE_WORKER_TIMEOUT_MS = 2 * 60 * 1_000L
     }
 
     private data class ResultViewHolder(

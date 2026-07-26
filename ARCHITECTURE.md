@@ -21,19 +21,24 @@ Nominatim fallback receives coordinates rounded to roughly 110 m. The fallback
 is serialized below one request per second, is switchable in Settings, and
 never receives photo pixels, OCR, faces, filenames, or query text. Successful
 readable places are cached durably and searched locally afterwards.
+On Android 10+, photo EXIF is opened only after `ACCESS_MEDIA_LOCATION`
+consent through `MediaStore.setRequireOriginal()`; a redacted ordinary URI is
+never persisted as an authoritative no-GPS result.
 
-The preparation owner is a WorkManager `CoroutineWorker` promoted to a
-`dataSync` foreground service. It holds a partial wake lock while actively
-transferring or indexing, persists model downloads as `*.part` files, renames
-only verified files into place, and records every indexing batch in SQLite.
+Gallery preparation and Gemma provisioning are separate WorkManager
+`CoroutineWorker`s promoted to `dataSync` foreground services. They hold a
+partial wake lock while actively transferring or indexing, persist model
+downloads as `*.part` files, rename only verified files into place, and record
+every indexing batch in SQLite. This lets visual/OCR/face/location/episode
+indexing begin while the multi-gigabyte Gemma artifact is still downloading.
 The Activity is only a viewer of this state; closing it does not cancel work.
 
-CPU-bound OCR and face extraction use a conservative pool of up to two worker
-threads, with one independent LiteRT interpreter per worker. Interpreter input
-and output buffers are never shared across workers; SQLite writes are serialized
-and progress reporting is monotonic. Each interpreter also uses LiteRT/XNNPACK
-internal threads, while the large Gemma session remains single-session to keep
-memory pressure predictable.
+CPU-bound visual, OCR, and face extraction use one isolated interpreter per
+available CPU worker. Model state and buffers are never shared across workers;
+SQLite and native vector writes are serialized, and progress reporting is
+monotonic. The large Gemma session remains single-session to keep memory
+pressure predictable. Settings can clear/rebuild each derived index separately;
+face rebuilds also refresh dependent episodes.
 
 All arm64 native libraries are linked with 16 KiB maximum/common page sizes,
 and the APK is checked with `zipalign -P 16`.
@@ -60,7 +65,7 @@ The model emits a floating-point vector. TurboQuant performs native 4-bit compre
 | `litert-community/SigLIP2-base-patch16-224` | direct LiteRT FP16 image encoder | normalized 768-D image embeddings |
 | `m-toman/siglip2-base-patch16-224-text` | separately generated LiteRT weight-only INT8 text encoder | normalized 768-D query embeddings |
 | same pinned text source | `tokenizer.json` through Rust `tokenizers` | exact 64-token, 256k-vocabulary BPE IDs |
-| PP-OCRv5 mobile | LiteRT detector + recognizer | OCR text stored in searchable SQLite metadata |
+| ML Kit Text Recognition v2 Latin `16.0.1` | bundled on-device model | confidence-gated OCR text stored in searchable SQLite metadata |
 | YuNet + FaceNet-512 | LiteRT exports | face boxes, 512-D embeddings, anonymous cluster IDs |
 | `google/gemma-4-E4B-it` | quantized LiteRT-LM `.litertlm` | resident query planner, scoped answer, and follow-ups |
 
@@ -88,36 +93,73 @@ vector space from the 768-D SigLIP image space. After all pending face vectors
 are written, an on-device cosine-centroid clustering pass creates stable
 anonymous `person-*` groups. Existing group labels are reused when a refreshed
 centroid matches, while the raw vectors remain encrypted by an Android Keystore
-AES-GCM key.
+AES-GCM key. One additive `is_self` marker may identify exactly one normally
+named cluster as the user. It survives matching rebuilds and lets the planner
+resolve presence-oriented `I`/`me`/`my` references without treating ordinary
+document phrases such as “my passport” or “I spent” as face constraints.
 
 Gemma 4 E4B through LiteRT-LM is the only planner and answer path. No separate
 GGUF planner is downloaded or loaded; SigLIP, OCR, and faces remain independent
 indexing/retrieval components.
 
+OCR preserves input aspect ratio. Ordinary photos use EXIF-oriented pixels;
+very tall or wide inputs are region-decoded into overlapping 2048px strips.
+ML Kit line confidence and a document-structure gate reject isolated short
+hallucinations while retaining prices and punctuation inside credible
+documents. Database v11 persists an engine/preprocessing `ocr_signature`.
+`OcrReindexWorker` updates only stale image OCR rows and their derived
+`doc`/`scenary` class; it never rebuilds locations, visual vectors, faces,
+clusters, or episodes.
+
+Database v12 repairs the orthogonal photo-location contract. It invalidates
+only image GPS/place fields that older builds read through redacted MediaStore
+URIs. `LocationReindexWorker` reopens original EXIF, rejects the `0°,0°`
+missing-GPS sentinel, reverse geocodes/cache readable places, and leaves OCR,
+vectors, faces, clusters, and episodes untouched.
+
 ## Search path
 
 ```text
 user query
-  -> deterministic or Gemma QP emits the same C-like execution AST
+  -> Gemma 4 E4B emits one query_category plus the C-like execution AST
   -> recursive `,` / `+` / `-` / `&&` execution with postfix date/place sorting
   -> Rust BPE tokenizer emits fixed 64 INT32 IDs
   -> SigLIP2 text encoder emits a normalized 768-D query vector
-  -> resident TurboQuant searches the aligned image index (up to 100)
-  -> SQLite executes indexed OCR, person, MIME, capture-date, and readable-place branches
+  -> persisted OCR-derived doc/scenary or metadata class creates a hard allowlist
+  -> resident TurboQuant searches the aligned image index (up to 512 candidates,
+     accepting cosine scores >= 0.10 when confident matches exist; otherwise a
+     positive-only nearest-neighbor fallback publishes up to 200 candidates
+     inside the accumulated category/person/date/location/MIME allowlist)
+  -> SQLite executes planner-authored OCR keywords with OR recall plus exact
+     person, MIME, capture-date, and readable-place branches
+  -> doc retrieval fuses SigLIP semantic similarity + OCR keyword score;
+     rows present in both branches receive an additive rank boost
   -> the full bounded match set is returned newest-first to the virtualized UI
   -> optional encrypted personal-context matcher runs only for a context scope
   -> persisted episode membership supplies cross-event diversity at query time
-  -> Context Picker chooses at most 16 images across relevance, episode, visual,
-     OCR, person, place, metadata, and timeline novelty
-  -> one EXIF-correct 4x4 visual board joins those images with named face anchors
+  -> Context Picker chooses at most 8 eligible records without decoding images;
+     scenery alone uses persisted SigLIP embedding diversity
+  -> doc/person/location/time use text only; scenery may attach up to 4
+     images downscaled to a 512 px longest edge
   -> a clean Gemma 4 answer conversation writes the answer and follow-ups
 ```
 
-The answer evidence scope controls which metadata/OCR/personal-context fields
-are authoritative; it does not suppress the bounded visual board. Planner and
-answer conversations share the resident Gemma engine, but not the planner turn:
+The Gemma-emitted category controls search eligibility, answer metadata fields,
+and whether bounded scenery inputs are attached. Planner and answer conversations share
+the resident Gemma engine, but not the planner turn:
 only the stable planner prefill is reused for query planning, which prevents
 planner syntax and routing language from leaking into the natural-language answer.
+The frozen QP and language graph stay on CPU. Only Gemma's image
+encoder/adapter uses the LiteRT GPU backend, with a CPU-vision initialization
+fallback for unsupported devices; this keeps the individual visual inputs below the
+Samsung CPU-only process-memory spike. The answer prompt groups identical
+structured rows and carries only category-selected metadata/OCR, reducing
+prefill without removing any of the Context Picker's selected records.
+The planner date gate rejects `from_date`/`to_date` unless the original query
+contains explicit temporal intent; it requests one Gemma repair rather than
+silently treating an undated query as today. A single exact day requires both
+inclusive endpoints to equal that day, preventing a lone `from_date` from
+widening retrieval into every later date.
 
 The image vector index is built locally. While the search field is available, the
 resident TurboQuant handle, SigLIP text tower, and Gemma 4 planner preface are
@@ -150,8 +192,9 @@ user enables Personal context + Android notification access
 
 The answer model may use bounded internal source labels to keep its multimodal
 context aligned, but `AnswerTextSanitizer` removes those labels from user-visible
-prose. The UI always presents the full bounded search browser rather than the
-private top-16 Context Picker set. Answers are limited to 2–3 natural sentences,
+prose, model-reasoning tags, and task echoes. The UI always presents the full
+bounded search browser rather than the private top-8 Context Picker set.
+Answers are limited to 2–3 natural sentences without synthetic browse filler,
 followed by useful contextual queries. Notification access is optional, can be
 disabled independently, and the Settings screen can clear the personal-context
 store without touching the gallery index.
@@ -162,7 +205,7 @@ Preparation is gated by a persisted flow state:
 MediaStore scan + metadata
   -> capture date/GPS extraction + cached online reverse geocoding
   -> SigLIP image embeddings
-  -> PP-OCRv5 text extraction
+  -> bundled ML Kit OCR with aspect-preserving long-image tiles
   -> YuNet + FaceNet-512 embeddings
   -> anonymous cosine clustering only when new/unassigned faces invalidate it
   -> persisted episodes from time + readable place + anonymous people

@@ -31,6 +31,7 @@ data class TaggedFaceOccurrence(
 data class StoredFaceCluster(
     val clusterId: String,
     val label: String,
+    val isSelf: Boolean,
     val centroid: FloatArray,
     val representativeMediaStoreId: Long,
     val faceCount: Int,
@@ -40,6 +41,7 @@ data class StoredFaceCluster(
 data class FaceCluster(
     val clusterId: String,
     val label: String,
+    val isSelf: Boolean,
     val faceCount: Int,
     val representative: GalleryMedia,
     val representativeBox: FaceBox? = null,
@@ -48,6 +50,7 @@ data class FaceCluster(
 data class FaceClusterAssignment(
     val clusterId: String,
     val label: String,
+    val isSelf: Boolean,
     val centroid: FloatArray,
     val representativeMediaStoreId: Long,
     val representativeFaceId: Long,

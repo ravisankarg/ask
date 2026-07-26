@@ -272,10 +272,13 @@ class FaceClustersActivity : Activity() {
         if (!inventoryLoaded) return
         val unnamed = clusters.count { it.label.isBlank() }
         val named = clusters.size - unnamed
+        val selfCluster = clusters.firstOrNull { it.isSelf }
         val isMerge = stage == FaceTaggingStage.MERGE
 
         instructions.text = if (isMerge) {
             "This is the complete cluster set. Select every group that belongs to one person, then merge them together. You can repeat without a changing top-list."
+        } else if (selfCluster == null && clusters.isNotEmpty()) {
+            "First identify yourself: tap Name on your face group, enter one name, and select “This is me.” Ask Galaxy will map I, me, my, mine, and myself to that one person."
         } else if (named < FaceTaggingPolicy.MIN_NAMED_GROUPS_FOR_SKIP && unnamed > 0) {
             "Tap Name beside the important people. Name at least ${FaceTaggingPolicy.MIN_NAMED_GROUPS_FOR_SKIP} groups to unlock Skip; the complete inventory remains available."
         } else {
@@ -284,6 +287,8 @@ class FaceClustersActivity : Activity() {
         status.text = when {
             clusters.isEmpty() -> "No face groups were found in the indexed gallery."
             isMerge -> "All ${clusters.size} groups • ${selectedClusterIds.size} selected"
+            selfCluster != null && unnamed > 0 ->
+                "You: ${selfCluster.label} • $named named • $unnamed remaining"
             unnamed == 0 -> "All ${clusters.size} groups are named."
             named >= FaceTaggingPolicy.MIN_NAMED_GROUPS_FOR_SKIP ->
                 "$named named • $unnamed remaining • all ${clusters.size} groups shown"
@@ -299,14 +304,21 @@ class FaceClustersActivity : Activity() {
             else -> "Merge selected groups"
         }
         mergeProgressRow.visibility = if (mergeInProgress) View.VISIBLE else View.GONE
-        continueButton.visibility = if (clusters.isEmpty()) View.GONE else View.VISIBLE
-        continueButton.text = if (isMerge) "Continue to naming" else "Finish face tagging"
-        continueButton.isEnabled = !mergeInProgress && (isMerge || unnamed == 0)
-        skipButton.visibility = if (
-            !isMerge &&
+        val canFinish = !isMerge && unnamed == 0
+        val canSkip = !isMerge &&
             unnamed > 0 &&
             named >= FaceTaggingPolicy.MIN_NAMED_GROUPS_FOR_SKIP
-        ) View.VISIBLE else View.GONE
+        continueButton.visibility = if (
+            clusters.isEmpty() || (!isMerge && !canFinish)
+        ) {
+            View.GONE
+        } else {
+            View.VISIBLE
+        }
+        continueButton.text = if (isMerge) "Continue to naming" else "Finish face tagging"
+        continueButton.isEnabled = !mergeInProgress && (isMerge || canFinish)
+        skipButton.visibility = if (canSkip) View.VISIBLE else View.GONE
+        skipButton.isEnabled = !mergeInProgress && canSkip
         clusterList.isEnabled = !mergeInProgress && clusters.isNotEmpty()
         clusterAdapter.notifyDataSetChanged()
     }
@@ -349,12 +361,27 @@ class FaceClustersActivity : Activity() {
             selectAll()
             setPadding(dp(16), dp(4), dp(16), dp(4))
         }
+        val selfCheck = CheckBox(this).apply {
+            text = "This is me"
+            isChecked = cluster.isSelf
+            textSize = 16f
+            setTextColor(Color.rgb(29, 32, 42))
+            setPadding(dp(4), dp(8), 0, 0)
+        }
         val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(4), dp(20), 0)
             addView(
                 input,
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)),
             )
+            addView(selfCheck, matchWrap())
+            addView(TextView(this@FaceClustersActivity).apply {
+                text = "Use this one identity for I, me, my, mine, and myself in gallery queries."
+                textSize = 13f
+                setTextColor(Color.rgb(91, 94, 105))
+                setPadding(dp(12), 0, dp(8), dp(4))
+            }, matchWrap())
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle(if (cluster.label.isBlank()) "Name this person" else "Update name")
@@ -370,17 +397,28 @@ class FaceClustersActivity : Activity() {
                     return@setOnClickListener
                 }
                 input.isEnabled = false
+                selfCheck.isEnabled = false
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
-                galleryIndexer.saveFaceClusterLabelAsync(cluster.clusterId, label) { result ->
+                galleryIndexer.saveFaceClusterIdentityAsync(
+                    cluster.clusterId,
+                    label,
+                    selfCheck.isChecked,
+                ) { result ->
                     runOnUiThread {
                         if (result.isSuccess) {
                             clusters = clusters.map {
-                                if (it.clusterId == cluster.clusterId) it.copy(label = label) else it
+                                when {
+                                    it.clusterId == cluster.clusterId ->
+                                        it.copy(label = label, isSelf = selfCheck.isChecked)
+                                    selfCheck.isChecked -> it.copy(isSelf = false)
+                                    else -> it
+                                }
                             }
                             dialog.dismiss()
                             refreshUiState()
                         } else {
                             input.isEnabled = true
+                            selfCheck.isEnabled = true
                             input.error = "Couldn't save this name. Try again."
                             dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = true
                         }
@@ -466,8 +504,14 @@ class FaceClustersActivity : Activity() {
                 else selectedClusterIds -= cluster.clusterId
                 refreshUiState()
             }
-            holder.title.text = cluster.label.ifBlank { "Face group ${position + 1}" }
-            holder.count.text = "${cluster.faceCount} appearance${if (cluster.faceCount == 1) "" else "s"}"
+            holder.title.text = if (cluster.isSelf) {
+                "${cluster.label.ifBlank { "Face group ${position + 1}" }} · Me"
+            } else {
+                cluster.label.ifBlank { "Face group ${position + 1}" }
+            }
+            holder.count.text =
+                "${cluster.faceCount} appearance${if (cluster.faceCount == 1) "" else "s"}" +
+                    if (cluster.isSelf) " • your identity" else ""
             holder.name.visibility = if (stage == FaceTaggingStage.TAG) View.VISIBLE else View.GONE
             holder.name.text = if (cluster.label.isBlank()) "Name" else "Edit"
             holder.name.setOnClickListener { showNameDialog(cluster) }

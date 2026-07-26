@@ -1,5 +1,6 @@
 package com.ravi.askgalaxy
 
+import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
@@ -25,8 +26,12 @@ class SettingsActivity : Activity() {
     private lateinit var summary: TextView
     private lateinit var progress: ProgressBar
     private lateinit var models: TextView
+    private lateinit var ocrStatus: TextView
+    private lateinit var locationStatus: TextView
+    private lateinit var locationPermissionButton: Button
     private lateinit var personalContextStatus: TextView
     private lateinit var personalContextToggle: Switch
+    private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
     private val handler = Handler(Looper.getMainLooper())
     private val contextExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var updatingContextToggle = false
@@ -57,6 +62,18 @@ class SettingsActivity : Activity() {
     override fun onDestroy() {
         contextExecutor.shutdown()
         super.onDestroy()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == LOCATION_PERMISSION_REQUEST) {
+            LocationReindexScheduler.enqueueIfNeeded(this)
+            refreshState()
+        }
     }
 
     private fun createContent(): ScrollView {
@@ -103,6 +120,125 @@ class SettingsActivity : Activity() {
         root.addView(models, wrap())
 
         root.addView(TextView(this).apply {
+            text = "Preparation progress"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Each pipeline stage reports its own progress and estimated remaining time."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        IndexProgressStage.entries.forEach { stage ->
+            val label = TextView(this).apply {
+                textSize = 13f
+                setTextColor(Color.rgb(60, 63, 72))
+                setPadding(0, 10, 0, 2)
+            }
+            val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                max = 100
+                setPadding(0, 0, 0, 2)
+            }
+            stageProgressViews[stage] = StageProgressView(label, bar)
+            root.addView(label, wrap())
+            root.addView(bar, wrap())
+        }
+
+        root.addView(TextView(this).apply {
+            text = "Index maintenance"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Each action affects only the selected derived index. Gallery metadata, permissions, and unrelated indexes remain intact. Rebuilds run in the foreground and can resume after interruption."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        val visualRebuildButton = Button(this).apply {
+            text = "Clear and rebuild visual search"
+            setAllCaps(false)
+        }
+        visualRebuildButton.setOnClickListener {
+            confirmIsolatedRebuild(
+                button = visualRebuildButton,
+                index = IsolatedIndex.VISUAL,
+                title = "Rebuild visual search?",
+                message = "This clears only the SigLIP visual vector index and recomputes it. OCR, faces, locations, episodes, and gallery metadata are preserved.",
+            )
+        }
+        root.addView(visualRebuildButton, wrap())
+        val faceRebuildButton = Button(this).apply {
+            text = "Clear and rebuild face index"
+            setAllCaps(false)
+        }
+        faceRebuildButton.setOnClickListener {
+            confirmIsolatedRebuild(
+                button = faceRebuildButton,
+                index = IsolatedIndex.FACE,
+                title = "Rebuild face index?",
+                message = "This reruns face detection and embeddings, then refreshes face groups and dependent photo episodes. Existing names are matched where possible.",
+            )
+        }
+        root.addView(faceRebuildButton, wrap())
+        val episodeRebuildButton = Button(this).apply {
+            text = "Rebuild photo episodes only"
+            setAllCaps(false)
+        }
+        episodeRebuildButton.setOnClickListener {
+            confirmIsolatedRebuild(
+                button = episodeRebuildButton,
+                index = IsolatedIndex.EPISODE,
+                title = "Rebuild photo episodes?",
+                message = "This replaces only the derived episode headers and memberships. Media metadata, OCR, visual vectors, and faces are preserved.",
+            )
+        }
+        root.addView(episodeRebuildButton, wrap())
+
+        root.addView(TextView(this).apply {
+            text = "Text recognition"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Bundled ML Kit reads text offline from aspect-preserving photo and screenshot tiles. Rebuilding here changes only OCR text and the doc/scenary label; visual search, places, faces, and episodes are preserved."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        ocrStatus = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(90, 93, 103))
+            setPadding(0, 8, 0, 6)
+        }
+        root.addView(ocrStatus, wrap())
+        root.addView(Button(this).apply {
+            text = "Rebuild text index only"
+            setAllCaps(false)
+            setOnClickListener {
+                isEnabled = false
+                contextExecutor.execute {
+                    val count = runCatching {
+                        OcrReindexScheduler.rebuild(this@SettingsActivity)
+                    }.getOrDefault(0)
+                    runOnUiThread {
+                        isEnabled = true
+                        Toast.makeText(
+                            this@SettingsActivity,
+                            "Refreshing text for $count photos in the background.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        refreshState()
+                    }
+                }
+            }
+        }, wrap())
+
+        root.addView(TextView(this).apply {
             text = "Photo location enrichment"
             textSize = 20f
             setTypeface(typeface, Typeface.BOLD)
@@ -113,6 +249,56 @@ class SettingsActivity : Activity() {
             textSize = 14f
             setTextColor(Color.rgb(72, 75, 85))
             setLineSpacing(3f, 1f)
+        }, wrap())
+        locationStatus = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(90, 93, 103))
+            setPadding(0, 8, 0, 6)
+        }
+        root.addView(locationStatus, wrap())
+        locationPermissionButton = Button(this).apply {
+            text = "Allow precise photo locations"
+            setAllCaps(false)
+            setOnClickListener {
+                if (MediaLocationAccess.hasPermission(this@SettingsActivity)) {
+                    return@setOnClickListener
+                }
+                MediaLocationAccess.markRequested(this@SettingsActivity)
+                requestPermissions(
+                    arrayOf(Manifest.permission.ACCESS_MEDIA_LOCATION),
+                    LOCATION_PERMISSION_REQUEST,
+                )
+            }
+        }
+        root.addView(locationPermissionButton, wrap())
+        root.addView(Button(this).apply {
+            text = "Rebuild photo locations only"
+            setAllCaps(false)
+            setOnClickListener {
+                if (!MediaLocationAccess.hasPermission(this@SettingsActivity)) {
+                    Toast.makeText(
+                        this@SettingsActivity,
+                        "Allow precise photo locations first.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    return@setOnClickListener
+                }
+                isEnabled = false
+                contextExecutor.execute {
+                    val count = runCatching {
+                        LocationReindexScheduler.rebuild(this@SettingsActivity)
+                    }.getOrDefault(0)
+                    runOnUiThread {
+                        isEnabled = true
+                        Toast.makeText(
+                            this@SettingsActivity,
+                            "Refreshing locations for $count photos in the background.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        refreshState()
+                    }
+                }
+            }
         }, wrap())
         root.addView(Switch(this).apply {
             text = "Use OpenStreetMap fallback"
@@ -126,7 +312,7 @@ class SettingsActivity : Activity() {
                     this@SettingsActivity,
                     enabled,
                 )
-                if (enabled) PreparationScheduler.enqueue(this@SettingsActivity)
+                if (enabled) LocationReindexScheduler.enqueueIfNeeded(this@SettingsActivity)
             }
         }, wrap())
         root.addView(TextView(this).apply {
@@ -249,12 +435,99 @@ class SettingsActivity : Activity() {
         personalContextStatus.text = personalContextBaseStatus
         contextExecutor.execute {
             val count = runCatching { PersonalContextDatabase(this).use { it.count() } }.getOrDefault(0)
+            val pendingOcr = runCatching {
+                GalleryDatabase(this).use { it.pendingOcrCount() }
+            }.getOrDefault(-1)
+            val locationCounts = runCatching {
+                GalleryDatabase(this).use {
+                    it.pendingLocationCount() to it.resolvedLocationCount()
+                }
+            }.getOrDefault(-1 to -1)
+            val progressStore = IndexProgressStore(this)
+            if (ModelCatalog.gemma.isInstalled(this)) {
+                progressStore.update(
+                    IndexProgressStage.MODELS,
+                    ModelCatalog.gemma.expectedBytes,
+                    ModelCatalog.gemma.expectedBytes,
+                    completed = true,
+                )
+            }
+            val stageProgress = progressStore.readAll()
             runOnUiThread {
                 if (!isFinishing) {
+                    updateStageProgress(stageProgress)
                     personalContextStatus.text = "$personalContextBaseStatus Stored local records: $count."
+                    ocrStatus.text = when (pendingOcr) {
+                        0 -> "Text index is current."
+                        -1 -> "Text-index status is temporarily unavailable."
+                        else -> "Refreshing $pendingOcr photos in the background."
+                    }
+                    val hasLocationPermission =
+                        MediaLocationAccess.hasPermission(this@SettingsActivity)
+                    locationPermissionButton.isEnabled = !hasLocationPermission
+                    locationPermissionButton.text = if (hasLocationPermission) {
+                        "Precise photo location access granted"
+                    } else {
+                        "Allow precise photo locations"
+                    }
+                    locationStatus.text = when {
+                        !hasLocationPermission ->
+                            "Photo GPS is protected by Android. Allow access to index unredacted locations."
+                        locationCounts.first < 0 ->
+                            "Photo-location status is temporarily unavailable."
+                        locationCounts.first > 0 ->
+                            "Refreshing ${locationCounts.first} items. " +
+                                "${locationCounts.second} locations are currently resolved."
+                        else ->
+                            "Photo locations are current. " +
+                                "${locationCounts.second} GPS-tagged items have readable place names."
+                    }
                 }
             }
         }
+    }
+
+    private fun updateStageProgress(progress: Map<IndexProgressStage, StageProgress>) {
+        val now = System.currentTimeMillis()
+        stageProgressViews.forEach { (stage, views) ->
+            val state = progress[stage] ?: StageProgress()
+            views.bar.isIndeterminate = state.updatedAtMs > 0L &&
+                !state.completed && state.total <= 0L
+            views.bar.progress = state.percent
+            views.label.text = "${stage.label}  ·  ${formatStageProgress(stage, state, now)}"
+        }
+    }
+
+    private fun formatStageProgress(
+        stage: IndexProgressStage,
+        progress: StageProgress,
+        nowMs: Long,
+    ): String {
+        if (progress.completed) return "Complete"
+        if (progress.updatedAtMs == 0L) return "Waiting"
+        val counts = if (stage == IndexProgressStage.MODELS) {
+            "${formatBytes(progress.current)} / ${formatBytes(progress.total)}"
+        } else {
+            "${progress.current} / ${progress.total}"
+        }
+        val eta = progress.etaMs(nowMs)?.let { " • ETA ${formatDuration(it)}" }.orEmpty()
+        return "$counts (${progress.percent}%)$eta"
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1_024L * 1_024L) return "${bytes / 1_024L} KB"
+        return String.format(
+            java.util.Locale.US,
+            "%.1f GB",
+            bytes / (1_024.0 * 1_024.0 * 1_024.0),
+        )
+    }
+
+    private fun formatDuration(durationMs: Long): String {
+        val totalMinutes = durationMs / 60_000L
+        val hours = totalMinutes / 60L
+        val minutes = totalMinutes % 60L
+        return if (hours > 0L) "${hours}h ${minutes}m" else "${minutes}m"
     }
 
     private fun confirmClearPersonalContext() {
@@ -274,8 +547,52 @@ class SettingsActivity : Activity() {
             .show()
     }
 
+    private fun confirmIsolatedRebuild(
+        button: Button,
+        index: IsolatedIndex,
+        title: String,
+        message: String,
+    ) {
+        if (!PreparationStore(this).read().isPrepared) {
+            Toast.makeText(this, "Finish initial gallery preparation first.", Toast.LENGTH_LONG).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Clear and rebuild") { _, _ ->
+                button.isEnabled = false
+                contextExecutor.execute {
+                    val count = runCatching {
+                        IndexRebuildScheduler.rebuild(this@SettingsActivity, index)
+                    }.getOrDefault(-1)
+                    runOnUiThread {
+                        button.isEnabled = true
+                        val messageText = if (count >= 0) {
+                            "${index.displayName.replaceFirstChar { it.uppercase() }} rebuild started for $count rows."
+                        } else {
+                            "Could not start ${index.displayName} rebuild."
+                        }
+                        Toast.makeText(this, messageText, Toast.LENGTH_LONG).show()
+                        refreshState()
+                    }
+                }
+            }
+            .show()
+    }
+
     private fun wrap(): ViewGroup.LayoutParams = ViewGroup.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT,
     )
+
+    private data class StageProgressView(
+        val label: TextView,
+        val bar: ProgressBar,
+    )
+
+    private companion object {
+        const val LOCATION_PERMISSION_REQUEST = 2001
+    }
 }

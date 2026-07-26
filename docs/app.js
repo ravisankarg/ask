@@ -1,17 +1,32 @@
 const demos = [
   {
+    query: "How much was the Odyssey ticket?",
+    plan: "[query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == Odyssey ticket price total]]",
+    shown: "1",
+    count: "1"
+  },
+  {
+    query: "What is my passport number?",
+    plan: "[query_category == doc] && [[semantic == passport identity document] + [ocr == Ravi passport]]",
+    shown: "3",
+    count: "3"
+  },
+  {
     query: "Rvai phots at tem outng",
-    plan: "[person == Ravi] && [semantic == team outing] && [mime type == photos]",
+    plan: "[query_category == scenary] && [[person == Ravi] && [semantic == team outing] && [mime type == photos]]",
+    shown: "200",
     count: "1,284"
   },
   {
     query: "Ravi without glasses",
-    plan: "[[person == Ravi] && [mime type == photos]] - [semantic == glasses]",
+    plan: "[query_category == scenary] && [[[person == Ravi] && [mime type == photos]] - [semantic == glasses]]",
+    shown: "200",
     count: "342"
   },
   {
     query: "last Goa trip photos without Ramani",
-    plan: "[[[location == Goa] && [mime type == photos]] - [person == Ramani]] SORT_DATE",
+    plan: "[query_category == scenary] && [[[[location == Goa] && [mime type == photos]] - [person == Ramani]]] SORT_DATE",
+    shown: "76",
     count: "76"
   }
 ];
@@ -30,7 +45,8 @@ document.querySelector("#cycle-demo")?.addEventListener("click", () => {
   ).finished.then(() => {
     queryNode.textContent = demo.query;
     planNode.textContent = demo.plan;
-    countNode.innerHTML = `<strong>200</strong> of ${demo.count} matches`;
+    const label = demo.count === "1" ? "match" : "matches";
+    countNode.innerHTML = `<strong>${demo.shown}</strong> of ${demo.count} ${label}`;
     node.animate(
       [{ opacity: 0, transform: "translateY(-4px)" }, { opacity: 1, transform: "translateY(0)" }],
       { duration: 220, fill: "forwards" }

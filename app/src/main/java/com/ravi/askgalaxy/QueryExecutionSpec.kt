@@ -1,5 +1,7 @@
 package com.ravi.askgalaxy
 
+import java.time.LocalDate
+
 /**
  * Canonical query execution language.
  *
@@ -9,6 +11,69 @@ package com.ravi.askgalaxy
  */
 data class QueryExecutionSpec(val root: ExecutionNode) {
     fun render(): String = ExecutionSpecRenderer.render(root)
+
+    /** Validates that Gemma emitted exactly one supported category predicate. */
+    fun requiredQueryCategory(): QueryCategory {
+        val categories = ArrayList<ExecutionNode.Predicate>(1)
+        fun collectCategories(node: ExecutionNode) {
+            when (node) {
+                is ExecutionNode.Predicate -> {
+                    if (node.field == ExecutionField.QUERY_CATEGORY) categories += node
+                }
+                is ExecutionNode.Sorted -> collectCategories(node.value)
+                is ExecutionNode.Binary -> {
+                    collectCategories(node.left)
+                    collectCategories(node.right)
+                }
+            }
+        }
+        collectCategories(root)
+        require(categories.size == 1) { "Planner spec must contain exactly one query_category" }
+        val categoryPredicate = categories.single()
+        return requireNotNull(QueryCategory.fromWireName(categoryPredicate.value)) {
+            "query_category must be one of doc, scenary, person, location, time"
+        }
+    }
+
+    /**
+     * Normalizes Gemma's routing predicate without planning any user intent.
+     * All non-category predicates and operators remain model-authored.
+     */
+    fun canonicalizeCategoryEnvelope(): QueryExecutionSpec {
+        requiredQueryCategory()
+        lateinit var category: ExecutionNode.Predicate
+        fun withoutCategory(node: ExecutionNode): ExecutionNode? = when (node) {
+            is ExecutionNode.Predicate -> if (node.field == ExecutionField.QUERY_CATEGORY) {
+                category = node
+                null
+            } else {
+                node
+            }
+            is ExecutionNode.Sorted -> withoutCategory(node.value)?.let {
+                ExecutionNode.Sorted(it, node.sort)
+            }
+            is ExecutionNode.Binary -> {
+                val left = withoutCategory(node.left)
+                val right = withoutCategory(node.right)
+                when {
+                    left != null && right != null -> ExecutionNode.Binary(left, node.operator, right)
+                    left != null -> left
+                    right != null -> right
+                    else -> null
+                }
+            }
+        }
+        val retrieval = requireNotNull(withoutCategory(root)) {
+            "Planner spec must include a retrieval predicate after query_category"
+        }
+        return QueryExecutionSpec(
+            ExecutionNode.Binary(
+                category,
+                ExecutionBinaryOperator.INTERSECT,
+                retrieval,
+            ),
+        )
+    }
 
     companion object {
         fun parse(value: String): QueryExecutionSpec {
@@ -24,6 +89,24 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
                         }
                         require(node.value.length <= MAX_VALUE_CHARS) {
                             "Execution predicate is too long"
+                        }
+                        when (node.field) {
+                            ExecutionField.MIME_TYPE -> require(
+                                node.value == "photos" || node.value == "videos",
+                            ) {
+                                "mime type must be exactly photos or videos"
+                            }
+                            ExecutionField.FROM_DATE,
+                            ExecutionField.TO_DATE,
+                            -> require(runCatching { LocalDate.parse(node.value) }.isSuccess) {
+                                "${node.field.wireName} must be an ISO yyyy-MM-dd date"
+                            }
+                            ExecutionField.QUERY_CATEGORY -> require(
+                                QueryCategory.fromWireName(node.value) != null,
+                            ) {
+                                "query_category must be one of doc, scenary, person, location, time"
+                            }
+                            else -> Unit
                         }
                     }
                     is ExecutionNode.Sorted -> validate(node.value, depth + 1)
@@ -44,24 +127,28 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
 }
 
 enum class ExecutionField(val wireName: String) {
+    QUERY_CATEGORY("query_category"),
     PERSON("person"),
     MIME_TYPE("mime type"),
     FROM_DATE("from_date"),
     TO_DATE("to_date"),
     LOCATION("location"),
     SEMANTIC("semantic"),
+    OCR("ocr"),
     ;
 
     companion object {
         fun fromWireName(value: String): ExecutionField? = when (
             value.lowercase().replace(Regex("\\s+"), " ").trim()
         ) {
-            "person", "person name" -> PERSON
-            "mime", "mime type" -> MIME_TYPE
-            "from_date", "from date" -> FROM_DATE
-            "to_date", "to date" -> TO_DATE
-            "location", "place" -> LOCATION
-            "semantic", "semantic query" -> SEMANTIC
+            "query_category" -> QUERY_CATEGORY
+            "person" -> PERSON
+            "mime type" -> MIME_TYPE
+            "from_date" -> FROM_DATE
+            "to_date" -> TO_DATE
+            "location" -> LOCATION
+            "semantic" -> SEMANTIC
+            "ocr" -> OCR
             else -> null
         }
     }
@@ -340,16 +427,18 @@ private class ExecutionSpecParser(value: String) {
 }
 
 /**
- * Compiles the canonical AST into the bounded retrieval model. This is the
- * only bridge used by deterministic and LLM query processors.
+ * Compiles the Gemma planner AST into the bounded retrieval and answer-routing
+ * model. The required category is both answer routing metadata and a hard
+ * indexed retrieval scope; all predicates execute in [StructuredSearchExecutor].
  */
 object ExecutionSpecCompiler {
-    fun compile(
-        spec: QueryExecutionSpec,
-        answerScope: AnswerEvidenceScope,
-    ): QueryPlan {
+    fun compile(spec: QueryExecutionSpec): QueryPlan {
+        val canonicalSpec = spec.canonicalizeCategoryEnvelope()
+        val queryCategory = canonicalSpec.requiredQueryCategory()
         val semantic = ArrayList<String>()
         val negativeSemantic = ArrayList<String>()
+        val ocr = ArrayList<String>()
+        val negativeOcr = ArrayList<String>()
         val people = ArrayList<String>()
         val excludedPeople = ArrayList<String>()
         var mediaType: QueryMediaType? = null
@@ -362,16 +451,21 @@ object ExecutionSpecCompiler {
         fun visit(node: ExecutionNode, subtract: Boolean = false) {
             when (node) {
                 is ExecutionNode.Predicate -> when (node.field) {
+                    ExecutionField.QUERY_CATEGORY -> Unit
                     ExecutionField.PERSON ->
                         if (subtract) excludedPeople += node.value else people += node.value
                     ExecutionField.MIME_TYPE -> if (!subtract) {
-                        mediaType = QueryMediaType.fromToken(node.value)
+                        mediaType = requireNotNull(QueryMediaType.fromToken(node.value)) {
+                            "Invalid canonical MIME value '${node.value}'"
+                        }
                     }
                     ExecutionField.FROM_DATE -> if (!subtract) fromDate = node.value
                     ExecutionField.TO_DATE -> if (!subtract) toDate = node.value
                     ExecutionField.LOCATION -> if (!subtract) location = node.value
                     ExecutionField.SEMANTIC ->
                         if (subtract) negativeSemantic += node.value else semantic += node.value
+                    ExecutionField.OCR ->
+                        if (subtract) negativeOcr += node.value else ocr += node.value
                 }
                 is ExecutionNode.Sorted -> {
                     when (node.sort) {
@@ -389,20 +483,28 @@ object ExecutionSpecCompiler {
                 }
             }
         }
-        visit(spec.root)
+        visit(canonicalSpec.root)
+        val metadataFields = buildSet {
+            if (people.isNotEmpty() || excludedPeople.isNotEmpty()) add(AnswerMetadataField.PEOPLE)
+            if (fromDate.isNotBlank() || toDate.isNotBlank()) add(AnswerMetadataField.TIME)
+            if (location.isNotBlank()) add(AnswerMetadataField.LOCATION)
+        }
+        val answerScope = queryCategory.answerEvidenceScope()
+            .withMetadataFields(metadataFields)
         val cleanSemantic = semantic.distinctBy { it.lowercase() }
+        val cleanOcr = ocr.distinctBy { it.lowercase() }
         return QueryPlan(
             semanticQueries = cleanSemantic,
             metadataQueries = if (answerScope.needsMetadata || answerScope.needsOcr) {
-                cleanSemantic
+                (cleanSemantic + cleanOcr).distinctBy { it.lowercase() }
             } else {
                 emptyList()
             },
             personNames = people.distinctBy { it.lowercase() },
-            ocrTerms = if (answerScope.needsOcr) cleanSemantic else emptyList(),
+            ocrTerms = if (answerScope.needsOcr) cleanOcr else emptyList(),
             excludedPersonNames = excludedPeople.distinctBy { it.lowercase() },
             excludedOcrTerms = if (answerScope.needsOcr) {
-                negativeSemantic.distinctBy { it.lowercase() }
+                negativeOcr.distinctBy { it.lowercase() }
             } else {
                 emptyList()
             },
@@ -413,9 +515,10 @@ object ExecutionSpecCompiler {
             recentFirst = sortDate,
             sortByLocation = sortLocation,
             mediaType = mediaType,
+            queryCategory = queryCategory,
             needsPersonalContext = answerScope.needsPersonalContext,
             answerEvidenceScope = answerScope,
-            executionSpec = spec,
+            executionSpec = canonicalSpec,
         )
     }
 }

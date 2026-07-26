@@ -43,6 +43,7 @@ data class SearchResponse(
     val plannerSession: GemmaRuntime.ConversationSession? = null,
     val plannerJson: String = "",
     val effectivePlanJson: String = "",
+    val queryCategory: QueryCategory = QueryCategory.SCENARY,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
     val timings: PhaseTimings = PhaseTimings(),
 )

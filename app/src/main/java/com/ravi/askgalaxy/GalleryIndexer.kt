@@ -4,10 +4,6 @@ import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
 import android.provider.MediaStore
 import android.util.Log
 import java.io.ByteArrayOutputStream
@@ -58,6 +54,8 @@ class GalleryIndexer(context: Context) {
 
     fun count(): Long = database.count()
 
+    fun pendingOcrCount(): Int = database.pendingOcrCount()
+
     fun indexEmbeddingsAsync(onFinished: (Result<EmbeddingProgress>) -> Unit) {
         semanticIndexer.indexAsync(onFinished)
     }
@@ -106,10 +104,8 @@ class GalleryIndexer(context: Context) {
                             }.thenByDescending { it.mediaStoreId },
                         )
                         .take(UI_RESULT_LIMIT)
-                    // Publish a practical browsing window immediately. The
-                    // full retrieval pool continues into episode coverage and
-                    // the independent top-16 Context Picker.
-                    // joining, Context Picker reranking, or Gemma work.
+                    // Publish the practical browsing window before episode
+                    // joining, Context Picker reranking, or Gemma answer work.
                     runCatching { onMatches(uiGallery, candidates.size) }
                     val contextMatches = if (
                         searchExecution.answerEvidenceScope.needsPersonalContext &&
@@ -151,10 +147,9 @@ class GalleryIndexer(context: Context) {
                         evidenceCurationMs = elapsedMs(evidenceStarted, System.nanoTime()),
                     )
                     val diverseStarted = System.nanoTime()
-                    // Keep a small visual context set for every answer. The
-                    // planner still controls which metadata/OCR fields are
-                    // authoritative, but images help Gemma identify the
-                    // event behind a time/location/person question.
+                    // The picker always operates on indexed records. Scenery
+                    // alone uses persisted SigLIP embeddings for diversity;
+                    // no phase here opens or decodes an image.
                     val diversityCandidates = (
                         evidenceBuild.representativeCandidates + candidates
                         ).distinctBy { it.mediaStoreId }
@@ -163,11 +158,14 @@ class GalleryIndexer(context: Context) {
                         rankedCandidates = diversityCandidates,
                         evidenceGroups = evidenceBuild.contextGroups,
                         evidenceScope = searchExecution.answerEvidenceScope,
-                        maxImages = MAX_GEMMA_IMAGES,
+                        queryCategory = searchExecution.queryCategory,
+                        maxRecords = MAX_ANSWER_RECORDS,
                     )
                     Log.i(
                         TAG,
-                        "Context picker: selected=${answerContext.items.size}, fields=" +
+                        "Context picker: category=${answerContext.queryCategory.wireName}, " +
+                            "eligible=${answerContext.eligibleCandidateCount}/${answerContext.inputCandidateCount}, " +
+                            "selected=${answerContext.items.size}, visuals=${answerContext.includeVisuals}, fields=" +
                             answerContext.metadataFields.joinToString(",") { it.name.lowercase() } +
                             ", coverage=" + answerContext.items.joinToString(" ") { item ->
                             "${item.media.mediaStoreId}:${item.coverage.joinToString("+") { it.name.lowercase() }}"
@@ -193,13 +191,13 @@ class GalleryIndexer(context: Context) {
 
                     SigLipTextEncoder.releaseResident()
                     SearchResponse(
-                        // The result browser is independent from the top-16
+                        // The result browser is independent from the top-8
                         // answer context. Show up to 200 newest matches while
                         // retaining the full evaluated count.
                         gallery = uiGallery,
                         totalGalleryMatches = candidates.size,
                         personalContext = contextMatches.take(CONTEXT_ANSWER_LIMIT),
-                        answerGallery = answerContext.images,
+                        answerGallery = answerContext.records,
                         answerContext = answerContext,
                         evidenceRecords = emptyList(),
                         evidenceGroups = evidenceBuild.evidenceGroups.filter { group ->
@@ -211,6 +209,7 @@ class GalleryIndexer(context: Context) {
                         plannerSession = searchExecution.plannerSession,
                         plannerJson = searchExecution.plannerJson,
                         effectivePlanJson = searchExecution.effectivePlanJson,
+                        queryCategory = searchExecution.queryCategory,
                         answerEvidenceScope = searchExecution.answerEvidenceScope,
                         timings = timings,
                     )
@@ -230,13 +229,16 @@ class GalleryIndexer(context: Context) {
         }
     }
 
-    fun saveFaceClusterLabelAsync(
+    fun saveFaceClusterIdentityAsync(
         clusterId: String,
         label: String,
+        isSelf: Boolean,
         onFinished: (Result<Unit>) -> Unit = {},
     ) {
         executor.execute {
-            onFinished(runCatching { database.saveFaceClusterLabel(clusterId, label) })
+            onFinished(runCatching {
+                database.saveFaceClusterIdentity(clusterId, label, isSelf)
+            })
         }
     }
 
@@ -316,7 +318,8 @@ class GalleryIndexer(context: Context) {
             val plannerSession = response.plannerSession
             // The answer path deliberately uses a clean conversation; the
             // planner KV is no longer useful after retrieval. Release it
-            // before EXIF reads, bitmap boards, and answer prompt assembly so
+            // before EXIF reads, bounded scenery-image encoding, and answer
+            // prompt assembly so
             // those hot paths do not compete with a second KV cache.
             plannerSession?.close()
             val result = try {
@@ -327,77 +330,78 @@ class GalleryIndexer(context: Context) {
                 val evidenceScope = response.answerContext?.metadataFields
                     ?.let(response.answerEvidenceScope::withMetadataFields)
                     ?: response.answerEvidenceScope
-                val attachedResults = ArrayList<GalleryMedia>(MAX_GEMMA_IMAGES)
-                val loadedEvidence = ArrayList<Pair<GalleryMedia, Bitmap>>(MAX_GEMMA_IMAGES)
-                val visualGallery = (response.answerGallery.ifEmpty {
-                    response.gallery.take(MAX_GEMMA_IMAGES)
-                }).take(MAX_GEMMA_IMAGES)
-                val visualIds = visualGallery.map { it.mediaStoreId }.toSet()
-                val taggedFaceOccurrences = database.taggedFaceOccurrencesForMedia(
-                    visualIds.toLongArray(),
-                )
-                // The Context Picker is the complete answer context. Enrich
-                // only the fields its policy selected; never append a second
-                // uncurated metadata tail after the top-16 images.
-                val visualContextFields = response.answerContext?.metadataFields
-                    ?: evidenceScope.metadataFields
-                MediaBitmapLoader(appContext).use { loader ->
-                    visualGallery.forEach { media ->
-                        val enrichedMedia = metadataReader.enrich(media, visualContextFields)
-                        val bitmap = loader.load(
-                            enrichedMedia,
-                            maxDimension = 384,
-                            applyExifOrientation = true,
-                        )
-                            ?: return@forEach
-                        loadedEvidence += enrichedMedia to bitmap
-                    }
-                }
-                // G1..Gn must describe the same successfully decoded images
-                // that appear in the contact sheet. A failed decode must not
-                // shift the labels onto a different gallery record.
-                val attachedVisualResults = if (loadedEvidence.isNotEmpty()) {
-                    loadedEvidence.map { it.first }
-                } else {
-                    visualGallery.map { metadataReader.enrich(it, visualContextFields) }
-                }
-                val identityFaceEvidence = if (loadedEvidence.isNotEmpty()) {
-                    buildIdentityFaceEvidence(loadedEvidence, taggedFaceOccurrences)
+                val attachedResults = ArrayList<GalleryMedia>(MAX_ANSWER_RECORDS)
+                val answerImageLimit =
+                    QueryCategoryContextPolicy.answerImageLimit(response.queryCategory)
+                val loadedEvidence = ArrayList<Pair<GalleryMedia, Bitmap>>(answerImageLimit)
+                // A present AnswerContextBundle is authoritative even when its
+                // strict category filter found zero eligible rows. Never fall
+                // back to unrelated search results in that case.
+                val selectedContextRecords = (
+                    response.answerContext?.records
+                        ?: response.answerGallery.ifEmpty {
+                            response.gallery.take(MAX_ANSWER_RECORDS)
+                        }
+                    ).take(MAX_ANSWER_RECORDS)
+                val includeVisuals = answerImageLimit > 0 && (
+                    response.answerContext?.includeVisuals
+                        ?: response.answerEvidenceScope.needsVisual
+                    )
+                val visualGallery = if (includeVisuals) {
+                    selectedContextRecords.take(answerImageLimit)
                 } else {
                     emptyList()
                 }
-                attachedResults += attachedVisualResults
+                val visualIds = visualGallery.map { it.mediaStoreId }.toSet()
+                // The Context Picker is the complete answer context. Enrich
+                // only the fields its policy selected; never append a second
+                // uncurated metadata tail after the selected records.
+                val visualContextFields = response.answerContext?.metadataFields
+                    ?: evidenceScope.metadataFields
+                val enrichedContextRecords = selectedContextRecords.map {
+                    metadataReader.enrich(it, visualContextFields)
+                }
+                MediaBitmapLoader(appContext).use { loader ->
+                    enrichedContextRecords
+                        .filter { it.mediaStoreId in visualIds }
+                        .forEach { enrichedMedia ->
+                        val bitmap = loader.load(
+                            enrichedMedia,
+                            maxDimension =
+                                QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_MAX_DIMENSION,
+                            applyExifOrientation = true,
+                        )
+                            ?: return@forEach
+                        loadedEvidence += enrichedMedia to downscaleAnswerImage(bitmap)
+                    }
+                }
+                // Keep all eight selected OCR/metadata records even when only
+                // the first four scenery records receive image inputs.
+                attachedResults += enrichedContextRecords
+                val imageReferences = loadedEvidence.mapNotNull { (media, _) ->
+                    attachedResults.indexOfFirst { it.mediaStoreId == media.mediaStoreId }
+                        .takeIf { it >= 0 }
+                        ?.let { "G${it + 1}" }
+                }
                 val imageBytes = try {
-                    if (loadedEvidence.isEmpty()) {
-                        emptyList()
-                    } else {
-                        buildList {
-                            // Keep one multimodal image input: the upper half
-                            // is the gallery board and the lower half is the
-                            // labeled face board. This preserves joint visual
-                            // reasoning while avoiding a second vision
-                            // prefill and its large latency/memory cost.
-                            add(encodeGemmaEvidenceBoard(loadedEvidence, identityFaceEvidence))
-                        }
-                    }
+                    loadedEvidence.map { (_, bitmap) -> encodeGemmaImage(bitmap) }
                 } finally {
-                    identityFaceEvidence.forEach { face ->
-                        if (!face.bitmap.isRecycled) face.bitmap.recycle()
-                    }
                     loadedEvidence.forEach { (_, bitmap) ->
                         if (!bitmap.isRecycled) bitmap.recycle()
                     }
                 }
                 val richVisualIds = if (imageBytes.isNotEmpty()) {
-                    attachedVisualResults.map { it.mediaStoreId }.toSet()
+                    loadedEvidence.map { it.first.mediaStoreId }.toSet()
                 } else {
                     emptySet()
                 }
                 Log.i(
                     TAG,
-                    "Answer evidence scope=${evidenceScope.label()}, records=${attachedResults.size}, " +
+                    "Answer category=${response.queryCategory.wireName}, scope=${evidenceScope.label()}, " +
+                        "records=${attachedResults.size}, " +
                         "visualCandidates=${visualGallery.size}, decodedVisuals=${loadedEvidence.size}, " +
-                        "images=${imageBytes.size}, ocr=${evidenceScope.needsOcr}, metadata=${evidenceScope.needsMetadata}",
+                        "images=${imageBytes.size}, " +
+                        "ocr=${evidenceScope.needsOcr}, metadata=${evidenceScope.needsMetadata}",
                 )
                 check(imageBytes.isNotEmpty() || attachedResults.isNotEmpty() || response.personalContext.isNotEmpty()) {
                     "No readable result evidence for Gemma"
@@ -409,32 +413,22 @@ class GalleryIndexer(context: Context) {
                         query,
                         attachedResults,
                         response.personalContext,
-                        includeImages = imageBytes.isNotEmpty(),
+                        imageReferences = imageReferences,
                         evidenceScope = evidenceScope,
                         richVisualIds = richVisualIds,
-                        identityFaceReferences = identityFaceEvidence.map { it.reference },
                         evidenceGroups = response.evidenceGroups,
                     )
                     // The planner conversation contains the strict execution
                     // grammar and its previous turn. Reusing it for answers
-                    // lets that syntax leak into the answer, especially on
-                    // deterministic fast-path plans. Keep the Gemma engine
+                    // lets that syntax leak into the answer. Keep the Gemma engine
                     // resident, but create a clean answer conversation.
-                    var generated = generateGroundedAnswer(gemma, answerPrompt, imageBytes)
-                    if (looksLikePlannerOutput(generated)) {
-                        Log.w(TAG, "Gemma returned planner-shaped answer; retrying clean answer turn")
-                        generated = generateGroundedAnswer(
-                            gemma,
-                            "$answerPrompt\nIMPORTANT: Output only a natural-language gallery answer. Do not output JSON, routing keys, regex, a query plan, or the planner example.",
-                            imageBytes,
-                        )
-                    }
-                    if (looksLikePlannerOutput(generated)) {
-                        Log.e(TAG, "Gemma repeated planner-shaped answer; using grounded UI fallback")
-                        groundedAnswerFallback(query, attachedResults)
-                    } else {
-                        generated
-                    }
+                    generateCheckedAnswer(
+                        gemma = gemma,
+                        prompt = answerPrompt,
+                        images = imageBytes,
+                        query = query,
+                        results = attachedResults,
+                    )
                 } catch (multimodalError: RuntimeException) {
                     if (imageBytes.isEmpty()) throw multimodalError
                     // Some supported phone/runtime combinations reject the
@@ -443,25 +437,32 @@ class GalleryIndexer(context: Context) {
                     // selected evidence and answer from OCR/metadata rather
                     // than returning the generic UI failure.
                     Log.w(TAG, "Gemma vision path failed; retrying grounded text answer", multimodalError)
-                    generateGroundedAnswer(
-                        gemma,
+                    generateCheckedAnswer(
+                        gemma = gemma,
                         prompt = buildAnswerPrompt(
                             query,
                             attachedResults,
                             response.personalContext,
-                            includeImages = false,
+                            imageReferences = emptyList(),
                             evidenceScope = evidenceScope,
-                            richVisualIds = richVisualIds,
-                            identityFaceReferences = emptyList(),
+                            richVisualIds = emptySet(),
                             evidenceGroups = response.evidenceGroups,
                         ),
                         images = emptyList(),
+                        query = query,
+                        results = attachedResults,
                     )
                 }
                 val answerGenerationMs = elapsedMs(answerStarted, System.nanoTime())
                 check(output.isNotBlank()) { "Gemma returned an empty answer" }
                 val followUpStarted = System.nanoTime()
-                val parsed = parseAnswer(output)
+                val parsedOutput = parseAnswer(output)
+                val parsed = if (parsedOutput.text.isBlank()) {
+                    Log.w(TAG, "Gemma answer became empty after public-output sanitation; using grounded fallback")
+                    parsedOutput.copy(text = groundedAnswerFallback(query, attachedResults))
+                } else {
+                    parsedOutput
+                }
                 val followUps = (parsed.followUps + defaultFollowUps(
                     query,
                     attachedResults,
@@ -516,31 +517,20 @@ class GalleryIndexer(context: Context) {
             appContext,
             query,
             database.namedPersonLabelsForPlanning(),
+            database.selfPersonLabelForPlanning(),
         )
         // The planner KV is useful only for the planning turn. Answering uses
         // a clean conversation, so holding this session through SQLite,
         // native retrieval, and diversity only increases memory pressure.
         plannedQuery.session?.close()
         var plan = plannedQuery.plan
-        // Named people are hard retrieval constraints. Resolve planner output
-        // against actual local labels and also inspect the original query so
-        // one malformed planner response cannot widen a person search.
-        val personLabels = (
-            database.namedPersonLabelsMentioned(query) +
-                database.resolveNamedPersonLabels(
-                    plan.personNames.filter {
-                        QuerySpellingMatcher.isPlausibleCorrection(query, it)
-                    },
-                )
-            ).distinctBy { it.lowercase() }
-        val excludedPersonLabels = (
-            database.namedPersonLabelsNegated(query) +
-                database.resolveNamedPersonLabels(
-                    plan.excludedPersonNames.filter {
-                        QuerySpellingMatcher.isPlausibleCorrection(query, it)
-                    },
-                )
-            ).distinctBy { it.lowercase() }
+        // Gemma is the sole source of person predicates. The database only
+        // resolves those already-validated planner values to real local face
+        // labels; it never extracts an additional plan from the raw query.
+        val personLabels = database.resolveNamedPersonLabels(plan.personNames)
+            .distinctBy { it.lowercase() }
+        val excludedPersonLabels = database.resolveNamedPersonLabels(plan.excludedPersonNames)
+            .distinctBy { it.lowercase() }
         // A named-person query needs identity metadata even when the user
         // asks for time, location, or an activity. The image encoder cannot
         // tell Gemma that a face is "Ramani"; the local face tag is the
@@ -553,9 +543,6 @@ class GalleryIndexer(context: Context) {
             )
         }
         run {
-            val timeHint = plan.timeHint.ifBlank {
-                QueryScopeParser.explicitTimeHintFromQuery(query)
-            }
             val scopedSemanticQueries = (plan.semanticQueries + plan.assertions)
                 .map {
                     sanitizeSemanticQuery(
@@ -583,7 +570,6 @@ class GalleryIndexer(context: Context) {
                 personNames = personLabels,
                 excludedPersonNames = excludedPersonLabels,
                 negativeSemanticQueries = negativeSemanticQueries,
-                timeHint = timeHint,
                 executionSpec = resolvedExecutionSpec,
             )
             val executionSpec = effectivePlan.canonicalExecutionSpec()
@@ -594,6 +580,7 @@ class GalleryIndexer(context: Context) {
                     plannerSession = null,
                     plannerJson = plannedQuery.plannerJson,
                     effectivePlanJson = "(empty)",
+                    queryCategory = effectivePlan.queryCategory,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
                 )
             }
@@ -606,6 +593,7 @@ class GalleryIndexer(context: Context) {
                 plannerSession = null,
                 plannerJson = plannedQuery.plannerJson,
                 effectivePlanJson = renderedExecutionSpec,
+                queryCategory = effectivePlan.queryCategory,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
             )
         }
@@ -615,20 +603,18 @@ class GalleryIndexer(context: Context) {
         query: String,
         results: List<GalleryMedia>,
         contextMatches: List<PersonalContextMatch>,
-        includeImages: Boolean,
+        imageReferences: List<String>,
         evidenceScope: AnswerEvidenceScope,
         richVisualIds: Set<Long> = emptySet(),
-        identityFaceReferences: List<String> = emptyList(),
         evidenceGroups: List<EvidenceGroup> = emptyList(),
     ): String {
-        val evidence = results.mapIndexed { index, media ->
-            buildString {
-                append("G${index + 1}")
+        val includeImages = imageReferences.isNotEmpty()
+        val evidenceRows = results.mapIndexed { index, media ->
+            val label = "G${index + 1}"
+            val fields = buildString {
                 val richVisual = media.mediaStoreId in richVisualIds
-                append(if (richVisual) " visual_evidence=attached_tile" else " visual_evidence=not_attached")
-                val personTag = media.personLabel
-                    ?.take(MAX_PERSON_PROMPT_CHARS)
-                    ?.takeIf(String::isNotBlank)
+                append(if (richVisual) "visual=tile" else "visual=none")
+                val personTag = media.personLabel?.takeIf(String::isNotBlank)
                 if (personTag != null || evidenceScope.needsPeopleMetadata) {
                     append(" person=${personTag ?: "none"}")
                 }
@@ -637,11 +623,17 @@ class GalleryIndexer(context: Context) {
                     if (media.durationMs > 0L) append(" duration=${formatDuration(media.durationMs)}")
                 }
                 if (evidenceScope.needsTimeMetadata) {
-                    append(" capture_time=${formatDate(media.dateTakenMs)}")
-                    append(" modified_time=${formatModifiedDate(media.dateModifiedSeconds)}")
+                    val captureTime = formatDate(media.dateTakenMs)
+                    append(
+                        if (captureTime != "none") {
+                            " time=$captureTime"
+                        } else {
+                            " time=${formatModifiedDate(media.dateModifiedSeconds)} (modified)"
+                        },
+                    )
                 }
                 if (evidenceScope.needsLocationMetadata) {
-                    append(" location=${formatLocation(media)}")
+                    append(" place=${formatLocation(media)}")
                 }
                 if (evidenceScope.needsMetadata &&
                     !evidenceScope.needsTimeMetadata &&
@@ -650,25 +642,32 @@ class GalleryIndexer(context: Context) {
                 ) {
                     // Defensive fallback if a future metadata channel is
                     // added without a field mapping.
-                    append(" capture_time=${formatDate(media.dateTakenMs)}")
-                    append(" location=${formatLocation(media)}")
-                    append(" person=${media.personLabel?.take(MAX_PERSON_PROMPT_CHARS) ?: "none"}")
+                    append(" time=${formatDate(media.dateTakenMs)}")
+                    append(" place=${formatLocation(media)}")
+                    append(" person=${media.personLabel ?: "none"}")
                 }
                 // OCR is often the largest joined text field. Keep it for an
                 // explicit OCR/text question; scene/location/activity answers
                 // still receive pixels, people, time, and location without
                 // spending prompt budget on unrelated text.
                 if (evidenceScope.needsOcr) {
-                    append(" ocr=${ocrPromptSnippet(media.ocrText, query).ifBlank { "none" }}")
+                    val ocr = compactPromptText(media.ocrText)
+                        .replace('"', '\'')
+                        .ifBlank { "none" }
+                    append(" ocr=\"$ocr\"")
                 }
             }
-        }.joinToString("\n")
-        val attachedLabels = results.mapIndexedNotNull { index, media ->
-            if (media.mediaStoreId in richVisualIds) "G${index + 1}" else null
+            label to fields
         }
-        val structuredOnlyLabels = results.mapIndexedNotNull { index, media ->
-            if (media.mediaStoreId !in richVisualIds) "G${index + 1}" else null
-        }
+        // Collapse exact duplicate structured rows while retaining their join
+        // labels. This removes redundant structure without truncating any
+        // OCR or metadata text from the surviving row.
+        val evidence = evidenceRows
+            .groupBy(keySelector = { it.second }, valueTransform = { it.first })
+            .entries
+            .joinToString("\n") { (fields, labels) ->
+                "${labels.joinToString(",")} $fields"
+            }
         val episodeEvidence = evidenceGroups.mapIndexedNotNull { index, group ->
             val resultIndex = results.indexOfFirst {
                 it.mediaStoreId == group.representative.mediaStoreId
@@ -688,138 +687,87 @@ class GalleryIndexer(context: Context) {
                 "start=${formatDate(group.startTimeMs)} end=${formatDate(group.endTimeMs)} " +
                 "location=$location"
         }
-        val evidenceBuilderInstruction = if (episodeEvidence.isNotEmpty()) {
-            "Evidence builder pass: grouped the scoped candidates into exactly ${episodeEvidence.size} candidate episodes. For a how-many trip/event question, report this as the candidate-group count first, then say how many are visually supported as the requested event if that is smaller. Count E groups rather than raw near-duplicate photos, but call them candidate episodes unless the evidence proves distinct human trips. Use each representative G for visual confirmation and the supplied span/location for the episode summary."
-        } else {
-            ""
-        }
-        val identityEvidence = results.mapIndexedNotNull { index, media ->
-            media.personLabel
-                ?.take(MAX_PERSON_PROMPT_CHARS)
-                ?.takeIf(String::isNotBlank)
-                ?.let { "G${index + 1}=$it" }
-        }.joinToString(", ")
-        val identityInstruction = if (identityEvidence.isNotBlank()) {
-            "Identity links from the local face index (authoritative for names): $identityEvidence. Use person= tags to connect a name in Q to its G image; the name does not need to be visibly written in the pixels."
-        } else if (evidenceScope.needsPeopleMetadata) {
-            "No local person tag is available for these records, so do not assign a named identity from appearance alone."
-        } else {
-            ""
-        }
-        val identityFaceInstruction = if (identityFaceReferences.isNotEmpty()) {
-            "The lower half of the attached image is a labeled identity face board. Its tiles are ${identityFaceReferences.joinToString(", ")}. Compare those face crops with the people in the upper gallery board, then reason over the scene, metadata, OCR, and face links together in one answer. Face-board tiles are identity aids, not separate gallery sources."
-        } else {
-            ""
-        }
-        val answerDirective = answerDirective(query)
-        val contextEvidence = if (!evidenceScope.needsPersonalContext) {
-            "not requested"
-        } else if (contextMatches.isEmpty()) {
+        val answerDirective = answerDirective(query, includeImages)
+        val contextEvidence = if (contextMatches.isEmpty()) {
             "none"
         } else {
-            contextMatches.take(MAX_CONTEXT_PROMPT_ITEMS).mapIndexed { index, match ->
+            contextMatches.mapIndexed { index, match ->
                 val item = match.item
-                "C${index + 1} ${item.title.ifBlank { item.kind.displayName }.take(MAX_NAME_PROMPT_CHARS)} " +
-                    "${contextSummary(item).take(MAX_CONTEXT_PROMPT_CHARS)}"
+                "C${index + 1} ${item.title.ifBlank { item.kind.displayName }} " +
+                    contextSummary(item)
             }.joinToString("\n")
         }
-        val evidenceInstruction = buildString {
-            if (includeImages) {
-                append("Use the attached contact-sheet tiles as visual evidence when relevant.")
-                if (identityFaceReferences.isNotEmpty()) {
-                    append(" The upper half is the gallery contact sheet; the lower half is the labeled identity face board.")
-                }
-                if (attachedLabels.isNotEmpty()) {
-                    append(" Attached tiles: ${attachedLabels.joinToString(", ")} in the same order as the G labels.")
-                }
-                if (structuredOnlyLabels.isNotEmpty()) {
-                    append(" ${structuredOnlyLabels.joinToString(", ")} are structured-only records; do not describe their pixels or claim that they visibly show an activity.")
-                }
-            } else if (evidenceScope.needsVisual) {
-                append("Visual evidence is unavailable; do not make visual claims.")
-            } else {
-                append("Do not infer visual facts from filenames or metadata.")
-            }
-            if (evidenceScope.needsMetadata) {
-                append(" Use supplied structured metadata as authoritative and combine it with the images and identity tags:")
-                if (evidenceScope.needsPeopleMetadata) append(" people")
-                if (evidenceScope.needsTimeMetadata) append(" capture time")
-                if (evidenceScope.needsLocationMetadata) append(" location")
-                append(".")
-            }
-            if (evidenceScope.needsOcr) {
-                append(" Use only the supplied OCR text.")
-            }
-            if (richVisualIds.isNotEmpty()) {
-                append(" OCR and metadata on the selected visual records are supplementary joined evidence; use them when they help answer Q.")
-            }
-            if (episodeEvidence.isNotEmpty()) {
-                append(" Use the evidence-builder episode rows below as a curated multi-pass summary, not as extra images.")
-            }
-            if (evidenceScope.needsPersonalContext) {
-                append(" Use only the supplied personal context.")
-            }
-            append(" Answer directly when the joined evidence supports it. Do not open with a generic refusal when candidate records exist: lead with the closest useful date, place, or event, then state the confidence or limitation. For activity or appearance questions, call something confirmed only when an attached tile clearly supports it; otherwise say likely or adjacent and explain why. For when+activity questions, attach the activity claim to the strongest visual tile before giving its capture date; a metadata-only record can establish when a tagged person was present, but cannot prove what they were doing. If an exact fact is absent, say what the evidence does support instead of only saying that evidence is missing. Do not invent an exact identity or date.")
+        val inputInstruction = when {
+            includeImages ->
+                "IMAGE INPUTS: the four-or-fewer downscaled scenery images map in order to " +
+                    imageReferences.joinToString(", ") +
+                    " and are the only source for visible scene/activity claims."
+            evidenceScope.needsVisual ->
+                "IMAGE INPUTS: unavailable. Do not make scene/activity claims."
+            else ->
+                "METADATA ONLY: person/time/place fields do not prove a visible scene or activity."
         }
-        val sourceInstruction = if (includeImages) {
-            "Use attached tiles for visual claims and structured G records only for their supplied metadata. G/C/E/F labels are private join keys: never print or refer to them in the answer or follow-up questions."
+        val selectedFields = buildList {
+            if (evidenceScope.needsPeopleMetadata) add("person")
+            if (evidenceScope.needsTimeMetadata) add("time")
+            if (evidenceScope.needsLocationMetadata) add("place")
+            if (evidenceScope.needsOcr) add("OCR")
+        }.joinToString(", ").ifBlank { "visual" }
+        val contextBlock = if (evidenceScope.needsPersonalContext) {
+            "\nPERSONAL_CONTEXT:\n$contextEvidence"
         } else {
-            "Treat each G label as its matching structured gallery record. G/C/E/F labels are private join keys: never print or refer to them in the answer or follow-up questions."
+            ""
         }
-        return """
+        val episodeBlock = if (episodeEvidence.isNotEmpty()) {
+            "\nEPISODES:\n${episodeEvidence.joinToString("\n")}\n" +
+                "Count E rows, not duplicate photos, for event-count questions; call them candidate episodes unless visually confirmed."
+        } else {
+            ""
+        }
+        val prompt = """
             ANSWER_TASK:
-            Return only a natural-language answer. Never output JSON, routing keys, regex, code, or a query plan.
-            Do not mention "provided evidence", "supplied records", the prompt, the model, or internal reasoning. Speak directly about the photos and their details.
-            $evidenceInstruction
-            $identityInstruction
-            $identityFaceInstruction
-            $answerDirective
-            $evidenceBuilderInstruction
-            Treat each G record as joined evidence: attached image pixels describe the event or activity, person tags identify people, capture_time answers when, location answers where, and OCR supplies written text. Combine these channels before deciding that the answer is unavailable, but keep visual claims limited to the attached tiles.
-            ${if (evidenceScope.needsMetadata) {
-                buildString {
-                    if (evidenceScope.needsTimeMetadata) {
-                        append("For time questions prefer capture_time; use modified_time only when capture_time is none. ")
-                    }
-                    if (evidenceScope.needsLocationMetadata) {
-                        append("For where questions use location only when present. ")
-                    }
-                    if (evidenceScope.needsPeopleMetadata) {
-                        append("Use tagged people only when present. ")
-                    }
-                }.trim()
-            } else {
-                ""
-            }} $sourceInstruction
-            Q: $query
-            EVIDENCE:
+            QUESTION: $query
+            MODE: $answerDirective
+            INPUT: $inputInstruction
+            TRUSTED FIELDS: $selectedFields. Local person tags are authoritative; use capture time before a modified fallback; explicitly name relevant places.
+            RECORDS:
             $evidence
-            CONTEXT:
-            $contextEvidence
-            EVIDENCE_BUILDER:
-            ${episodeEvidence.ifEmpty { listOf("none") }.joinToString("\n")}
-            Reply in 2-3 concise, natural sentences and lead with the best supported answer. Never include source IDs such as G1, G2, C1, E1, or F1:
-            ANSWER: <answer>
+            $contextBlock$episodeBlock
+            Return a direct, natural 2-3 sentence summary. Use a calibrated caveat only for a missing exact fact.
+            ANSWER:
             FOLLOW_UPS:
-            QUERY: <interesting gallery question grounded in the matched people, day, event, or place>
-            Add at most 3 QUERY lines. Prefer questions such as who else was there, what happened through the whole day, or what other moments occurred at that place. Do not add source-review actions.
+            QUERY: <up to 3 short gallery questions about who else, that day, event, or place>
         """.trimIndent()
+        Log.i(
+            TAG,
+            "Answer prompt: chars=${prompt.length}, records=${results.size}, " +
+                "rows=${evidence.lineSequence().count()}, images=${imageReferences.size}, " +
+                "episodes=${episodeEvidence.size}, context=${contextMatches.size}",
+        )
+        return prompt
     }
 
-    private fun answerDirective(query: String): String {
+    private fun answerDirective(query: String, includeImages: Boolean): String {
         val normalized = query.lowercase().replace(Regex("\\s+"), " ").trim()
         return when {
+            Regex("\\b(how much|spend|spent|cost|price|amount|total|paid)\\b")
+                .containsMatchIn(normalized) ->
+                "DOCUMENT AMOUNT TASK: prioritize the record matching the requested title or merchant. Read its OCR labels and values together; prefer Total Amount or Grand Total over component fees or per-ticket prices. State the amount directly, and do not reject a matching ticket merely because no image is attached."
             Regex("\\b(when|date|dated|time)\\b").containsMatchIn(normalized) &&
                 Regex("\\b(go|went|doing|activity|swim|swimming|eat|eating|drink|drinking|run|running|play|playing|work|working|visit|visiting)\\b")
                     .containsMatchIn(normalized) ->
-                "ACTIVITY TIMELINE TASK: start with the strongest supported capture date(s) or closest event, then state whether the named activity is confirmed, likely, or only adjacent. Use the attached visual tiles to make that distinction; do not turn person presence in a metadata-only record into proof of the activity."
+                if (includeImages) {
+                    "ACTIVITY TIMELINE TASK: start with the strongest supported capture date(s) or closest event, then state whether the named activity is confirmed, likely, or only adjacent. Use the attached scenery images to make that distinction."
+                } else {
+                    "ACTIVITY TIMELINE TASK: answer only from OCR, capture time, place, and person tags. Do not turn person presence into proof of an activity."
+                }
             Regex("\\b(when|date|dated|born|birth|birthdate|birthday|year|today|yesterday)\\b")
                 .containsMatchIn(normalized) ->
-                "DATE/TIMELINE TASK: rank the strongest matching event dates from capture_time and the images. For birthdate/birthday questions, inspect the images for birthday cues such as cake, candles, or a celebration; do not use the earliest record as a birthdate proxy. Distinguish an exact birthdate from a birthday-event photo date; if the exact fact is not stored, give the strongest supported event-date candidate or shortlist and explain the distinction briefly."
+                "DATE/TIMELINE TASK: rank the strongest matching dates from capture_time and OCR. Do not use the earliest record as a birthdate proxy. Distinguish an exact printed date from a photo-event date; if the exact fact is not stored, give the strongest supported candidate or shortlist."
             Regex("\\b(where|location|place)\\b").containsMatchIn(normalized) ->
                 "LOCATION TASK: answer with the strongest supplied location details and explicitly name the place. If only GPS text or a partial place is available, present it naturally rather than discarding it."
             Regex("\\b(who|whose|person|people)\\b").containsMatchIn(normalized) ->
-                "IDENTITY TASK: use local person tags as the primary identity link, then use the image to describe what that person is doing or where they appear."
+                "IDENTITY TASK: use local person tags as the authoritative identity link and answer only from the joined person, place, time, and OCR fields."
             Regex("\\b(how many|count|number of|most|least)\\b").containsMatchIn(normalized) ->
                 "COUNT/RANK TASK: count or rank only the scoped records and explain the basis briefly; do not replace a count with a generic evidence disclaimer."
             Regex("\\b(compare|comparison|difference|versus| vs )\\b").containsMatchIn(normalized) ->
@@ -827,7 +775,11 @@ class GalleryIndexer(context: Context) {
             Regex("\\b(without|excluding|except|not|no)\\b").containsMatchIn(normalized) ->
                 "EXCLUSION TASK: answer from the positive set after applying the subtraction and state what remains instead of only describing the excluded set."
             else ->
-                "GENERAL TASK: synthesize the strongest visual, identity, metadata, OCR, and personal-context clues into a useful direct answer, with a calibrated caveat only where needed."
+                if (includeImages) {
+                    "GENERAL SCENERY TASK: synthesize the downscaled scenery images with the joined metadata into a useful direct answer."
+                } else {
+                    "GENERAL TEXT TASK: synthesize the strongest identity, metadata, OCR, and personal-context fields into a useful direct answer."
+                }
         }
     }
 
@@ -844,6 +796,30 @@ class GalleryIndexer(context: Context) {
         }
     }
 
+    private fun generateCheckedAnswer(
+        gemma: GemmaRuntime,
+        prompt: String,
+        images: List<ByteArray>,
+        query: String,
+        results: List<GalleryMedia>,
+    ): String {
+        var generated = generateGroundedAnswer(gemma, prompt, images)
+        if (looksLikePlannerOutput(generated)) {
+            Log.w(TAG, "Gemma returned task/planner-shaped answer; retrying clean answer turn")
+            generated = generateGroundedAnswer(
+                gemma,
+                "$prompt\nIMPORTANT: Return only the natural-language answer and QUERY follow-up lines. Do not repeat task text, JSON, routing keys, code, or a query plan.",
+                images,
+            )
+        }
+        return if (looksLikePlannerOutput(generated)) {
+            Log.e(TAG, "Gemma repeated task/planner-shaped answer; using grounded UI fallback")
+            groundedAnswerFallback(query, results)
+        } else {
+            generated
+        }
+    }
+
     private fun looksLikePlannerOutput(output: String): Boolean {
         val normalized = output.trim()
         if (normalized.isBlank()) return false
@@ -853,6 +829,8 @@ class GalleryIndexer(context: Context) {
             .replace("```", "")
             .trim()
         if (candidate.contains("PLANNER_TASK", ignoreCase = true) ||
+            candidate.contains("ANSWER_TASK", ignoreCase = true) ||
+            candidate.contains("EVIDENCE_BUILDER:", ignoreCase = true) ||
             candidate.contains("semantic_queries", ignoreCase = true) ||
             candidate.contains("person_names", ignoreCase = true) ||
             candidate.startsWith("+ semantic=") ||
@@ -873,201 +851,74 @@ class GalleryIndexer(context: Context) {
 
     private fun groundedAnswerFallback(query: String, results: List<GalleryMedia>): String {
         if (results.isEmpty()) {
-            return "I could not find matching photos or details for \"${query.take(MAX_NAME_PROMPT_CHARS)}\"."
+            return "I could not find matching gallery items or details for \"${query.take(MAX_NAME_PROMPT_CHARS)}\"."
         }
-        return "I found ${results.size} matching photo${if (results.size == 1) "" else "s"} for \"${query.take(MAX_NAME_PROMPT_CHARS)}\". The newest matches are ready to browse below."
-    }
-
-    private fun buildIdentityFaceEvidence(
-        loadedEvidence: List<Pair<GalleryMedia, Bitmap>>,
-        occurrences: List<TaggedFaceOccurrence>,
-    ): List<IdentityFaceEvidence> {
-        if (loadedEvidence.isEmpty() || occurrences.isEmpty()) return emptyList()
-        val loadedById = loadedEvidence.associateBy { it.first.mediaStoreId }
-        val sourceRank = loadedEvidence.mapIndexed { index, (media, _) -> media.mediaStoreId to index }.toMap()
-        val orientationById = MediaBitmapLoader(appContext).use { loader ->
-            loadedEvidence.associate { (media, _) ->
-                media.mediaStoreId to loader.readOrientation(media)
+        val places = results.asSequence()
+            .mapNotNull { it.locationName?.trim()?.takeIf(String::isNotBlank) }
+            .distinctBy(String::lowercase)
+            .take(2)
+            .toList()
+        val people = results.asSequence()
+            .flatMap { it.personLabel.orEmpty().split(',').asSequence() }
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinctBy(String::lowercase)
+            .take(2)
+            .toList()
+        val dates = results.mapNotNull(GalleryMedia::dateTakenMs).sorted()
+        val groundedDetails = buildList {
+            if (places.isNotEmpty()) {
+                add("The closest matches were taken in ${places.joinToString(" and ")}.")
+            }
+            if (people.isNotEmpty()) {
+                add("${people.joinToString(" and ")} ${if (people.size == 1) "appears" else "appear"} in these photos.")
+            }
+            if (dates.isNotEmpty()) {
+                val firstDate = formatDate(dates.first()).substringBefore(' ')
+                val lastDate = formatDate(dates.last()).substringBefore(' ')
+                add(
+                    if (firstDate == lastDate) {
+                        "They were captured on $firstDate."
+                    } else {
+                        "They span $firstDate to $lastDate."
+                    },
+                )
             }
         }
-        // One strong crop per distinct local name gives the model an identity
-        // anchor without flooding the multimodal token budget with repeats.
-        val chosen = occurrences
-            .filter { it.mediaStoreId in loadedById }
-            .groupBy { it.label.trim().lowercase() }
-            .values
-            .mapNotNull { group ->
-                group.sortedWith(
-                    compareByDescending<TaggedFaceOccurrence> { it.detectionScore }
-                        .thenBy { sourceRank[it.mediaStoreId] ?: Int.MAX_VALUE },
-                ).firstOrNull()
-            }
-            .sortedWith(
-                compareBy<TaggedFaceOccurrence> { sourceRank[it.mediaStoreId] ?: Int.MAX_VALUE }
-                    .thenByDescending { it.detectionScore },
-            )
-            .take(MAX_IDENTITY_FACE_CROPS)
-
-        return chosen.mapIndexedNotNull { faceIndex, occurrence ->
-            val sourceIndex = sourceRank[occurrence.mediaStoreId] ?: return@mapIndexedNotNull null
-            val bitmap = loadedById[occurrence.mediaStoreId]?.second ?: return@mapIndexedNotNull null
-            val orientedBox = ImageOrientation.transformBox(
-                occurrence.box,
-                orientationById[occurrence.mediaStoreId] ?: androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
-            )
-            val detection = FaceDetection(
-                box = FaceBox(
-                    left = orientedBox.left * bitmap.width,
-                    top = orientedBox.top * bitmap.height,
-                    right = orientedBox.right * bitmap.width,
-                    bottom = orientedBox.bottom * bitmap.height,
-                ),
-                landmarks = FloatArray(0),
-                score = occurrence.detectionScore,
-            )
-            val crop = runCatching { FaceCropper.crop(bitmap, detection) }.getOrNull()
-                ?: return@mapIndexedNotNull null
-            IdentityFaceEvidence(
-                reference = "F${faceIndex + 1}=${occurrence.label} from G${sourceIndex + 1}",
-                label = occurrence.label,
-                sourceLabel = "G${sourceIndex + 1}",
-                bitmap = crop,
-            )
+        val mediaNoun = when {
+            results.all { it.mimeType.startsWith("video/", ignoreCase = true) } -> "video"
+            results.all { it.mimeType.startsWith("image/", ignoreCase = true) } -> "photo"
+            else -> "gallery item"
+        }
+        return groundedDetails.take(2).joinToString(" ").ifBlank {
+            "I found ${results.size} close $mediaNoun${if (results.size == 1) "" else "s"} matching \"${query.take(MAX_NAME_PROMPT_CHARS)}\"."
         }
     }
 
-    /**
-     * Encodes gallery scenes and named face anchors into one bounded vision
-     * input. The split board makes the cross-reference explicit to Gemma,
-     * while one image prefill is materially cheaper than two independent
-     * multimodal inputs on the phone.
-     */
-    private fun encodeGemmaEvidenceBoard(
-        gallery: List<Pair<GalleryMedia, Bitmap>>,
-        faces: List<IdentityFaceEvidence>,
-    ): ByteArray {
-        val size = EVIDENCE_BOARD_SIZE
-        // Reserve the lower half only when there are identity anchors to show.
-        // A blank identity area would otherwise cut every scene tile in half
-        // for ordinary visual/location/time questions without improving
-        // grounding.
-        val hasFaceBoard = faces.isNotEmpty()
-        val galleryAreaHeight = if (hasFaceBoard) size / 2 else size
-        val galleryColumns = CONTACT_SHEET_COLUMNS
-        val galleryCell = galleryAreaHeight / galleryColumns
-        val faceColumns = IDENTITY_BOARD_COLUMNS
-        val faceRows = if (hasFaceBoard) {
-            (faces.size + faceColumns - 1) / faceColumns
-        } else {
-            0
-        }
-        val faceAreaTop = galleryAreaHeight
-        val faceCellWidth = size / faceColumns
-        val faceCellHeight = if (faceRows > 0) (size - faceAreaTop) / faceRows else 0
-        val sheet = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(sheet)
-        canvas.drawColor(Color.BLACK)
-        val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-        val labelBackgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(205, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-        val galleryLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = EVIDENCE_BOARD_GALLERY_LABEL_SIZE
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        val faceLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = EVIDENCE_BOARD_FACE_LABEL_SIZE
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        gallery.take(MAX_GEMMA_IMAGES).forEachIndexed { index, (_, bitmap) ->
-            val column = index % galleryColumns
-            val row = index / galleryColumns
-            val left = column * galleryCell + CONTACT_SHEET_GAP
-            val top = row * galleryCell + CONTACT_SHEET_GAP
-            val right = (column + 1) * galleryCell - CONTACT_SHEET_GAP
-            val bottom = (row + 1) * galleryCell - CONTACT_SHEET_GAP
-            val scale = minOf(
-                (right - left).toFloat() / bitmap.width,
-                (bottom - top).toFloat() / bitmap.height,
-            )
-            val width = bitmap.width * scale
-            val height = bitmap.height * scale
-            val imageLeft = left + ((right - left) - width) / 2f
-            val imageTop = top + ((bottom - top) - height) / 2f
-            canvas.drawBitmap(
-                bitmap,
-                null,
-                RectF(imageLeft, imageTop, imageLeft + width, imageTop + height),
-                imagePaint,
-            )
-            canvas.drawRect(
-                RectF(
-                    left.toFloat(),
-                    top.toFloat(),
-                    (left + EVIDENCE_BOARD_GALLERY_LABEL_WIDTH).toFloat(),
-                    (top + EVIDENCE_BOARD_GALLERY_LABEL_HEIGHT).toFloat(),
-                ),
-                labelBackgroundPaint,
-            )
-            canvas.drawText(
-                "G${index + 1}",
-                left + EVIDENCE_BOARD_LABEL_INSET,
-                top + EVIDENCE_BOARD_GALLERY_LABEL_BASELINE,
-                galleryLabelPaint,
-            )
-        }
-        faces.forEachIndexed { index, face ->
-            val column = index % faceColumns
-            val row = index / faceColumns
-            val left = column * faceCellWidth + IDENTITY_SHEET_GAP
-            val top = faceAreaTop + row * faceCellHeight + IDENTITY_SHEET_GAP
-            val right = (column + 1) * faceCellWidth - IDENTITY_SHEET_GAP
-            val bottom = faceAreaTop + (row + 1) * faceCellHeight - IDENTITY_SHEET_GAP
-            val imageBottom = bottom - EVIDENCE_BOARD_FACE_LABEL_HEIGHT
-            val scale = minOf(
-                (right - left).toFloat() / face.bitmap.width,
-                (imageBottom - top).toFloat() / face.bitmap.height,
-            ).coerceAtLeast(0.01f)
-            val width = face.bitmap.width * scale
-            val height = face.bitmap.height * scale
-            val imageLeft = left + ((right - left) - width) / 2f
-            val imageTop = top + ((imageBottom - top) - height) / 2f
-            canvas.drawBitmap(
-                face.bitmap,
-                null,
-                RectF(imageLeft, imageTop, imageLeft + width, imageTop + height),
-                imagePaint,
-            )
-            canvas.drawRect(
-                RectF(
-                    left.toFloat(),
-                    imageBottom.toFloat(),
-                    right.toFloat(),
-                    bottom.toFloat(),
-                ),
-                labelBackgroundPaint,
-            )
-            canvas.drawText(
-                "F${index + 1} ${face.label.take(MAX_IDENTITY_LABEL_CHARS)} • ${face.sourceLabel}",
-                left + EVIDENCE_BOARD_LABEL_INSET,
-                bottom - EVIDENCE_BOARD_FACE_LABEL_BASELINE,
-                faceLabelPaint,
-            )
-        }
-        return try {
-            ByteArrayOutputStream().use { output ->
-                check(sheet.compress(Bitmap.CompressFormat.JPEG, 82, output)) {
-                    "Could not encode Gemma evidence board"
-                }
-                output.toByteArray()
-            }
-        } finally {
-            if (!sheet.isRecycled) sheet.recycle()
-        }
+    /** Strictly bounds scenery pixels before LiteRT-LM creates vision tensors. */
+    private fun downscaleAnswerImage(bitmap: Bitmap): Bitmap {
+        val maxDimension = QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_MAX_DIMENSION
+        val largest = maxOf(bitmap.width, bitmap.height)
+        if (largest <= maxDimension) return bitmap
+        val scale = maxDimension.toFloat() / largest.toFloat()
+        val scaled = Bitmap.createScaledBitmap(
+            bitmap,
+            (bitmap.width * scale).toInt().coerceAtLeast(1),
+            (bitmap.height * scale).toInt().coerceAtLeast(1),
+            true,
+        )
+        if (scaled !== bitmap && !bitmap.isRecycled) bitmap.recycle()
+        return scaled
     }
+
+    /** Encodes one bounded scenery image without creating an in-memory board. */
+    private fun encodeGemmaImage(bitmap: Bitmap): ByteArray =
+        ByteArrayOutputStream().use { output ->
+            check(bitmap.compress(Bitmap.CompressFormat.JPEG, 90, output)) {
+                "Could not encode Gemma answer image"
+            }
+            output.toByteArray()
+        }
 
     private fun parseAnswer(output: String): ParsedAnswer {
         val normalized = output.trim()
@@ -1183,24 +1034,6 @@ class GalleryIndexer(context: Context) {
     private fun compactPromptText(value: String): String =
         value.replace(Regex("\\s+"), " ").trim()
 
-    /** Keeps the OCR window around query terms instead of always taking its header. */
-    private fun ocrPromptSnippet(value: String, query: String): String {
-        val compact = compactPromptText(value)
-        if (compact.length <= MAX_OCR_PROMPT_CHARS) return compact
-        val terms = query.lowercase()
-            .split(Regex("[^\\p{L}\\p{N}]+"))
-            .filter { it.length >= 3 }
-        val hit = terms.asSequence()
-            .map { compact.lowercase().indexOf(it) }
-            .filter { it >= 0 }
-            .minOrNull()
-        if (hit == null) return compact.take(MAX_OCR_PROMPT_CHARS)
-        val start = (hit - MAX_OCR_CONTEXT_PADDING).coerceAtLeast(0)
-        val end = (start + MAX_OCR_PROMPT_CHARS).coerceAtMost(compact.length)
-        return (if (start > 0) "…" else "") + compact.substring(start, end) +
-            if (end < compact.length) "…" else ""
-    }
-
     private fun buildAnswerSources(
         results: List<GalleryMedia>,
         contextMatches: List<PersonalContextMatch>,
@@ -1233,7 +1066,7 @@ class GalleryIndexer(context: Context) {
                     }
                     if (media.ocrText.isNotBlank()) {
                         append("\nOCR: ")
-                        append(compactPromptText(media.ocrText).take(MAX_OCR_PROMPT_CHARS))
+                        append(compactPromptText(media.ocrText))
                     }
                     media.personLabel?.takeIf { it.isNotBlank() }?.let {
                         append("\nPerson: ")
@@ -1274,7 +1107,7 @@ class GalleryIndexer(context: Context) {
         item.merchant?.let { append(it).append("; ") }
         item.amount?.let { append(it).append("; ") }
         item.dateHint?.let { append(it).append("; ") }
-        append(item.body.take(MAX_CONTEXT_PROMPT_CHARS))
+        append(item.body)
     }.trim().trimEnd(';').ifBlank { item.title }
 
     private fun containsAnyPlanTerm(value: String, terms: List<String>): Boolean {
@@ -1385,10 +1218,14 @@ class GalleryIndexer(context: Context) {
         value = value
             .replace(Regex("(?i)\\b(last|previous|this|current)\\s+(month|week|year)\\b"), " ")
             .replace(Regex("(?i)\\b(latest|newest|recent|most)\\b"), " ")
-            .replace(
-                Regex("(?i)\\b(photo|photos|picture|pictures|image|images|still|stills|video|videos|movie|movies|clip|clips)\\b"),
-                " ",
-            )
+        val representedMediaWords = when (mediaType) {
+            QueryMediaType.PHOTOS ->
+                Regex("(?i)\\b(photo|photos|picture|pictures|image|images|still|stills)\\b")
+            QueryMediaType.VIDEOS ->
+                Regex("(?i)\\b(video|videos|clip|clips)\\b")
+            null -> null
+        }
+        representedMediaWords?.let { value = value.replace(it, " ") }
         if (locationHint.isNotBlank()) {
             value = value.replace(Regex("(?i)\\b(trip|trips|travel|vacation|holiday)\\b"), " ")
         }
@@ -1397,37 +1234,17 @@ class GalleryIndexer(context: Context) {
 
     companion object {
         private const val TAG = "AskGalaxy"
-        private const val MAX_GEMMA_IMAGES = 16
+        private const val MAX_ANSWER_RECORDS = 8
         private const val UI_RESULT_LIMIT = 200
-        private const val MAX_IDENTITY_FACE_CROPS = 8
         private const val MAX_EVIDENCE_LOG_CHARS = 600
         private const val MAX_FOLLOW_UPS = 3
         private const val MAX_NAME_PROMPT_CHARS = 48
-        private const val MAX_PERSON_PROMPT_CHARS = 64
-        private const val MAX_OCR_PROMPT_CHARS = 160
-        private const val MAX_OCR_CONTEXT_PADDING = 48
-        private const val MAX_CONTEXT_PROMPT_ITEMS = 2
         private const val CONTEXT_RETRIEVAL_LIMIT = 6
         private const val CONTEXT_ANSWER_LIMIT = 4
-        private const val MAX_CONTEXT_PROMPT_CHARS = 160
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z")
         private val ANSWER_SYSTEM_INSTRUCTION = """
-            You are Ask Galaxy's grounded gallery answer writer. Answer the user's question using only the joined context in the latest ANSWER_TASK. Reason jointly over every attached image board, labeled identity face tile, metadata record, OCR snippet, local person tag, personal-context item, and the query; do not answer each image independently or ignore the cross-references. Give a natural 2-3 sentence summary that leads with the most useful supported conclusion; use partial context and calibrated wording when an exact fact is missing instead of giving a generic refusal. Never say "based on the provided evidence", "according to the supplied records", "the prompt says", or similar system/evaluation wording. Say what the photos, dates, places, and tags show directly. When a readable location is present and relevant, explicitly name it. Separate confirmed visual details from likely or adjacent details, and never treat a metadata-only record as visual proof. G/C/E/F labels are private join keys: never include source IDs such as G1, G2, C1, E1, or F1 in the answer or follow-ups. Never emit JSON, routing keys, regular expressions, source code, or a query plan. Do not repeat the task instructions or invent an exact identity, date, place, or count.
+            You write Ask Galaxy's grounded gallery answer. Use only the latest task's joined text records and, for a scenery task only, its attached downscaled image inputs. A visual=tile record supports visible details; text-only fields support only their named person, time, place, or OCR facts. Local person tags are authoritative. Lead with the useful conclusion in 2-3 natural sentences, explicitly naming a relevant place when one is supplied, and use a brief calibrated caveat only when an exact fact is genuinely absent from all supplied inputs. Never mention evidence, records, prompts, models, reasoning, or private G/C/E/F IDs. Never output JSON, code, routing keys, or a query plan, and never invent an identity, date, place, count, price, or visible activity.
         """.trimIndent()
-        private const val CONTACT_SHEET_COLUMNS = 4
-        private const val CONTACT_SHEET_GAP = 6
-        private const val EVIDENCE_BOARD_SIZE = 768
-        private const val IDENTITY_BOARD_COLUMNS = 4
-        private const val EVIDENCE_BOARD_GALLERY_LABEL_WIDTH = 52
-        private const val EVIDENCE_BOARD_GALLERY_LABEL_HEIGHT = 30
-        private const val EVIDENCE_BOARD_GALLERY_LABEL_BASELINE = 22f
-        private const val EVIDENCE_BOARD_GALLERY_LABEL_SIZE = 16f
-        private const val EVIDENCE_BOARD_FACE_LABEL_HEIGHT = 38
-        private const val EVIDENCE_BOARD_FACE_LABEL_BASELINE = 9f
-        private const val EVIDENCE_BOARD_FACE_LABEL_SIZE = 13f
-        private const val EVIDENCE_BOARD_LABEL_INSET = 8f
-        private const val IDENTITY_SHEET_GAP = 8
-        private const val MAX_IDENTITY_LABEL_CHARS = 24
 
         private fun elapsedMs(startNanos: Long, endNanos: Long): Long =
             ((endNanos - startNanos).coerceAtLeast(0L) / 1_000_000L)
@@ -1438,19 +1255,13 @@ class GalleryIndexer(context: Context) {
         val plannerSession: GemmaRuntime.ConversationSession?,
         val plannerJson: String,
         val effectivePlanJson: String,
+        val queryCategory: QueryCategory,
         val answerEvidenceScope: AnswerEvidenceScope,
     )
 
     private data class ParsedAnswer(
         val text: String,
         val followUps: List<FollowUpSuggestion>,
-    )
-
-    private data class IdentityFaceEvidence(
-        val reference: String,
-        val label: String,
-        val sourceLabel: String,
-        val bitmap: Bitmap,
     )
 
     private fun scanBlockingInternal(): Long {

@@ -9,14 +9,14 @@ import android.net.Uri
 import androidx.exifinterface.media.ExifInterface
 import java.io.Closeable
 
-/** Decodes bounded-size gallery inputs without retaining full-resolution media. */
+/** Decodes gallery inputs with an optional size bound for memory-sensitive paths. */
 class MediaBitmapLoader(context: Context) : Closeable {
     private val appContext = context.applicationContext
     private val resolver = appContext.contentResolver
 
     fun load(
         media: GalleryMedia,
-        maxDimension: Int = 768,
+        maxDimension: Int? = 768,
         applyExifOrientation: Boolean = false,
     ): Bitmap? {
         val uri = Uri.parse(media.contentUri)
@@ -30,20 +30,27 @@ class MediaBitmapLoader(context: Context) : Closeable {
     /** Face boxes were indexed in the raw bitmap coordinate system. */
     fun readOrientation(media: GalleryMedia): Int = readOrientation(Uri.parse(media.contentUri))
 
+    /** Applies the same EXIF transform used by ordinary image decoding. */
+    fun orientForExif(bitmap: Bitmap, orientation: Int): Bitmap = orient(bitmap, orientation)
+
     override fun close() = Unit
 
     private fun loadImage(
         uri: Uri,
-        maxDimension: Int,
+        maxDimension: Int?,
         applyExifOrientation: Boolean,
     ): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         val largest = maxOf(bounds.outWidth, bounds.outHeight)
-        val sample = generateSequence(1) { it * 2 }
-            .takeWhile { it * maxDimension < largest }
-            .lastOrNull() ?: 1
+        val sample = if (maxDimension == null || maxDimension <= 0) {
+            1
+        } else {
+            generateSequence(1) { it * 2 }
+                .takeWhile { it * maxDimension < largest }
+                .lastOrNull() ?: 1
+        }
         val options = BitmapFactory.Options().apply {
             inSampleSize = sample
             inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -95,7 +102,7 @@ class MediaBitmapLoader(context: Context) : Closeable {
         return oriented
     }
 
-    private fun loadVideoFrame(uri: Uri, maxDimension: Int): Bitmap? {
+    private fun loadVideoFrame(uri: Uri, maxDimension: Int?): Bitmap? {
         val retriever = MediaMetadataRetriever()
         val frame = try {
             retriever.setDataSource(appContext, uri)
@@ -103,7 +110,9 @@ class MediaBitmapLoader(context: Context) : Closeable {
         } finally {
             retriever.release()
         }
-        if (frame == null || maxOf(frame.width, frame.height) <= maxDimension) return frame
+        if (frame == null || maxDimension == null || maxDimension <= 0 ||
+            maxOf(frame.width, frame.height) <= maxDimension
+        ) return frame
         val scale = maxDimension.toFloat() / maxOf(frame.width, frame.height)
         val scaled = Bitmap.createScaledBitmap(
             frame,

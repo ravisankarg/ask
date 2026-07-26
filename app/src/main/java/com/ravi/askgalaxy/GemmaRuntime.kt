@@ -157,13 +157,13 @@ class GemmaRuntime private constructor(
             temperature = 0.35,
             seed = 29,
         )
-        // Keep the model's full 4K input+output graph capacity. Reducing this
-        // to 1024 makes Gemma 4 prefill/decode dynamic slices incompatible with
-        // multimodal and grounded prompts on-device.
-        private const val MAX_OUTPUT_TOKENS = 4096
-        // LiteRT-LM's Gemma 4 graph must be created with its compiled image
-        // capacity of eight; the request path sends one board containing up to
-        // sixteen gallery tiles plus bounded face anchors.
+        // The answer path keeps complete selected OCR/metadata. Scenery may
+        // additionally send four bounded images, so retain an 8K
+        // input+output capacity for the joined multimodal prompt.
+        private const val MAX_CONTEXT_TOKENS = 8192
+        // LiteRT-LM's Gemma 4 graph must still be created with its compiled
+        // capacity of eight even though Ask Galaxy sends at most four
+        // downscaled scenery images in one answer request.
         private const val MAX_IMAGES = 8
         private val residentLock = Any()
         private val prefilledPlannerLock = Any()
@@ -258,26 +258,47 @@ class GemmaRuntime private constructor(
             check(model.isFile) {
                 "Gemma model is not installed: ${model.absolutePath}"
             }
-            // Keep both language and vision on CPU for deterministic behavior on
-            // this Samsung device. LiteRT-LM 0.14.0 contains the multimodal CPU
-            // fixes; the older runtime's CPU vision path produced DUS failures.
+            // Keep language generation on CPU so the frozen QP retains its
+            // verified numerical path. Move only the image encoder/adapter to
+            // GPU: Gemma 4's CPU vision graph otherwise pushes this Samsung
+            // above its per-process memory guard before answer decoding begins.
+            // LiteRT-LM 0.14 supports the split backend directly.
             val backend = Backend.CPU(CPU_THREADS)
-            val visionBackend = Backend.CPU(CPU_THREADS)
+            val visionBackend = Backend.GPU()
             val cacheDir = File(context.filesDir, "models/cache").apply {
                 check(mkdirs() || isDirectory) {
                     "Could not create Gemma cache directory: $absolutePath"
                 }
             }
-            val config = EngineConfig(
-                model.absolutePath,
-                backend,
-                visionBackend,
-                backend,
-                MAX_OUTPUT_TOKENS,
-                MAX_IMAGES,
-                cacheDir.absolutePath,
-            )
-            return GemmaRuntime(Engine(config).also { it.initialize() })
+            fun initialize(vision: Backend): GemmaRuntime {
+                val config = EngineConfig(
+                    model.absolutePath,
+                    backend,
+                    vision,
+                    backend,
+                    MAX_CONTEXT_TOKENS,
+                    MAX_IMAGES,
+                    cacheDir.absolutePath,
+                )
+                val engine = Engine(config)
+                return try {
+                    engine.initialize()
+                    GemmaRuntime(engine)
+                } catch (error: Throwable) {
+                    runCatching { engine.close() }
+                    throw error
+                }
+            }
+            return try {
+                initialize(visionBackend)
+            } catch (gpuError: RuntimeException) {
+                Log.w(
+                    TAG,
+                    "Gemma GPU vision initialization failed; using CPU vision fallback",
+                    gpuError,
+                )
+                initialize(Backend.CPU(CPU_THREADS))
+            }
         }
     }
 }

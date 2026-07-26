@@ -6,6 +6,27 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import kotlin.math.sqrt
 
+enum class MediaContentClass(val wireName: String) {
+    DOC("doc"),
+    SCENARY("scenary"),
+    ;
+
+    companion object {
+        fun fromWireName(value: String?): MediaContentClass =
+            entries.firstOrNull { it.wireName == value } ?: SCENARY
+
+        fun fromIndexedOcr(mimeType: String, ocrText: String): MediaContentClass =
+            if (
+                mimeType.startsWith("image/", ignoreCase = true) &&
+                ocrText.isNotBlank()
+            ) {
+                DOC
+            } else {
+                SCENARY
+            }
+    }
+}
+
 data class GalleryMedia(
     val mediaStoreId: Long,
     val contentUri: String,
@@ -19,6 +40,7 @@ data class GalleryMedia(
     val personClusterId: String? = null,
     val personLabel: String? = null,
     val ocrText: String = "",
+    val contentClass: MediaContentClass = MediaContentClass.SCENARY,
     // Capture and location metadata are persisted during preprocessing. Lazy
     // reads remain as a compatibility fallback for rows indexed before v8.
     val dateTakenMs: Long? = null,
@@ -55,7 +77,9 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 height INTEGER NOT NULL,
                 duration_ms INTEGER NOT NULL,
                 ocr_text TEXT NOT NULL DEFAULT '',
+                content_class TEXT NOT NULL DEFAULT 'scenary',
                 ocr_indexed INTEGER NOT NULL DEFAULT 0,
+                ocr_signature TEXT NOT NULL DEFAULT '',
                 person_cluster_id TEXT,
                 image_embedding_indexed INTEGER NOT NULL DEFAULT 0,
                 face_embedding_indexed INTEGER NOT NULL DEFAULT 0,
@@ -73,6 +97,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX media_items_cluster ON media_items(person_cluster_id)")
         db.execSQL("CREATE INDEX media_items_date_taken ON media_items(date_taken_ms)")
         db.execSQL("CREATE INDEX media_items_location_name ON media_items(location_name)")
+        db.execSQL("CREATE INDEX media_items_content_class ON media_items(content_class)")
         createFaceTables(db)
         createLocationCache(db)
         createEpisodeTables(db)
@@ -122,6 +147,67 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         if (oldVersion < 9) {
             createEpisodeTables(db)
         }
+        if (oldVersion < 10) {
+            db.execSQL(
+                "ALTER TABLE media_items ADD COLUMN content_class TEXT NOT NULL DEFAULT 'scenary'",
+            )
+            db.execSQL(
+                """
+                UPDATE media_items
+                SET content_class = CASE
+                    WHEN mime_type LIKE 'image/%' AND TRIM(ocr_text) <> '' THEN 'doc'
+                    ELSE 'scenary'
+                END
+                """.trimIndent(),
+            )
+            db.execSQL(
+                "CREATE INDEX IF NOT EXISTS media_items_content_class ON media_items(content_class)",
+            )
+        }
+        if (oldVersion < 11) {
+            db.execSQL(
+                "ALTER TABLE media_items ADD COLUMN ocr_signature TEXT NOT NULL DEFAULT ''",
+            )
+            // OCR is an image classification contract. Discard stale frame
+            // text from the retired PP-OCR pass without touching any other
+            // index state.
+            val values = ContentValues().apply {
+                put("ocr_text", "")
+                put("content_class", MediaContentClass.SCENARY.wireName)
+                put("ocr_indexed", 1)
+                put("ocr_signature", OcrIndexContract.SIGNATURE)
+            }
+            db.update(
+                TABLE_MEDIA,
+                values,
+                "mime_type NOT LIKE 'image/%'",
+                null,
+            )
+        }
+        if (oldVersion < 12) {
+            // Earlier builds opened ordinary MediaStore photo URIs, whose EXIF
+            // GPS is redacted on Android 10+. Revisit only image location
+            // metadata after explicit ACCESS_MEDIA_LOCATION consent; retain
+            // capture dates, OCR, vectors, faces, and every other index.
+            val values = ContentValues().apply {
+                putNull("location_raw")
+                putNull("location_name")
+                put("location_enrichment_state", LOCATION_PENDING)
+            }
+            db.update(
+                TABLE_MEDIA,
+                values,
+                "mime_type LIKE 'image/%'",
+                null,
+            )
+        }
+        if (oldVersion >= 4 && oldVersion < 13) {
+            // Add one exclusive local self-identity marker without changing
+            // any face vectors, cluster IDs, labels, or gallery index state.
+            db.execSQL(
+                "ALTER TABLE face_clusters ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0",
+            )
+        }
     }
 
     fun upsert(media: GalleryMedia) {
@@ -150,9 +236,20 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             put("duration_ms", media.durationMs)
             put("embedding_signature", signature)
             put("updated_at_ms", System.currentTimeMillis())
+            if (!media.mimeType.startsWith("image/")) {
+                put("ocr_text", "")
+                put("content_class", MediaContentClass.SCENARY.wireName)
+                put("ocr_indexed", 1)
+                put("ocr_signature", OcrIndexContract.SIGNATURE)
+            }
             if (previousSignature != null && previousSignature != signature) {
                 put("image_embedding_indexed", 0)
-                put("ocr_indexed", 0)
+                if (media.mimeType.startsWith("image/")) {
+                    put("ocr_indexed", 0)
+                    put("ocr_signature", "")
+                    put("ocr_text", "")
+                    put("content_class", MediaContentClass.SCENARY.wireName)
+                }
                 put("face_embedding_indexed", 0)
                 putNull("date_taken_ms")
                 putNull("location_raw")
@@ -193,6 +290,12 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         projection = INDEXING_PROJECTION,
     )
 
+    /** Makes every gallery row eligible for a clean visual-index rebuild. */
+    fun invalidateImageEmbeddingIndex(): Int {
+        val values = ContentValues().apply { put("image_embedding_indexed", 0) }
+        return writableDatabase.update(TABLE_MEDIA, values, null, null)
+    }
+
     /** Rows needing capture-time/GPS extraction or an online reverse-geocode retry. */
     fun pendingLocationMetadata(): List<GalleryMedia> = queryMedia(
         selection = "location_enrichment_state = ?",
@@ -200,6 +303,30 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         orderBy = "date_modified_seconds DESC",
         projection = INDEXING_PROJECTION,
     )
+
+    fun pendingLocationCount(): Int = readableDatabase.compileStatement(
+        "SELECT COUNT(*) FROM $TABLE_MEDIA WHERE location_enrichment_state = $LOCATION_PENDING",
+    ).simpleQueryForLong().toInt()
+
+    fun resolvedLocationCount(): Int = readableDatabase.compileStatement(
+        "SELECT COUNT(*) FROM $TABLE_MEDIA WHERE location_enrichment_state = $LOCATION_RESOLVED",
+    ).simpleQueryForLong().toInt()
+
+    /** Invalidates only persisted photo GPS/place fields. */
+    fun invalidatePhotoLocationIndex(): Int {
+        val values = ContentValues().apply {
+            putNull("location_raw")
+            putNull("location_name")
+            put("location_enrichment_state", LOCATION_PENDING)
+            put("updated_at_ms", System.currentTimeMillis())
+        }
+        return writableDatabase.update(
+            TABLE_MEDIA,
+            values,
+            "mime_type LIKE 'image/%'",
+            null,
+        )
+    }
 
     fun saveEnrichedMetadata(
         mediaStoreId: Long,
@@ -384,15 +511,50 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         projection = INDEXING_PROJECTION,
     )
 
-    fun pendingOcr(): List<GalleryMedia> = queryMedia(
-        selection = "ocr_indexed = 0",
+    /** Makes every gallery row eligible for face detection and embedding again. */
+    fun invalidateFaceEmbeddingIndex(): Int {
+        val values = ContentValues().apply { put("face_embedding_indexed", 0) }
+        return writableDatabase.update(TABLE_MEDIA, values, null, null)
+    }
+
+    fun pendingOcr(
+        signature: String = OcrIndexContract.SIGNATURE,
+    ): List<GalleryMedia> = queryMedia(
+        selection = "mime_type LIKE 'image/%' AND (ocr_indexed = 0 OR ocr_signature <> ?)",
+        selectionArgs = arrayOf(signature),
         orderBy = "date_modified_seconds DESC",
         projection = INDEXING_PROJECTION,
     )
 
-    fun replaceOcrText(mediaStoreId: Long, text: String) {
+    fun pendingOcrCount(
+        signature: String = OcrIndexContract.SIGNATURE,
+    ): Int = readableDatabase.rawQuery(
+        """
+        SELECT COUNT(*)
+        FROM $TABLE_MEDIA
+        WHERE mime_type LIKE 'image/%'
+          AND (ocr_indexed = 0 OR ocr_signature <> ?)
+        """.trimIndent(),
+        arrayOf(signature),
+    ).use { cursor ->
+        if (cursor.moveToFirst()) cursor.getInt(0) else 0
+    }
+
+    fun replaceOcrResult(
+        mediaStoreId: Long,
+        mimeType: String,
+        text: String,
+        signature: String = OcrIndexContract.SIGNATURE,
+    ) {
+        val cleanText = text.trim()
         val values = ContentValues().apply {
-            put("ocr_text", text.trim())
+            put("ocr_text", cleanText)
+            put(
+                "content_class",
+                MediaContentClass.fromIndexedOcr(mimeType, cleanText).wireName,
+            )
+            put("ocr_indexed", 1)
+            put("ocr_signature", signature)
         }
         writableDatabase.update(
             TABLE_MEDIA,
@@ -402,13 +564,20 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         )
     }
 
-    fun markOcrIndexed(mediaStoreId: Long) {
-        val values = ContentValues().apply { put("ocr_indexed", 1) }
-        writableDatabase.update(
+    /**
+     * Makes only image OCR rows pending. Existing text remains searchable
+     * until each replacement is committed atomically by the OCR-only worker.
+     */
+    fun invalidateOcrIndex(): Int {
+        val values = ContentValues().apply {
+            put("ocr_indexed", 0)
+            put("ocr_signature", "")
+        }
+        return writableDatabase.update(
             TABLE_MEDIA,
             values,
-            "media_store_id = ?",
-            arrayOf(mediaStoreId.toString()),
+            "mime_type LIKE 'image/%'",
+            null,
         )
     }
 
@@ -558,6 +727,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             arrayOf(
                 "cluster_id",
                 "label",
+                "is_self",
                 "centroid_blob",
                 "representative_media_store_id",
                 "face_count",
@@ -573,10 +743,11 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 result += StoredFaceCluster(
                     clusterId = cursor.getString(0),
                     label = cursor.getString(1),
-                    centroid = faceEmbeddingCrypto.decrypt(cursor.getBlob(2)),
-                    representativeMediaStoreId = cursor.getLong(3),
-                    faceCount = cursor.getInt(4),
-                    representativeFaceId = cursor.getLong(5),
+                    isSelf = cursor.getInt(2) != 0,
+                    centroid = faceEmbeddingCrypto.decrypt(cursor.getBlob(3)),
+                    representativeMediaStoreId = cursor.getLong(4),
+                    faceCount = cursor.getInt(5),
+                    representativeFaceId = cursor.getLong(6),
                 )
             }
         }
@@ -627,6 +798,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 val clusterValues = ContentValues().apply {
                     put("cluster_id", assignment.clusterId)
                     put("label", assignment.label)
+                    put("is_self", if (assignment.isSelf) 1 else 0)
                     put("centroid_blob", faceEmbeddingCrypto.encrypt(assignment.centroid))
                     put("representative_media_store_id", assignment.representativeMediaStoreId)
                     put("face_count", assignment.memberFaceIds.size)
@@ -688,6 +860,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         val projection = arrayOf(
             "c.cluster_id AS cluster_id",
             "c.label AS cluster_label",
+            "c.is_self AS cluster_is_self",
             "c.face_count AS cluster_face_count",
             "c.representative_face_id AS representative_face_id",
             "m.media_store_id",
@@ -701,6 +874,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "0 AS duration_ms",
             "NULL AS person_cluster_id",
             "'' AS ocr_text",
+            "'scenary' AS content_class",
             "NULL AS date_taken_ms",
             "NULL AS location_raw",
             "NULL AS location_name",
@@ -725,6 +899,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 result += FaceCluster(
                     clusterId = cursor.getString(cursor.getColumnIndexOrThrow("cluster_id")),
                     label = cursor.getString(cursor.getColumnIndexOrThrow("cluster_label")),
+                    isSelf = cursor.getInt(cursor.getColumnIndexOrThrow("cluster_is_self")) != 0,
                     faceCount = cursor.getInt(cursor.getColumnIndexOrThrow("cluster_face_count")),
                     representative = cursor.toGalleryMedia(),
                     representativeBox = cursor.faceBoxOrNull(),
@@ -766,8 +941,18 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 .mapNotNull { existing[it]?.label?.trim()?.takeIf(String::isNotEmpty) }
                 .firstOrNull()
                 .orEmpty()
+            val isSelf = ids.any { existing[it]?.isSelf == true }
+            if (isSelf) {
+                db.update(
+                    TABLE_FACE_CLUSTERS,
+                    ContentValues().apply { put("is_self", 0) },
+                    null,
+                    null,
+                )
+            }
             val clusterValues = ContentValues().apply {
                 put("label", label)
+                put("is_self", if (isSelf) 1 else 0)
                 put("centroid_blob", faceEmbeddingCrypto.encrypt(centroid))
                 put("representative_media_store_id", representative.mediaStoreId)
                 put("face_count", mergedRecords.size)
@@ -809,14 +994,35 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         }
     }
 
-    fun saveFaceClusterLabel(clusterId: String, label: String) {
-        val values = ContentValues().apply { put("label", label.trim()) }
-        writableDatabase.update(
-            TABLE_FACE_CLUSTERS,
-            values,
-            "cluster_id = ?",
-            arrayOf(clusterId),
-        )
+    fun saveFaceClusterIdentity(clusterId: String, label: String, isSelf: Boolean) {
+        val cleanLabel = label.trim()
+        require(cleanLabel.isNotBlank()) { "Face label cannot be blank" }
+        val db = writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            if (isSelf) {
+                db.update(
+                    TABLE_FACE_CLUSTERS,
+                    ContentValues().apply { put("is_self", 0) },
+                    null,
+                    null,
+                )
+            }
+            val updated = db.update(
+                TABLE_FACE_CLUSTERS,
+                ContentValues().apply {
+                    put("label", cleanLabel)
+                    put("is_self", if (isSelf) 1 else 0)
+                    put("updated_at_ms", System.currentTimeMillis())
+                },
+                "cluster_id = ?",
+                arrayOf(clusterId),
+            )
+            require(updated == 1) { "Face group no longer exists" }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     /** Returns named face labels explicitly mentioned in a user query. */
@@ -852,6 +1058,24 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     /** Small trusted vocabulary supplied to the on-device LLM planner for typo correction. */
     fun namedPersonLabelsForPlanning(): List<String> = namedPersonLabels()
+
+    /** The one face label explicitly identified by the user as themselves. */
+    fun selfPersonLabelForPlanning(): String? = readableDatabase.query(
+        TABLE_FACE_CLUSTERS,
+        arrayOf("label"),
+        "is_self = 1 AND TRIM(label) <> ''",
+        null,
+        null,
+        null,
+        "updated_at_ms DESC",
+        "1",
+    ).use { cursor ->
+        if (cursor.moveToFirst()) {
+            cursor.getString(0)?.trim()?.takeIf(String::isNotBlank)
+        } else {
+            null
+        }
+    }
 
     /** Returns indexed media containing at least one requested tagged face. */
     fun mediaStoreIdsForPersonLabels(labels: List<String>): Set<Long> {
@@ -964,6 +1188,45 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
     }
 
     /**
+     * Resolves the planner category into a persisted, query-time allowlist.
+     *
+     * DOC and SCENARY are assigned once by the OCR indexing pass. The other
+     * categories use their authoritative indexed metadata so category routing
+     * scopes the full result browser as well as the private answer context.
+     */
+    fun mediaStoreIdsForQueryCategory(category: QueryCategory): Set<Long> {
+        val selection = when (category) {
+            QueryCategory.DOC -> "content_class = '${MediaContentClass.DOC.wireName}'"
+            QueryCategory.SCENARY -> "content_class = '${MediaContentClass.SCENARY.wireName}'"
+            QueryCategory.PERSON ->
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM $TABLE_FACE_EMBEDDINGS f
+                    JOIN $TABLE_FACE_CLUSTERS c ON c.cluster_id = f.cluster_id
+                    WHERE f.media_store_id = media_items.media_store_id
+                      AND TRIM(c.label) <> ''
+                )
+                """.trimIndent()
+            QueryCategory.LOCATION -> "TRIM(COALESCE(location_name, '')) <> ''"
+            QueryCategory.TIME -> "date_taken_ms IS NOT NULL OR date_modified_seconds > 0"
+        }
+        val ids = LinkedHashSet<Long>()
+        readableDatabase.query(
+            TABLE_MEDIA,
+            arrayOf("media_store_id"),
+            selection,
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) ids += cursor.getLong(0)
+        }
+        return ids
+    }
+
+    /**
      * Executes a date predicate against persisted capture metadata. A non-null
      * empty set is authoritative; null means the v8 enrichment pass has not
      * produced any usable timestamps yet.
@@ -1032,6 +1295,44 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
     fun searchMetadataRanked(query: String, limit: Int = 16): List<MetadataMatch> =
         searchMetadataRanked(listOf(query), limit)
 
+    /**
+     * Matches planner-selected document keywords against OCR text only.
+     * Keywords are alternatives: any one term admits the row, while matching
+     * more terms raises its score before semantic/OCR fusion.
+     */
+    fun searchOcrKeywordsRanked(
+        keywords: List<String>,
+        limit: Int = 512,
+    ): List<MetadataMatch> {
+        val terms = keywords.asSequence()
+            .map { it.trim().lowercase() }
+            .filter(String::isNotBlank)
+            .distinct()
+            .take(8)
+            .toList()
+        if (terms.isEmpty()) return emptyList()
+        val selection = terms.joinToString(" OR ") {
+            "LOWER(ocr_text) LIKE ? ESCAPE '\\'"
+        }
+        val args = terms.map { term ->
+            "%${escapeSqlLike(term)}%"
+        }.toTypedArray()
+        return queryMedia(
+            selection = selection,
+            selectionArgs = args,
+            orderBy = "date_modified_seconds DESC",
+        ).asSequence()
+            .map { media ->
+                MetadataMatch(media, OcrKeywordPolicy.score(media.ocrText, terms))
+            }
+            .sortedWith(
+                compareByDescending<MetadataMatch> { it.score }
+                    .thenByDescending { it.media.dateModifiedSeconds },
+            )
+            .take(limit.coerceIn(1, MAX_SEARCH_RESULTS))
+            .toList()
+    }
+
     /** Searches several planner-produced keyword forms and keeps the best row score. */
     fun searchMetadataRanked(queries: List<String>, limit: Int = 16): List<MetadataMatch> {
         val bestByMediaId = LinkedHashMap<Long, MetadataMatch>()
@@ -1073,6 +1374,11 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .map { it.trim().replace("%", "").lowercase() }
             .filter { it.isNotEmpty() }
             .take(6)
+
+    private fun escapeSqlLike(value: String): String = value
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
 
     private fun metadataScore(media: GalleryMedia, terms: List<String>): Float {
         val displayName = media.displayName.lowercase()
@@ -1146,6 +1452,9 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         personClusterId = getStringOrNull("person_cluster_id"),
         personLabel = getStringOrNull("person_label"),
         ocrText = getString(getColumnIndexOrThrow("ocr_text")).orEmpty(),
+        contentClass = MediaContentClass.fromWireName(
+            getString(getColumnIndexOrThrow("content_class")),
+        ),
         dateTakenMs = getLongOrNull("date_taken_ms"),
         location = getStringOrNull("location_raw"),
         locationName = getStringOrNull("location_name"),
@@ -1193,6 +1502,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             CREATE TABLE IF NOT EXISTS face_clusters (
                 cluster_id TEXT PRIMARY KEY,
                 label TEXT NOT NULL DEFAULT '',
+                is_self INTEGER NOT NULL DEFAULT 0,
                 centroid_blob BLOB NOT NULL,
                 representative_media_store_id INTEGER NOT NULL,
                 face_count INTEGER NOT NULL,
@@ -1250,7 +1560,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     companion object {
         private const val DATABASE_NAME = "gallery.db"
-        private const val DATABASE_VERSION = 9
+        private const val DATABASE_VERSION = 13
         private const val SQLITE_ID_CHUNK = 900
         private const val TABLE_MEDIA = "media_items"
         private const val TABLE_FACE_EMBEDDINGS = "face_embeddings"
@@ -1275,6 +1585,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "duration_ms",
             "person_cluster_id",
             "ocr_text",
+            "content_class",
             "date_taken_ms",
             "location_raw",
             "location_name",
@@ -1298,6 +1609,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "duration_ms",
             "person_cluster_id",
             "ocr_text",
+            "content_class",
             "date_taken_ms",
             "location_raw",
             "location_name",

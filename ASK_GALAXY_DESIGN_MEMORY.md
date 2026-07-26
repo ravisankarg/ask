@@ -1,6 +1,6 @@
 # Ask Galaxy design memory
 
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-25
 
 This is the concise architectural memory for future Ask Galaxy sessions. The
 full module contracts, commands, live query matrix, and known issues are in
@@ -22,22 +22,27 @@ WorkManager preparation
   -> MediaStore scan and incremental SQLite rows
   -> capture/GPS extraction and cached online reverse geocoding
   -> SigLIP2 image/frame vectors in TurboQuant
-  -> PP-OCRv5 text in SQLite
+  -> bundled ML Kit OCR text in SQLite
   -> YuNet + FaceNet-512 encrypted face data and clustering
   -> persisted time/location/person episode index
   -> full virtualized face review/tagging snapshot
   -> search-ready state
 
 Search field visible
-  -> warm Gemma 4 CPU engine, SigLIP text encoder, and native index
-  -> deterministic or Gemma canonical execution AST
-  -> recursive set execution over native semantic + indexed metadata branches
-  -> newest 200 matches shown newest-first in the scrollable grid
+  -> warm Gemma 4 CPU-language engine, SigLIP text encoder, and native index
+  -> Gemma-only query_category + canonical execution AST
+  -> validate spelling, structured values, temporal intent, and semantic content
+  -> show the accepted QP output and planning time below the search field
+  -> recursively execute hard category/person/date/location/MIME sets
+  -> search TurboQuant + SQLite OCR/metadata inside the accumulated hard scope
+  -> keep semantic cosine >= 0.10; use scoped positive fallback only if empty
+  -> publish up to the newest 200 matches in the sole scrollable grid
   -> persisted episode membership join
-  -> Context Picker selects at most 16 cross-episode multimodal images
-  -> one EXIF-correct 4x4 gallery/face evidence board
+  -> Context Picker selects at most 8 eligible cross-episode records without decoding images
+  -> scenery uses persisted SigLIP embedding diversity and up to 4 downscaled
+     answer images; doc/person/location/time stay text-only
   -> clean Gemma answer turn
-  -> concise answer, contextual follow-ups, live QP output, and Time stats
+  -> concise answer and contextual follow-ups while the full grid stays visible
 ```
 
 ## Module contracts
@@ -45,7 +50,8 @@ Search field visible
 - Preparation is background-owned, resumable, foreground-notified, and
   persisted. The Activity observes state; it does not own long-running work.
 - Exact model contracts are fixed: SigLIP2 image/text at normalized 768-D,
-  PP-OCRv5, YuNet, FaceNet-512, and Gemma 4 E4B LiteRT-LM on CPU. Do not
+  bundled ML Kit Text Recognition v2, YuNet, FaceNet-512, and Gemma 4 E4B
+  LiteRT-LM on CPU. Do not
   silently substitute Gemma 3 270M, GGUF, another SigLIP export, or another
   face model.
 - MediaStore IDs are stable identities across SQLite, TurboQuant, face rows,
@@ -54,57 +60,97 @@ Search field visible
 - Image encoding belongs to indexing. Search uses the SigLIP text encoder,
   SQLite, and the resident native vector index; it must not run the vision
   encoder or copy all vectors into Kotlin.
-- OCR is indexing-time data and currently uses bounded SQLite keyword matching.
-  Multi-word concepts stay phrase branches, and OCR exclusions run before
-  evidence selection.
+- OCR is indexing-time data and uses a distinct planner-authored `ocr`
+  predicate. A doc plan fuses one conceptual SigLIP semantic phrase with one
+  short OCR-keyword list using `+`; OCR keywords are OR alternatives, matching
+  more keywords raises the OCR score, and semantic+OCR overlap gets a fusion
+  bonus. OCR exclusions run before evidence selection.
+- OCR inputs preserve aspect ratio; long images use overlapping region-decoded
+  tiles. Confidence/structure gating removes isolated hallucinations.
+  `ocr_signature` enables OCR-only migrations without touching visual,
+  location, face, cluster, or episode state.
 - Face vectors are encrypted and separate from the visual index. Only named
   clusters are authoritative person metadata. Face crops link a local name to
   a specific G record; they are identity aids, not extra gallery sources.
 - Face UI virtualizes the complete stable cluster snapshot, supports one-pass
   multi-select merge progress, permits Skip after three named groups, and is
   revisitable from Settings.
-- Query planning uses one bracketed C-like AST on both paths: semantic union
+- Query planning uses Gemma 4 E4B only and one bracketed C-like AST: semantic union
   `,`, fused addition `+`, subtraction `-`, intersection `&&`, and postfix
-  `SORT_DATE`/`SORT_LOC`. Clear structured queries use the fast deterministic
-  path; ambiguous/relational queries use Gemma 4. The AST executes recursively
-  and is diagnostic-only.
+  `SORT_DATE`/`SORT_LOC`. Every plan begins with exactly one `query_category`
+  (`doc`, `scenary`, `person`, `location`, or `time`). Invalid output gets one
+  Gemma repair turn and then fails explicitly; deterministic fallback planning
+  is disabled. The AST executes recursively and is diagnostic-only.
+- Date predicates require explicit user temporal intent. Undated present-tense,
+  amount, and spending queries must not acquire an implicit today range. A
+  single exact date must emit equal `from_date` and `to_date`; reject and repair
+  a missing or unequal endpoint before search. Day-first forms such as
+  `24 July 2026` and `24/07/2026` resolve to one closed day. Explicit after,
+  before, and since queries may remain one-sided.
+- Content words are not MIME values. MIME remains exactly `photos` or `videos`;
+  terms such as movie, movie ticket, receipt, scan, and document may remain in
+  semantic/OCR content. Semantic cleanup removes modality words only when an
+  actual matching MIME predicate already represents them.
 - Named people, time, location, MIME, OCR exclusions, and visual negations are
   hard scopes. They are enforced before ranking, evidence grouping, diversity,
   and Gemma. A known-empty scope must not widen to unrelated semantic hits.
+- Face tagging stores one normal display name plus an exclusive `is_self`
+  marker. Presence-oriented I/me/my queries resolve to that person; document
+  ownership or agency such as “my passport” and “I spent” remains OCR-only.
+- Identity/document fields including passport, DL, SSN, PAN, Aadhaar, ID
+  number, passwords, user IDs, DOB, exact age, and marks route to `doc`.
+  A named document subject remains OCR wording rather than an automatic face
+  constraint.
 - Location keeps raw GPS and a readable name persisted during indexing.
+  Android 10+ requires `ACCESS_MEDIA_LOCATION` plus
+  `MediaStore.setRequireOriginal()` before photo EXIF is authoritative.
   Android Geocoder is primary; the optional rate-limited OpenStreetMap fallback
   receives only coarse coordinates and is switchable in Settings. Successful
-  reverse geocodes are cached durably; unresolved GPS stays retryable. Capture
-  time is preferred over modified time.
+  reverse geocodes are cached durably; unresolved GPS stays retryable, while
+  the `0°,0°` missing-value sentinel is discarded. Capture time is preferred
+  over modified time.
 - Retrieval is synchronous on the search executor, not on the UI thread. It
   combines native semantic search and SQLite metadata/OCR matching, dedupes
-  variants, keeps the native index resident, and releases only memory-heavy
-  encoders when appropriate.
+  variants, and treats `0.10` as the primary inclusive confidence cutoff. When
+  a positive semantic and scoped metadata branch would otherwise be empty, it
+  publishes at most 200 nearest neighbors inside the accumulated hard scope.
+  Never apply that fallback to a subtraction branch. Keep the native index
+  resident and release only memory-heavy encoders when appropriate.
 - Episode construction is a derived SQLite index built after face clustering.
   It groups the full gallery by time, place, and anonymous face overlap.
   Query-time EvidenceBuilder only joins ranked IDs to episode memberships and
   chooses the highest-ranked matching member per episode.
 - Resumable metadata-only passes reuse face clusters when every face assignment
   still joins a cluster. Empty or dangling cluster IDs are the rebuild signal.
-- Context Picker privately selects at most 16 images. It preserves relevance, covers
-  requested person/place/OCR/time facets, prefers unseen episodes, and fills
-  remaining slots using visual, OCR, metadata, place, and timeline novelty.
-- Gemma uses one resident CPU engine, a warmed planner preface/KV session, and
-  a separate clean answer conversation. The planner session closes before
-  retrieval, bitmap work, and answer assembly. Planner/answer generation is
-  serialized and logs only privacy-safe timing/token counters.
-- The answer prompt joins G labels, pixels, named people, face anchors,
+- OCR indexing persists `doc` for images with any recognized text and `scenary`
+  otherwise. The QP category hard-scopes retrieval. Context Picker privately
+  selects at most 8 eligible records, preserves relevance, prefers unseen
+  episodes, and uses persisted SigLIP embedding novelty only for scenary.
+  It never decodes images. Answer prompts pass
+  the complete selected OCR and metadata text without prompt-side truncation.
+- Gemma uses one resident engine with the frozen QP/language path on CPU and
+  only the vision encoder/adapter on GPU (CPU-vision initialization fallback),
+  a warmed planner preface/KV session, and a separate clean answer
+  conversation. The planner session closes before retrieval, bitmap work, and
+  answer assembly. Planner/answer generation is serialized and logs only
+  privacy-safe aggregate timing/token/prompt-size counters.
+- The answer prompt joins G labels, named people,
   capture time, readable/raw location, MIME/duration, relevant OCR, episode
-  rows, and optional C context. Gemma reasons over the complete board together,
-  not one image at a time.
+  rows, optional C context, and at most four downscaled scenery images. Exact
+  duplicate structured rows are grouped so
+  the model receives the same facts once, and only category-needed fields are
+  carried. Gemma reasons over the complete selected context together.
 - Answers are natural and calibrated: visual tiles can support activity claims;
   metadata can establish presence/time but not activity; birthday-event dates
   are not birthdates; readable locations are preferred. Sanitization removes
-  planner/evidence/record boilerplate and execution syntax/regex/code.
-- Follow-ups are useful, deduplicated, and capped at three. G1-G16 and C1-C4
-  user-visible results remain the newest 200 matches in the sole scrollable grid.
-  The effective QP spec appears below the search bar immediately after planning;
-  Time stats show completed phase durations beside it.
+  planner/evidence/record boilerplate, reasoning/task echoes, and execution
+  syntax/regex/code. A valid one-sentence model result is never padded with a
+  generic browse sentence.
+- Follow-ups are useful, deduplicated, and capped at three. G1-G8 and C1-C4
+  are private join labels and never appear in UI text. User-visible results
+  remain the newest 200 matches in the sole scrollable grid before, during, and
+  after answer generation. The effective QP spec appears below the search bar
+  immediately after planning; Time stats show completed phase durations beside it.
 - Personal context is opt-in, separately encrypted, filtered, bounded, and
   queried only when the plan requests it. It must never become an implicit
   cloud or full-notification context path.
@@ -123,18 +169,35 @@ Search field visible
 
 ## Current validation memory
 
-- The current location/episode/context-picker/QP refactor passes 19 JVM
-  contract tests, Android lint, debug and release assembly, APK signature
-  verification, install, launch, and live search on device `RZCY92NW2AZ`.
-- The verified device database has integrity `ok`: 16,197 media rows, 100/100
-  GPS rows resolved, 39 durable locality cache entries, no pending GPS rows,
+- The current v0.2 pipeline passes 46 JVM contract tests plus the Rust/JNI and
+  debug APK build. The APK passes v2 signature and zip-alignment verification,
+  installs with `adb install -r -d`, and launches normally on Samsung SM-S938B
+  device `RZCY92NW2AZ`.
+- The verified device database has integrity `ok`: 16,197 media rows, 9,934
+  valid GPS rows resolved (9,834 photos plus 100 videos), 1,324 durable
+  locality cache entries, no pending GPS rows,
   and 2,015 episodes whose 16,197 memberships cover every media row exactly
   once. Existing 3,494 face clusters were reused with no unassigned faces.
-- Prior device measurements were approximately 5 ms fast-path planning,
-  3.1–3.7 s retrieval, and 45 s Gemma answer generation. Do not claim device
-  speed improvements without fresh phase traces.
-- The face review surface now shows all 3,469 current clusters in one stable
-  virtualized snapshot; nine are named, so search is unlocked. A live typo query
-  compiled to `[person == Ravi] && [semantic == team outing] && [mime type == photos]`
-  and displayed the spec below the search bar before retrieval. Continue the
-  full ten-query matrix for latency, answer calibration, and location coverage.
+- The persisted OCR category partition is 2,576 `doc` rows plus 13,621
+  `scenary` rows. The semantic threshold is inclusive `0.10`: current direct
+  no-fallback photo counts are beach 118, sunset 219, car 58, swimming 75,
+  receipt 255, and restaurant bill 116.
+- Exact-day live QP:
+  `Show photos taken on 5 October 2025` compiled to equal
+  `from_date`/`to_date` values of `2025-10-05` and returned 21 scoped results.
+- The document-retrieval contract now requires
+  `[query_category == doc] && [[semantic == conceptual phrase] +
+  [ocr == printed keywords]]`. JVM tests verify OCR OR recall, matched-keyword
+  scoring, semantic/OCR overlap boosting, self-name passport planning, and the
+  Odyssey ticket plan. Re-run the live query matrix before claiming device
+  answer quality for this new contract.
+- The installed and local v0.2 debug APK SHA-256 is
+  `3f0943dc8bdb3d85896e1649dcd97d158449a097a9c334261abf38e8c8a0f6e4`.
+  Data-preserving reinstall kept the gallery DB hash
+  `2a804f5b9a26f7f193bf947f6fa8caa17e229c7c5a9ffbc383c2ae830170d539`,
+  SigLIP index hash
+  `05f54d80eea6bf4cb92a1ad128a5fb40d892c59ed495c617af73bd5cb7ecae5d`,
+  and the 3,659,530,240-byte Gemma model unchanged.
+- Current device evidence and the ten-query audit are recorded in
+  [`QP_CONTEXT_PICKER_REPORT.md`](QP_CONTEXT_PICKER_REPORT.md). Re-run live
+  instrumentation before claiming new latency, model, index, or APK state.

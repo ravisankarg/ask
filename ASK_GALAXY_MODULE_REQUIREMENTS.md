@@ -40,12 +40,11 @@ internal planner/evidence disclaimer.
    semantic score is high.
 5. Person names are never hard-coded. Resolve any tagged name through the
    local face-cluster labels and apply the same logic for every name.
-6. Visual answer context is bounded to at most 16 query-aware, cross-episode
-   gallery representatives. Named face crops are additional identity aids,
-   not extra gallery records.
-7. Gemma must reason jointly over the query, all attached visual context,
-   face anchors, metadata, OCR, people, and personal context. It must not
-   answer one image independently and then average the results.
+6. Answer context is bounded to at most 8 query-aware, cross-episode records.
+   Doc/person/location/time are text-only. Scenary may attach at most 4
+   downscaled images from those records.
+7. Gemma must reason jointly over the query, complete selected OCR/metadata,
+   people, personal context, and any bounded scenery images.
 8. The final answer is natural language only. Never show the planner execution
    spec, regex,
    routing keys, code, “based on provided evidence,” “supplied records,”
@@ -76,7 +75,7 @@ WorkManager foreground preparation
   -> MediaStore scan into SQLite
   -> capture date/GPS extraction + cached online reverse geocoding into SQLite
   -> SigLIP2 image/frame embeddings into TurboQuant 4-bit index
-  -> PP-OCRv5 text extraction into SQLite
+  -> aspect-preserving bundled ML Kit text extraction into SQLite
   -> YuNet detection + FaceNet-512 embeddings into encrypted SQLite
   -> local face clustering and representative crops
   -> persisted episode index from time, readable location, and anonymous people
@@ -89,15 +88,17 @@ WorkManager foreground preparation
 ```text
 search field visible
   -> resident CPU Gemma 4 engine + planner preface warm-up
-  -> deterministic or Gemma QP: canonical C-like execution AST
+  -> Gemma-only QP: required query_category + canonical C-like execution AST
   -> effective QP output shown below the search bar before retrieval
   -> recursive set execution over person/date/location/MIME/semantic predicates
   -> SigLIP2 text vector + native TurboQuant search and SQLite metadata branches
   -> newest 200 matches shown immediately in the sole scrollable grid
   -> persisted episode membership join
-  -> Context Picker selects at most 16 cross-episode multimodal representatives
-  -> EXIF-correct 4x4 visual decode + query-needed metadata enrichment
-  -> one Gemma multimodal evidence board with gallery + face anchors
+  -> QP category hard-scopes the indexed result set
+  -> Context Picker selects at most 8 eligible representatives without decoding images
+  -> scenary: persisted SigLIP embedding diversity + at most 4 EXIF-correct
+     answer images downscaled to a 512 px longest edge
+  -> doc/person/location/time: complete selected OCR/metadata text with no image decode
   -> clean Gemma answer turn and bounded follow-ups
   -> 2–3 sentence answer, contextual follow-ups, and expandable Time stats
 ```
@@ -156,7 +157,7 @@ Fixed model roles:
 | --- | --- |
 | SigLIP2 image | direct `SigLIP2-base-patch16-224`, normalized 768-D image vector |
 | SigLIP2 text | aligned text tower, tokenizer IDs `[1,64]`, normalized 768-D vector |
-| OCR | pinned PP-OCRv5 detector/recognizer, text stored in SQLite |
+| OCR | bundled ML Kit Text Recognition v2 Latin `16.0.1`, confidence-gated text stored in SQLite |
 | face detection | YuNet boxes + five landmarks |
 | face identity | FaceNet-512, aligned `160x160x3` RGB -> 512-D vector |
 | planner/answer | `google/gemma-4-E4B-it` LiteRT-LM, CPU resident |
@@ -292,21 +293,41 @@ Requirements:
 Primary files:
 
 - `OcrIndexer.kt`
-- `PpOcrEngine.kt`
+- `MlKitOcrEngine.kt`
+- `OcrMediaReader.kt`
+- `OcrIndexContract.kt`
+- `OcrReindexWorker.kt`
 - `GalleryDatabase.kt`
 
 Requirements:
 
 - OCR is extracted at indexing time and stored per media item.
+- The bundled ML Kit Text Recognition v2 Latin model is available immediately
+  offline. OCR does not require a model download after installation.
+- Preserve source aspect ratio. Region-decode very tall/wide images as
+  overlapping strips so a long screenshot never becomes an unreadable
+  thumbnail or a huge full-image allocation.
+- Apply line confidence and document-structure validation before a row becomes
+  `doc`; isolated short hallucinations are not indexed.
+- Version the engine, preprocessing, and quality gate with `ocr_signature`.
+  A signature migration must enqueue only image OCR rows.
+- Commit `ocr_text`, `content_class`, `ocr_indexed`, and `ocr_signature`
+  atomically. A failed inference stays pending for retry.
+- The OCR-only worker must never invoke MediaStore scan, geocoding, visual
+  embedding, face indexing/clustering, or episode rebuilding.
+- OCR-derived `doc` classification applies to images. Do not spend OCR
+  inference on video keyframes.
 - Current OCR retrieval is keyword/SQLite matching, not a semantic OCR vector
   index. Do not describe it as semantic search.
-- OCR queries such as “electricity bill” should use OCR terms and may union a
-  semantic branch when the planner says so.
+- Every `doc` query must fuse one conceptual semantic branch with one
+  planner-authored OCR-keyword branch using `+`. OCR keywords are matched
+  against `ocr_text` only with OR recall; matching more terms raises the OCR
+  score, and matching both retrieval branches earns a fusion bonus.
 - OCR exclusions must be applied before answer evidence selection.
-- Keep OCR snippets bounded in prompts; retain query-term-centered windows
-  instead of dumping full OCR blobs.
-- OCR inference uses bounded parallel workers with independent interpreter
-  buffers; SQLite writes remain serialized.
+- For selected document evidence, pass the complete OCR text to Gemma; do not
+  use query-term-centered windows or prompt-side OCR truncation.
+- OCR inference uses bounded parallel workers with independent recognizers;
+  SQLite writes remain serialized.
 
 ### 4.7 Face detection, identity, clustering, and encryption
 
@@ -328,6 +349,10 @@ Requirements:
   separate from the visual retrieval index.
 - Clustering creates anonymous stable groups. Existing labels must survive
   centroid refresh when the refreshed centroid matches the prior group.
+- One normally named cluster may carry the exclusive local `is_self` marker.
+  Rebuilds and merges must preserve it with the matched identity; changing it
+  clears the marker from every other cluster without touching vectors or
+  labels.
 - Only named clusters become authoritative person metadata for query scoping
   and answer identity links.
 - `TaggedFaceOccurrence` is the bridge from a named local cluster to a
@@ -357,6 +382,9 @@ Product requirements:
 - Each group needs select/name/merge affordances that remain responsive across
   the full cluster count. Keep selection stable so the user can choose every
   merge candidate before committing once.
+- The naming dialog must ask whether the group is **This is me**. Store one
+  actual display name plus the exclusive self marker rather than separate
+  `I`, `me`, and `my` labels. Explain that those pronouns map to this identity.
 - “Merge groups” must visibly enter a working state, show a polished spinner,
   disable duplicate taps, persist all selected merges, then refresh the stable
   list and selection state. Errors must restore an actionable button and
@@ -377,17 +405,21 @@ Primary files:
 - `QueryPlannerRuntime.kt`
 - `QueryScope.kt`
 
-The planner converts every query into set operations:
+Gemma 4 E4B converts every query into a category plus set operations:
 
 ```text
+required routing field: query_category
 positive semantic/OCR branches: ADD or UNION
 hard person/time/location/MIME fields: INTERSECT
 without/not/excluding branches: SUBTRACT
 last/latest requests: SORT by time
 ```
 
-Both query processors emit one canonical C-like expression. Predicates use
-only `person`, `mime type`, `from_date`, `to_date`, `location`, and `semantic`.
+There is one query processor: Gemma 4 E4B. Every expression begins with exactly
+one `[query_category == ...]` predicate joined to retrieval with `&&`. The
+allowed category values are `doc`, `scenary`, `person`, `location`, and `time`.
+Retrieval predicates use only `person`, `mime type`, `from_date`, `to_date`,
+`location`, `semantic`, and `ocr`.
 Operators and precedence are:
 
 ```text
@@ -405,31 +437,98 @@ Required examples:
 
 ```text
 Ravi without glasses
-  [[person == Ravi] && [mime type == photos]] - [semantic == glasses]
+  [query_category == scenary]
+    && [[[person == Ravi] && [mime type == photos]] - [semantic == glasses]]
 
 Meghana photos from last team outing
-  [person == Meghana] && [semantic == team outing] SORT_DATE
+  [query_category == scenary]
+    && [[person == Meghana] && [semantic == team outing]] SORT_DATE
 
 last Goa trip photos without Ramani
-  [[[location == Goa] && [mime type == photos]] - [person == Ramani]] SORT_DATE
+  [query_category == scenary]
+    && [[[location == Goa] && [mime type == photos]] - [person == Ramani]] SORT_DATE
 
 electricity bills from June 2024
-  [[from_date == 2024-06-01] && [to_date == 2024-06-30]]
-    && [semantic == electricity bill]
+  [query_category == doc]
+    && [[[from_date == 2024-06-01] && [to_date == 2024-06-30]]
+    && [semantic == electricity bill]]
+
+where did I go last month
+  [query_category == location]
+    && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END]] SORT_DATE
+
+when did Ravi go swimming
+  [query_category == time]
+    && [[person == Ravi] && [semantic == swimming]] SORT_DATE
 ```
 
 Planner requirements:
 
 - Do not hard-code Ramani, Ravi, Goa, or any example name/place.
-- Preserve exact names, places, time phrases, and negation. Never widen a
+- Classify by the information requested in the answer: OCR/written facts are
+  `doc`, who/identity is `person`, where/visited places is `location`, when/date
+  is `time`, and visual activities/content use `scenary`.
+- `mime type` is exactly `photos` or `videos`. Documents, receipts, bills,
+  invoices, scans, and screenshots are semantic/OCR concepts, never MIME.
+- `semantic` is one compact, conceptual, semantically searchable phrase. It
+  must not contain question/routing words, dates, time ranges, person names,
+  place names, or MIME words already represented by structured fields. For a
+  broad untargeted document aggregate or collection query, use one conceptual
+  phrase such as `purchase receipt payment record`; place likely printed
+  alternatives such as receipt, bill, invoice, payment, paid, purchase, total,
+  or amount in the dedicated `ocr` predicate. Never use abstract intent such
+  as spending, expenses, finances, paperwork, or documents as the only
+  semantic value. Keep the fused retrieval group intersected with any requested
+  date range.
+- Every `doc` plan must contain exactly one conceptual `semantic` predicate
+  and one planner-authored `ocr` predicate joined by `+` in the same group.
+  The `ocr` value contains 2–6 independent likely printed words. It is a
+  compact whitespace-separated list, not a phrase: `[ocr == Ravi passport]`
+  executes as `Ravi OR passport`. Match each word against `ocr_text` only;
+  any one word admits the row and matching more words raises the OCR score.
+  Fuse semantic and OCR result sets so a row found by both receives the sum of
+  both scores plus a small fusion bonus. Never join the two branches with
+  `&&`, which would discard valid single-branch matches.
+- Passport, driving licence/DL, SSN/social-security number, PAN, Aadhaar/Aadhar,
+  ID number, Wi-Fi password, password, user ID, DOB/date of birth, exact age,
+  marks, grades, scores, and report-card fields request written facts and must
+  route to `doc`. If a doc query names a known person as the document owner or
+  subject, keep that name in the OCR keywords instead of adding a face
+  predicate merely because the local face label exists.
+- For presence-oriented self references such as photos of me, who was with me,
+  where I went, what I wore, or my birthday photos, compile the exclusive
+  self label as the person predicate. Do not add a face predicate for ordinary
+  document ownership/agency such as my passport, my password, or how much I
+  spent.
+- Emit `from_date`/`to_date` only when the original query contains an explicit
+  date, month, year, weekday, season, relative-time phrase, or time of day.
+  Present tense, amount/spending wording, `when`, `latest`, and a missing date
+  do not authorize an inferred today range. Reject and repair any such invented
+  date predicates.
+- For one exact calendar day, including today or yesterday, emit both
+  `from_date` and `to_date` and make both equal the resolved ISO date. Reject a
+  missing or unequal endpoint. Explicitly open-ended wording such as after,
+  before, or since may use one boundary.
+- Required undated example:
+  `how much I spend on car repair` →
+  `[query_category == doc] &&
+  [[semantic == car repair payment record] + [ocr == car repair invoice total]]`.
+- Required broad aggregate example:
+  `how much did I spend last month` →
+  `[query_category == doc] && [[from_date == LAST_MONTH_START] &&
+  [to_date == LAST_MONTH_END] &&
+  [[semantic == purchase receipt payment record] +
+  [ocr == receipt bill invoice payment total amount]]]`.
+- `semantic` may be clarified or paraphrased into one conceptual phrase, and
+  `ocr` is planner-authored from likely printed words. Preserve exact names,
+  places, time intent, and negation; every other structured value may receive
+  only spelling correction or required date/MIME canonicalization. Never widen a
   person exclusion into a broad semantic subtraction that removes unrelated
   images merely containing the name.
-- Use Gemma 4 E4B for ambiguous/relational planning. Use the deterministic
-  fast path for clear structured queries to keep planning near milliseconds;
-  do not send every obvious “photos in 2024” query through a 20-second model
-  round-trip.
-- `mergeWithFallback` is a safety boundary: Gemma can improve semantic wording
-  but must not introduce an unrequested OCR/person/context branch.
+- Use Gemma 4 E4B for every query, including clear structured queries. The
+  deterministic compiler and fallback are disabled. If the model is missing,
+  fail clearly. If its first expression is invalid, request one repair in the
+  same conversation; if repair is invalid, fail rather than widening search.
 - The effective execution spec must describe the sanitized AST actually sent to
   retrieval, not only the raw model output.
 - Never flatten a model AST into field lists before execution; nested union,
@@ -453,7 +552,8 @@ Requirements:
 - Time scopes use MediaStore capture dates first, then bounded lazy metadata
   fallback only when the provider exposes no usable dates. Prefer capture time
   over modified time in answers.
-- MIME scopes are exact image/video filters.
+- MIME scopes accept exactly `photos` or `videos` and execute as exact
+  image/video filters. `documents` is never a MIME value.
 - Location scopes must match human place names against provider strings or
   GPS, not merely semantic similarity. Use a native/provider allowlist when
   available, then exact lazy EXIF matching.
@@ -462,8 +562,8 @@ Requirements:
 
 ### 4.11 Metadata and human-readable locations
 
-Primary files: `GalleryMetadataReader.kt`, `LocationIndexer.kt`, and
-`GalleryDatabase.kt`.
+Primary files: `MediaLocationAccess.kt`, `GalleryMetadataReader.kt`,
+`LocationIndexer.kt`, `LocationReindexWorker.kt`, and `GalleryDatabase.kt`.
 
 Location contract:
 
@@ -475,7 +575,14 @@ prompt/source display may show: Panaji, Goa, India (GPS lat, lon)
 
 Requirements:
 
-- Keep raw GPS and readable location separately. Never discard raw coordinates.
+- Keep valid raw GPS and readable location separately. Reject out-of-range
+  coordinates and the `0°,0°` EXIF missing-value sentinel.
+- On Android 10+, declare/request `ACCESS_MEDIA_LOCATION` and open photos
+  through `MediaStore.setRequireOriginal()` before reading EXIF. Ordinary
+  media-read access is redacted and must never be persisted as authoritative
+  proof that a photo has no GPS.
+- If precise-photo-location consent is unavailable, leave image location rows
+  pending while allowing the rest of indexing/search to remain usable.
 - During initial/resumable indexing, extract capture time and GPS, try Android's
   online geocoder first, then use the optional OpenStreetMap Nominatim fallback
   when the system service returns no result. Persist the readable place
@@ -489,6 +596,12 @@ Requirements:
   photos do not make repeated online calls. A GPS row that cannot resolve
   remains pending for a later preparation retry; it must not be marked as a
   human-readable location.
+- If the detailed reverse lookup has no address object, make at most one
+  serialized coarser regional lookup and keep only regional trailing display
+  components, never a house/street fallback label.
+- Database v12 and the dedicated location-only WorkManager path may invalidate
+  and rebuild only image `location_raw`, `location_name`, and enrichment state.
+  They must not modify capture time, OCR, vectors, faces, clusters, or episodes.
 - Final evidence enrichment may use a bounded compatibility fallback, but
   query-time search must normally consume the persisted place index.
 - For location filtering, direct normalized text matching is free and comes
@@ -513,11 +626,14 @@ Requirements:
   photos. If no readable place can be derived, show raw GPS or say location is
   unavailable in natural language.
 
-Device validation on 2026-07-24 superseded the earlier provider-only
-observation: ISO-6709 metadata parsing found 100 GPS rows, all 100 received
-readable persisted names, 39 coarse coordinate results were cached, and no GPS
-row remained pending. Keep both comma-separated and ISO-6709 parser contracts
-covered by unit tests.
+Device validation on 2026-07-25 superseded the earlier provider-only
+observation. Before unredacted access, only 100 video GPS rows were visible and
+location-scoped photo retrieval was empty. After the isolated v12 migration,
+explicit permission, and `setRequireOriginal()` EXIF pass, 9,834 photos plus
+100 videos have valid raw GPS and readable persisted names, 1,324 locality
+cache entries exist, and no row remains pending. Fifteen `0°,0°` photo
+sentinels were correctly classified as missing GPS. Keep comma-separated,
+ISO-6709, bounds, and Null Island parser contracts covered by tests.
 
 ### 4.12 Retrieval and hybrid fusion
 
@@ -533,9 +649,15 @@ Current execution model:
 ```text
 canonical AST -> recursive union/add/intersection/subtraction evaluation
 semantic predicate -> TurboQuant image search + SQLite OCR/place/person branch
+ocr predicate -> OCR-only SQLite OR-keyword search with matched-term scoring
+semantic + ocr -> fused union; dual-branch matches receive an additive bonus
+semantic vector branch -> prefer cosine scores at or above 0.10
+empty positive semantic + metadata branch -> up to 200 nearest candidates
+  inside the accumulated hard scope
+negative semantic branch -> strict cutoff only; never subtract nearest fallback
 hard predicate -> indexed person, MIME, date, or location ID set
 postfix sort -> capture date or readable place ordering
-bounded result set (up to 100) -> immediate newest-first UI presentation
+full evaluated set -> newest 200 shown immediately in the virtualized UI
 ```
 
 Requirements:
@@ -547,10 +669,11 @@ Requirements:
 - Semantic query variants are bounded and deduplicated. Once hard scope is
   active, one sanitized semantic branch is usually enough; extra branches
   must not escape the scope or multiply latency.
-- Preserve multi-word OCR concepts as phrase branches (for example, one
-  `electricity bill` branch), letting the SQLite probe require all phrase
-  terms. Do not split a phrase into independent OCR unions that admit records
-  containing only one generic token.
+- Normalize and deduplicate planner-authored OCR keywords, then OR-match them
+  against `ocr_text` only. A record matching one term remains eligible, while
+  records matching more terms score higher. Keep generic OCR terms paired with
+  specific document, merchant, item, or subject keywords so fusion and
+  matched-term scoring rank the intended record first.
 - Apply person/time/location/MIME/negative operations before evidence curation,
   diversity, or answer generation.
 - Keep the index resident and release only the text encoder/model component
@@ -603,7 +726,7 @@ Requirements:
   is added later, impose a fixed step/token/time budget and preserve a final
   deterministic safety boundary.
 
-### 4.14 Context Picker and diverse visual selection
+### 4.14 Category-scoped search and Context Picker
 
 Primary files:
 
@@ -614,17 +737,30 @@ Primary files:
 
 Requirements:
 
-- Select at most 16 gallery images and treat this as the complete LLM gallery
-  context; never append an uncurated metadata tail.
-- Keep one strong relevance anchor, allocate no more than two-thirds of the
-  budget to requested person/place/OCR/time/episode coverage, and retain the
-  remainder for visual/multimodal novelty.
+- During OCR indexing, persist `content_class=doc` for every image with any
+  non-empty OCR text; persist `content_class=scenary` for all other
+  images/videos. Filename heuristics must not override this classification.
+- Apply `query_category` as a hard retrieval allowlist before rendering the
+  full result browser or selecting private answer context:
+  - `doc`: indexed `doc` records;
+  - `scenary`: indexed `scenary` records;
+  - `person`: records with named-person metadata;
+  - `location`: records with resolved readable locations;
+  - `time`: records with indexed capture/modified time.
+- Select at most 8 eligible records and treat this as the complete LLM gallery
+  context; never fall back to ineligible results or append an uncurated tail.
+- Attach pixels only for `doc` and `scenary`. `person`, `location`, and `time`
+  must skip bitmap decode and visual reranking.
+- For visual categories, keep one strong relevance anchor, allocate no more
+  than two-thirds of the budget to requested facet/episode coverage, and retain
+  the remainder for visual/multimodal novelty.
 - Give each requested evidence dimension one representative before one
   dimension consumes its full allowance.
 - Prefer one query-ranked image from every unseen persisted episode before
   selecting a second view from an already represented episode.
-- Diversity must use native persisted vectors or a bounded equivalent; it must
-  not re-encode images during search.
+- Visual diversity must use native persisted vectors or a bounded equivalent;
+  it must not re-encode images during search. Metadata-only categories must not
+  invoke the visual selector.
 - Balance native visual order with retrieval relevance, OCR vocabulary
   novelty, readable-location novelty, person/media metadata, and chronological
   spread.
@@ -644,7 +780,9 @@ Primary file: `GemmaRuntime.kt`.
 Fixed runtime contract:
 
 - model file: `gemma-4-E4B-it.litertlm`;
-- CPU backend for language and vision on the target Samsung device;
+- CPU backend for the frozen QP and language graph;
+- GPU backend only for the vision encoder/adapter on the target Samsung, with
+  optional OpenCL/VNDK declarations and a CPU-vision initialization fallback;
 - resident singleton engine per app process;
 - planner system preface warmed while the search field is available;
 - planner prefill session is taken for the planning turn;
@@ -655,10 +793,11 @@ Fixed runtime contract:
 - planner sampling is deliberately constrained (`topK=16`, `topP=0.90`,
   temperature `0.10`); answer sampling is low-variance but natural (`topK=40`,
   `topP=0.92`, temperature `0.35`);
-- compiled graph image capacity is 8, while the request currently sends one
-  combined board (the board contains up to 16 gallery tiles plus face tiles);
-- configured output graph capacity is 4096 tokens because lower graph settings
-  previously caused multimodal dynamic-slice failures.
+- compiled graph image capacity remains 8, while each request sends no images
+  for doc/person/location/time and at most 4 downscaled images for scenary;
+- configured input/output graph capacity is 8192 tokens so complete selected
+  OCR/metadata and up to four scenery image inputs fit without answer-stage
+  prompt truncation.
 
 Requirements:
 
@@ -667,7 +806,9 @@ Requirements:
 - Close consumed planner sessions and release unused prefilled sessions.
 - Do not carry the planner session through retrieval: the prefilled system KV
   is reused for planning, then the session is closed immediately.
-- Keep CPU residency predictable; monitor memory pressure on the actual phone.
+- Keep residency predictable and measure native, graphics, swap, and total PSS
+  on the actual phone. CPU-only vision crossed Samsung's per-process guard;
+  do not regress the verified split backend without a device memory audit.
 - Log LiteRT-LM's privacy-safe planner/answer benchmark counters on device:
   wall time, prefill/decode token counts, time to first token, and token rates;
   never log the query, prompt, OCR, face labels, or image bytes.
@@ -675,6 +816,9 @@ Requirements:
   context in a text-only answer turn, not show a generic empty UI error.
 - Detect planner-shaped answer output and retry a clean natural-language turn;
   if it repeats, use a direct natural fallback without internal terminology.
+- Apply the same leak check to the text-only recovery turn. If sanitation
+  removes every public token, use the grounded fallback rather than an empty
+  answer card.
 - Do not lower image count/graph settings casually to hide memory failures;
   first measure image bytes, prompt tokens, model residency, and native memory.
 
@@ -691,32 +835,30 @@ person tag(s)
 capture time and modified time
 human location + raw GPS when available
 MIME/duration
-OCR snippet
+complete OCR text
 episode/group reference when applicable
 ```
 
-Identity board contract:
+Image-input contract:
 
-- one strong face crop per distinct named person, bounded to eight;
-- each tile is labeled `F#=Name from G#` and is linked to a G record;
-- upper board half contains up to 16 G visual tiles in a 4x4 layout;
-- lower board half contains labeled face tiles;
-- board is one multimodal input to reduce vision-prefill overhead;
-- face tiles are identity aids, never additional gallery sources.
-- When no named face anchors are selected, use the full board for the gallery
-  tiles rather than reserving a blank identity half. Named-person queries keep
-  the split board so Gemma can cross-reference face crops and scenes.
+- doc/person/location/time pass no image input;
+- scenary passes at most four individual images, each strictly downscaled to a
+  512 px longest edge;
+- the prompt explicitly maps image-input order to G references.
 
 Prompt requirements:
 
-- Tell Gemma to reason over the entire board and joined text together.
+- Tell Gemma to reason over the complete joined text and any scenery images.
 - Use local person tags as authoritative identity links.
 - For “when” prefer capture time; for “where” use readable location/raw GPS;
   for “who” use named tags; for OCR use only supplied OCR.
-- Keep OCR snippets in the answer prompt only when the planner identifies an
+- Keep complete OCR text in the answer prompt only when the planner identifies an
   OCR/text need. Visual records still carry pixels, people, capture time, and
   location so general answers remain joined without paying for unrelated OCR
   tokens.
+- Group exact duplicate structured field rows while preserving all associated
+  G join labels. Repetition is not context coverage and must not consume
+  avoidable prefill time.
 - For activity questions, visual tiles can prove an activity; metadata alone
   can establish presence/time but not what a person was doing.
 - For birthday queries, distinguish a birthday-event photo date from a stored
@@ -724,6 +866,9 @@ Prompt requirements:
 - For counts, report candidate episode count first when EvidenceBuilder gives
   one, then the smaller visually confirmed count if appropriate.
 - Keep G/C labels internal; never expose them in the user-visible answer.
+- Strip complete/dangling model reasoning tags and task echoes as well as
+  planner syntax. Never append generic browse filler merely to manufacture a
+  second sentence.
 - Reply in 2–3 concise sentences and add at most three useful, contextual
   follow-up queries such as who else was present or what happened that day.
 
@@ -754,9 +899,9 @@ Requirements:
   be interesting gallery queries, not source-review actions.
 - Merge model follow-ups with deterministic useful defaults, deduplicate, and
   cap at three.
-- Gallery source IDs G1–G16 and personal-context IDs C1–C4 are prompt-internal
+- Gallery source IDs G1–G8 and personal-context IDs C1–C4 are prompt-internal
   alignment aids only and must be removed from visible answer text.
-- Do not render the top-16 answer context as a second gallery or a source-chip
+- Do not render the top-8 answer context as a second gallery or a source-chip
   strip. The user-visible grid remains the full bounded search result set.
 - Clicking a result opens its EXIF-correct detail view; back navigation returns
   to the same search surface.
@@ -785,7 +930,7 @@ Requirements:
 query planning
 search/retrieval
 evidence curation
-top-16/context selection
+  top-8/context selection
 answer generation
 follow-up phase
 total
@@ -794,7 +939,7 @@ total
 - The effective execution spec belongs in the live QP panel, not hidden inside
   end-of-answer timing details. Raw planner JSON remains diagnostic-only.
 - Display up to the newest 200 results, keep `GridView` as the sole vertical
-  scroller, and never replace that grid with the private top-16 answer context.
+  scroller, and never replace that grid with the private top-8 answer context.
 - UI errors should be conversational and actionable. Avoid “evidence” as a
   generic error noun; say “matching photos or details” instead.
 - Keep QP and time telemetry compact so they do not consume the browsing area or
@@ -877,25 +1022,31 @@ Optimization rules:
 - Prewarm Gemma and SigLIP text only after the search field is available, off
   the UI thread.
 - Keep planner prompts compact and prefill stable instructions in KV.
-- Prefer deterministic planning for obvious hard-field queries.
+- Reuse the stable Gemma planner prefill and keep its output grammar compact;
+  never introduce a deterministic planning bypass.
 - Keep semantic variants bounded; do not run the same query through the text
   encoder repeatedly.
 - Use hard allowlists to reduce native search work and candidate enrichment.
 - Enrich/reverse-geocode only the final small set.
-- Use one combined visual board rather than multiple redundant image inputs.
+- Keep doc/person/location/time answer generation text-only. For scenary,
+  pass at most four separate images with a strict 512 px longest-edge bound.
 - Recycle all temporary bitmaps and close conversations in `finally` blocks.
 - Keep Gemma generation serialized and monitor system low-memory kills.
 
-Observed live baseline before the phone was disconnected:
+Verified answer-only device matrix after prompt compaction and split vision:
 
 ```text
-planner fast path: approximately 5 ms
-retrieval: approximately 3.1–3.7 s
-Gemma answer with one board: approximately 45.5 s
+doc, one board + OCR: 40.209 s
+scenary, one board: 46.984 s
+person, metadata only: 21.491 s
+location, metadata only: 29.765 s
+time, metadata only: 26.156 s
 ```
 
-The retrieval and answer timings are not yet ideal. Future work must improve
-them with device traces, not by hiding phases or weakening scope quality.
+All five produced two grounded natural sentences without private IDs or prompt
+leakage. Detailed before/after evidence is in
+`ANSWER_GENERATION_AUDIT_REPORT.md`. Visual latency remains material and must
+be improved with device traces, not by hiding phases or weakening context.
 
 ## 7. Build and handoff runbook
 
@@ -964,8 +1115,8 @@ For every query verify:
 - effective spec contains the expected person/time/location/MIME/subtraction
   scopes and no hard-coded name behavior;
 - unrelated records do not survive a named person/place/time scope;
-- visual queries attach one board with no more than 16 G tiles and the
-  correct named face tiles;
+- visual queries attach no more than four 512 px scenery images selected from
+  no more than eight G records, with the correct named face metadata;
 - metadata/OCR facts are present in the same G records used by Gemma;
 - answer has no planner/evidence/record boilerplate and no execution syntax/regex;
 - activity claims are visually calibrated and dates are capture dates;
@@ -983,18 +1134,22 @@ For every query verify:
 These are intentionally recorded so a future session does not mistake the
 previous green build for full completion:
 
-1. The target phone showed approximately 45 seconds of Gemma generation even
-   after using one visual board. Profile model prefill/decode and memory
-   pressure before making further prompt/image changes.
-2. The target phone's MediaStore GPS allowlist returned zero candidates for
-   Goa. Validate selected-photo EXIF GPS and reverse geocoder behavior after
-   reconnect; do not loosen location scope to compensate.
-3. Reconnect validation must confirm that final answer sanitation removes
-   planner/evaluation wording from model variants and that the visible fallback
-   strings remain natural.
+1. Follow-up generation is the next isolated module. Verify useful episode-aware
+   queries, dedupe, sanitation, click-through planning/search, and latency
+   without reopening the frozen QP or closed answer-context policy.
+2. Visual Gemma generation remains about 40-47 seconds on the target even
+   after duplicate-aware prompt compaction and GPU vision. Further work needs
+   LiteRT prefill/decode traces and memory measurements, not fewer public
+   results or hidden timing.
+3. OCR now uses bundled ML Kit Text Recognition v2 Latin with EXIF-aware,
+   aspect-preserving input, overlapping long-image tiles, confidence gating,
+   and a versioned OCR-only migration. Keep a script/codec-stratified review
+   item for HEIC and Indian-language text before adding another script model;
+   do not widen the current Latin index from anecdotal samples.
 
-The sanitation rule now has a pure unit-tested implementation, so model output
-cleanup can be regression-tested without opening the Android gallery database.
+The sanitation rule now has a pure unit-tested implementation for source IDs,
+reasoning tags, task echoes, boilerplate, and sentence limits, so output cleanup
+can be regression-tested without opening the Android gallery database.
 
 Source-side fixes already verified in the latest build: diversity now retains
 retrieval relevance while selecting visual variety; location allowlists cache
@@ -1005,20 +1160,23 @@ text queries use a bounded embedding cache; planner KV is released immediately
 after planning; and planner/answer sampling is explicitly tuned for structured
 routing versus natural prose; the runtime now logs privacy-safe prefill/decode
 counters; named identity boards choose the highest-confidence face crop per
-person; and answer sanitization is pure and unit-tested. OCR fallback planning
-now preserves phrase-level branches, with a regression test for the
-electricity-bill OR semantics. The fallback planner now also preserves hard
-location scopes after an infix subtraction such as "without glasses in Goa"
-and creates a bounded generic positive branch for pure-subtraction queries
-such as "photos without Ramani". The visual evidence board now uses its full
+person; answer rows are duplicate-compacted; language/QP stays on CPU while
+vision uses GPU with CPU initialization fallback; and answer sanitization is
+pure and unit-tested. The former
+deterministic/fallback planner is now disabled: Gemma emits every category and
+execution AST, gets one grammar-repair turn, and otherwise fails explicitly.
+Hard validation constrains MIME to photos/videos and keeps routing/time/place/
+person words out of semantic predicates. The visual evidence board now uses its full
 canvas when no identity face board is needed, preserving scene detail without
 adding image inputs. General visual prompts now omit unrelated OCR snippets
 while preserving OCR for explicit text questions. These reduce avoidable work
-but do not replace the live device Gemma profile or the GPS/EXIF validation
-above. The location allowlist now scans the unified MediaStore Files
+but do not replace the live device Gemma profile. The location allowlist scans
+the unified MediaStore Files
 collection for both image and video rows, matching the time-scope universe;
 the previous Images-only query could silently omit valid video location
-matches.
+matches. The photo-GPS path is now separately device-validated through
+`ACCESS_MEDIA_LOCATION`, original MediaStore URIs, a location-only migration,
+and isolation digests; do not regress it to ordinary redacted photo URIs.
 
 ## 10. Change discipline
 

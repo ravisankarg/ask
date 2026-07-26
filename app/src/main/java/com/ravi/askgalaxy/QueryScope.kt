@@ -104,6 +104,29 @@ object QueryScopeParser {
     private val MONTH_DAY_YEAR = Regex(
         "(?i)\\b(january|february|march|april|may|june|july|august|september|october|november|december)\\s+(\\d{1,2})(?:,?\\s+(\\d{4}))?\\b",
     )
+    private val DAY_MONTH_NAME_YEAR = Regex(
+        "(?i)\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+" +
+            "(january|february|march|april|may|june|july|august|september|october|november|december)" +
+            "(?:,?\\s+(\\d{4}))?\\b",
+    )
+    private val DAY_MONTH_YEAR = Regex(
+        "(?<!\\d)(\\d{1,2})[-/.](\\d{1,2})[-/.](\\d{4})(?!\\d)",
+    )
+    private val MONTH_RANGE = Regex(
+        "(?i)\\b(?:from|between)\\s+" +
+            "(january|february|march|april|may|june|july|august|september|october|november|december)" +
+            "\\s+(?:to|through|until|and|-)\\s+" +
+            "(january|february|march|april|may|june|july|august|september|october|november|december)" +
+            "\\s+(\\d{4})\\b",
+    )
+    private val OPEN_MONTH_BOUNDARY = Regex(
+        "(?i)\\b(after|since|before|until|through)\\s+" +
+            "(january|february|march|april|may|june|july|august|september|october|november|december)" +
+            "\\s+(\\d{4})\\b",
+    )
+    private val OPEN_BOUNDARY_OPERATOR = Regex(
+        "(?i)\\b(after|since|before|until|through)\\b",
+    )
     // A bare integer is not a clock time: "top 3 photos" must not become a
     // 03:00 hard scope. Require either a colon or an explicit meridiem.
     private val CLOCK = Regex("(?i)(?<!\\d)(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?\\b")
@@ -182,6 +205,31 @@ object QueryScopeParser {
 
     /** Extracts an explicit from/to range before falling back to one date window. */
     fun explicitDateBoundsFromQuery(query: String): Pair<String, String>? {
+        MONTH_RANGE.find(query)?.let { match ->
+            val firstMonth = monthNumber(match.groupValues[1]) ?: return@let
+            val secondMonth = monthNumber(match.groupValues[2]) ?: return@let
+            val year = match.groupValues[3].toIntOrNull() ?: return@let
+            val first = LocalDate.of(year, firstMonth, 1)
+            val second = LocalDate.of(year, secondMonth, 1)
+            val start = minOf(first, second)
+            val endMonth = maxOf(first, second)
+            return start.toString() to
+                endMonth.withDayOfMonth(endMonth.lengthOfMonth()).toString()
+        }
+        OPEN_MONTH_BOUNDARY.find(query)?.let { match ->
+            val operator = match.groupValues[1].lowercase(Locale.ROOT)
+            val month = monthNumber(match.groupValues[2]) ?: return@let
+            val year = match.groupValues[3].toIntOrNull() ?: return@let
+            val start = LocalDate.of(year, month, 1)
+            val end = start.withDayOfMonth(start.lengthOfMonth())
+            return when (operator) {
+                "after" -> end.plusDays(1).toString() to ""
+                "since" -> start.toString() to ""
+                "before" -> "" to start.minusDays(1).toString()
+                "until", "through" -> "" to end.toString()
+                else -> return@let
+            }
+        }
         val isoDates = ISO_DATE.findAll(query).map { it.value.replace('/', '-').replace('.', '-') }.toList()
         if (isoDates.size >= 2 && Regex("(?i)\\b(from|between)\\b").containsMatchIn(query)) {
             val first = parseFlexibleIsoDate(isoDates[0])
@@ -195,6 +243,18 @@ object QueryScopeParser {
             val first = years.min()
             val last = years.max()
             return LocalDate.of(first, 1, 1).toString() to LocalDate.of(last, 12, 31).toString()
+        }
+        OPEN_BOUNDARY_OPERATOR.find(query)?.let { operatorMatch ->
+            val base = dateBounds(explicitTimeHintFromQuery(query)) ?: return@let
+            val start = LocalDate.parse(base.first)
+            val end = LocalDate.parse(base.second)
+            return when (operatorMatch.groupValues[1].lowercase(Locale.ROOT)) {
+                "after" -> end.plusDays(1).toString() to ""
+                "since" -> start.toString() to ""
+                "before" -> "" to start.minusDays(1).toString()
+                "until", "through" -> "" to end.toString()
+                else -> return@let
+            }
         }
         return dateBounds(explicitTimeHintFromQuery(query))
     }
@@ -211,6 +271,8 @@ object QueryScopeParser {
         Regex("(?i)\\b(this|current)\\s+year\\b").find(query)?.let { return "this year" }
         ISO_DATE.find(query)?.value?.let { return it }
         MONTH_DAY_YEAR.find(query)?.value?.let { return it }
+        DAY_MONTH_NAME_YEAR.find(query)?.value?.let { return it }
+        DAY_MONTH_YEAR.find(query)?.value?.let { return it }
         MONTH_NAME.find(query)?.value?.let { month ->
             YEAR.find(query)?.value?.let { year -> return "$month $year" }
         }
@@ -239,6 +301,14 @@ object QueryScopeParser {
             month = monthNumber(match.groupValues[1])
             day = match.groupValues[2].toIntOrNull()
             year = match.groupValues[3].takeIf(String::isNotBlank)?.toIntOrNull()
+        } ?: DAY_MONTH_NAME_YEAR.find(hint)?.let { match ->
+            day = match.groupValues[1].toIntOrNull()
+            month = monthNumber(match.groupValues[2])
+            year = match.groupValues[3].takeIf(String::isNotBlank)?.toIntOrNull()
+        } ?: DAY_MONTH_YEAR.find(hint)?.let { match ->
+            day = match.groupValues[1].toIntOrNull()
+            month = match.groupValues[2].toIntOrNull()
+            year = match.groupValues[3].toIntOrNull()
         } ?: MONTH_NAME.find(hint)?.let { match ->
             month = monthNumber(match.groupValues[1])
         }

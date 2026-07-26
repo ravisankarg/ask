@@ -15,9 +15,8 @@ enum class QueryMediaType {
 
     companion object {
         fun fromToken(value: String): QueryMediaType? = when (value.trim().lowercase()) {
-            "p", "photo", "photos", "picture", "pictures", "image", "images", "still", "stills",
-            "document", "documents", "scan", "scans" -> PHOTOS
-            "v", "video", "videos", "movie", "movies", "clip", "clips" -> VIDEOS
+            "photos" -> PHOTOS
+            "videos" -> VIDEOS
             else -> null
         }
     }
@@ -30,6 +29,50 @@ enum class QueryMediaType {
     fun mimePrefix(): String = when (this) {
         PHOTOS -> "image/"
         VIDEOS -> "video/"
+    }
+}
+
+/**
+ * Primary answer intent emitted by Gemma with every execution spec.
+ *
+ * `scenary` intentionally preserves the product vocabulary requested for the
+ * broad visual/activity category. It is the only catch-all; the other values
+ * route the Context Picker toward the evidence channel needed for the answer.
+ */
+enum class QueryCategory(val wireName: String) {
+    DOC("doc"),
+    SCENARY("scenary"),
+    PERSON("person"),
+    LOCATION("location"),
+    TIME("time"),
+    ;
+
+    fun answerEvidenceScope(): AnswerEvidenceScope = when (this) {
+        DOC -> AnswerEvidenceScope(
+            kinds = setOf(
+                AnswerEvidenceKind.OCR,
+                AnswerEvidenceKind.METADATA,
+                AnswerEvidenceKind.PERSONAL_CONTEXT,
+            ),
+        )
+        SCENARY -> AnswerEvidenceScope(setOf(AnswerEvidenceKind.VISUAL))
+        PERSON -> AnswerEvidenceScope(
+            kinds = setOf(AnswerEvidenceKind.METADATA),
+            metadataFields = setOf(AnswerMetadataField.PEOPLE),
+        )
+        LOCATION -> AnswerEvidenceScope(
+            kinds = setOf(AnswerEvidenceKind.METADATA),
+            metadataFields = setOf(AnswerMetadataField.LOCATION),
+        )
+        TIME -> AnswerEvidenceScope(
+            kinds = setOf(AnswerEvidenceKind.METADATA),
+            metadataFields = setOf(AnswerMetadataField.TIME),
+        )
+    }
+
+    companion object {
+        fun fromWireName(value: String): QueryCategory? =
+            entries.firstOrNull { it.wireName == value.trim().lowercase() }
     }
 }
 
@@ -219,6 +262,7 @@ data class QueryPlan(
     val sortByLocation: Boolean = false,
     val needsPersonalContext: Boolean = false,
     val mediaType: QueryMediaType? = null,
+    val queryCategory: QueryCategory = QueryCategory.SCENARY,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
     val executionSpec: QueryExecutionSpec? = null,
 ) {
@@ -276,6 +320,10 @@ data class QueryPlan(
 
     fun canonicalExecutionSpec(): QueryExecutionSpec? {
         executionSpec?.let { return it }
+        val categoryPredicate = ExecutionNode.Predicate(
+            ExecutionField.QUERY_CATEGORY,
+            queryCategory.wireName,
+        )
         val hardPredicates = buildList<ExecutionNode> {
             personNames.filter(String::isNotBlank).forEach {
                 add(ExecutionNode.Predicate(ExecutionField.PERSON, it))
@@ -293,14 +341,20 @@ data class QueryPlan(
                 add(ExecutionNode.Predicate(ExecutionField.LOCATION, it))
             }
         }
-        val semanticPredicates: List<ExecutionNode> = (semanticQueries + ocrTerms)
+        val retrievalPredicates: List<ExecutionNode> = semanticQueries
             .filter(String::isNotBlank)
             .distinctBy { it.lowercase() }
             .map { ExecutionNode.Predicate(ExecutionField.SEMANTIC, it) }
-        val semanticNode = semanticPredicates.reduceOrNull { left, right ->
+            .plus(
+                ocrTerms
+                    .filter(String::isNotBlank)
+                    .distinctBy { it.lowercase() }
+                    .map { ExecutionNode.Predicate(ExecutionField.OCR, it) },
+            )
+        val retrievalNode = retrievalPredicates.reduceOrNull { left, right ->
             ExecutionNode.Binary(left, ExecutionBinaryOperator.ADD, right)
         }
-        val positiveNodes = hardPredicates + listOfNotNull(semanticNode)
+        val positiveNodes = hardPredicates + listOfNotNull(retrievalNode)
         var root = positiveNodes.reduceOrNull { left, right ->
             ExecutionNode.Binary(left, ExecutionBinaryOperator.INTERSECT, right)
         }
@@ -308,11 +362,17 @@ data class QueryPlan(
             excludedPersonNames.filter(String::isNotBlank).forEach {
                 add(ExecutionNode.Predicate(ExecutionField.PERSON, it))
             }
-            (negativeSemanticQueries + excludedOcrTerms)
+            negativeSemanticQueries
                 .filter(String::isNotBlank)
                 .distinctBy { it.lowercase() }
                 .forEach {
                     add(ExecutionNode.Predicate(ExecutionField.SEMANTIC, it))
+                }
+            excludedOcrTerms
+                .filter(String::isNotBlank)
+                .distinctBy { it.lowercase() }
+                .forEach {
+                    add(ExecutionNode.Predicate(ExecutionField.OCR, it))
                 }
         }
         if (root == null && negativeNodes.isNotEmpty()) {
@@ -328,13 +388,24 @@ data class QueryPlan(
                 negative,
             )
         }
+        if (root != null) {
+            root = ExecutionNode.Binary(
+                categoryPredicate,
+                ExecutionBinaryOperator.INTERSECT,
+                root,
+            )
+        }
         if (recentFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
         if (sortByLocation && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)
         return root?.let(::QueryExecutionSpec)
     }
 
     companion object {
-        fun fallback(query: String): QueryPlan {
+        @Deprecated(
+            message = "Deterministic query planning is disabled; use QueryPlannerRuntime",
+            level = DeprecationLevel.ERROR,
+        )
+        private fun fallback(query: String): QueryPlan {
             val normalized = query.trim()
                 .replace(Regex("(?i)\\bwith\\s+out\\b"), "without")
                 .replace(Regex("\\s+"), " ")

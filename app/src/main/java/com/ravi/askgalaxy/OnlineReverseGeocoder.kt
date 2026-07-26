@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URLEncoder
@@ -32,11 +33,22 @@ class OnlineReverseGeocoder(
         val roundedLatitude = roundToLocality(latitude)
         val roundedLongitude = roundToLocality(longitude)
         return REQUEST_LOCK.runSerialized {
-            request(roundedLatitude, roundedLongitude)
+            request(roundedLatitude, roundedLongitude, DETAIL_ZOOM, ADDRESS_LAYER)
+        } ?: REQUEST_LOCK.runSerialized {
+            // Some valid camera coordinates sit in parks, beaches, water, or
+            // roadless areas and have no zoom-14 address object. A second,
+            // coarser reverse lookup produces a city/region/country name
+            // without transmitting any additional coordinate precision.
+            request(roundedLatitude, roundedLongitude, REGION_ZOOM, null)
         }
     }
 
-    private fun request(latitude: Double, longitude: Double): String? {
+    private fun request(
+        latitude: Double,
+        longitude: Double,
+        zoom: Int,
+        layer: String?,
+    ): String? {
         val language = Locale.getDefault().toLanguageTag()
             .takeIf(String::isNotBlank)
             ?: "en"
@@ -44,9 +56,9 @@ class OnlineReverseGeocoder(
             append("format=jsonv2")
             append("&lat=").append(latitude)
             append("&lon=").append(longitude)
-            append("&zoom=14")
+            append("&zoom=").append(zoom)
             append("&addressdetails=1")
-            append("&layer=address")
+            if (layer != null) append("&layer=").append(layer)
             append("&accept-language=")
             append(URLEncoder.encode(language, StandardCharsets.UTF_8.name()))
         }
@@ -64,7 +76,10 @@ class OnlineReverseGeocoder(
                 "User-Agent",
                 "AskGalaxy/${BuildConfig.VERSION_NAME} (Android; ${BuildConfig.APPLICATION_ID})",
             )
-            if (connection.responseCode != HttpURLConnection.HTTP_OK) return null
+            if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "OpenStreetMap reverse lookup returned HTTP ${connection.responseCode}")
+                return null
+            }
             val body = connection.inputStream.bufferedReader().use { reader ->
                 reader.readText().take(MAX_RESPONSE_CHARACTERS)
             }
@@ -77,7 +92,8 @@ class OnlineReverseGeocoder(
     }
 
     private fun readableAddress(result: JSONObject): String? {
-        val address = result.optJSONObject("address") ?: return null
+        val address = result.optJSONObject("address")
+        if (address == null) return coarseDisplayName(result)
         val locality = firstNonBlank(
             address,
             "neighbourhood",
@@ -98,7 +114,19 @@ class OnlineReverseGeocoder(
             .distinctBy { value -> value.lowercase(Locale.ROOT) }
             .joinToString(", ")
             .takeIf(String::isNotBlank)
+            ?: coarseDisplayName(result)
     }
+
+    /** Keeps only regional trailing components, never a house/street address. */
+    private fun coarseDisplayName(result: JSONObject): String? =
+        result.optString("display_name")
+            .split(',')
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .takeLast(MAX_DISPLAY_NAME_PARTS)
+            .distinctBy { value -> value.lowercase(Locale.ROOT) }
+            .joinToString(", ")
+            .takeIf(String::isNotBlank)
 
     private fun firstNonBlank(source: JSONObject, vararg keys: String): String? =
         keys.asSequence()
@@ -125,6 +153,11 @@ class OnlineReverseGeocoder(
 
     private companion object {
         const val ENDPOINT = "https://nominatim.openstreetmap.org/reverse"
+        const val TAG = "AskGalaxyGeocoder"
+        const val DETAIL_ZOOM = 14
+        const val REGION_ZOOM = 8
+        const val ADDRESS_LAYER = "address"
+        const val MAX_DISPLAY_NAME_PARTS = 3
         const val CONNECT_TIMEOUT_MS = 6_000
         const val READ_TIMEOUT_MS = 8_000
         const val MAX_RESPONSE_CHARACTERS = 64_000

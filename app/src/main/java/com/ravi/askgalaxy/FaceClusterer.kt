@@ -35,6 +35,7 @@ class FaceClusterer(
             FaceClusterAssignment(
                 clusterId = id,
                 label = match?.label.orEmpty(),
+                isSelf = match?.isSelf == true,
                 centroid = cluster.centroid,
                 representativeMediaStoreId = representative.mediaStoreId,
                 representativeFaceId = representative.id,

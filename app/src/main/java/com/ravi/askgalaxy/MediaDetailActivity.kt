@@ -181,6 +181,7 @@ class MediaDetailActivity : Activity() {
         private const val EXTRA_DURATION = "duration"
         private const val EXTRA_PERSON = "person"
         private const val EXTRA_OCR = "ocr"
+        private const val EXTRA_CONTENT_CLASS = "media_content_class"
         private const val EXTRA_CAPTURE = "capture"
         private const val EXTRA_LOCATION = "location"
         private const val EXTRA_LOCATION_NAME = "location_name"
@@ -197,6 +198,7 @@ class MediaDetailActivity : Activity() {
                 putExtra(EXTRA_DURATION, media.durationMs)
                 putExtra(EXTRA_PERSON, media.personLabel)
                 putExtra(EXTRA_OCR, media.ocrText)
+                putExtra(EXTRA_CONTENT_CLASS, media.contentClass.wireName)
                 putExtra(EXTRA_CAPTURE, media.dateTakenMs ?: -1L)
                 putExtra(EXTRA_LOCATION, media.location)
                 putExtra(EXTRA_LOCATION_NAME, media.locationName)
@@ -216,6 +218,9 @@ class MediaDetailActivity : Activity() {
                 durationMs = intent.getLongExtra(EXTRA_DURATION, 0L),
                 personLabel = intent.getStringExtra(EXTRA_PERSON),
                 ocrText = intent.getStringExtra(EXTRA_OCR).orEmpty(),
+                contentClass = MediaContentClass.fromWireName(
+                    intent.getStringExtra(EXTRA_CONTENT_CLASS),
+                ),
                 dateTakenMs = intent.getLongExtra(EXTRA_CAPTURE, -1L).takeIf { it > 0L },
                 location = intent.getStringExtra(EXTRA_LOCATION),
                 locationName = intent.getStringExtra(EXTRA_LOCATION_NAME),

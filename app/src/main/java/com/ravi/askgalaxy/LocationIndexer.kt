@@ -24,9 +24,11 @@ class LocationIndexer(
     context: Context,
     private val database: GalleryDatabase,
 ) {
-    private val metadataReader = GalleryMetadataReader(context.applicationContext)
+    private val appContext = context.applicationContext
+    private val metadataReader = GalleryMetadataReader(appContext)
 
     fun indexBlocking(
+        shouldContinue: () -> Boolean = { true },
         onProgress: (LocationIndexProgress) -> Unit = {},
     ): LocationIndexProgress {
         val pending = database.pendingLocationMetadata()
@@ -37,12 +39,36 @@ class LocationIndexer(
         var resolved = 0
         var retryable = 0
         pending.forEach { media ->
+            if (!shouldContinue()) {
+                return LocationIndexProgress(completed, pending.size, withGps, resolved, retryable)
+            }
+            val imageNeedsConsent =
+                media.mimeType.startsWith("image/", ignoreCase = true) &&
+                    !MediaLocationAccess.hasPermission(appContext)
+            if (imageNeedsConsent) {
+                // Leave the row pending. Redacted EXIF must never be persisted
+                // as authoritative proof that this image has no GPS.
+                completed += 1
+                retryable += 1
+                publishIfNeeded(
+                    completed,
+                    pending.size,
+                    withGps,
+                    resolved,
+                    retryable,
+                    onProgress,
+                )
+                return@forEach
+            }
             val enriched = metadataReader.enrich(
                 media,
                 setOf(AnswerMetadataField.TIME, AnswerMetadataField.LOCATION),
                 includeLocationName = false,
             )
-            val rawLocation = enriched.location?.trim()?.takeIf(String::isNotBlank)
+            val rawLocation = enriched.location
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+                ?.takeIf { GalleryMetadataReader.parseCoordinates(it) != null }
             val locationName = rawLocation?.let { raw ->
                 val key = metadataReader.locationCacheKey(raw)
                 val cached = key?.let(database::cachedLocationName)
@@ -61,19 +87,37 @@ class LocationIndexer(
             if (rawLocation != null) withGps += 1
             if (locationName != null) resolved += 1
             if (rawLocation != null && locationName == null) retryable += 1
-            if (completed == pending.size || completed % PROGRESS_INTERVAL == 0) {
-                onProgress(
-                    LocationIndexProgress(
-                        completed = completed,
-                        total = pending.size,
-                        withGps = withGps,
-                        resolved = resolved,
-                        retryable = retryable,
-                    ),
-                )
-            }
+            publishIfNeeded(
+                completed,
+                pending.size,
+                withGps,
+                resolved,
+                retryable,
+                onProgress,
+            )
         }
         return LocationIndexProgress(completed, pending.size, withGps, resolved, retryable)
+    }
+
+    private fun publishIfNeeded(
+        completed: Int,
+        total: Int,
+        withGps: Int,
+        resolved: Int,
+        retryable: Int,
+        onProgress: (LocationIndexProgress) -> Unit,
+    ) {
+        if (completed == total || completed % PROGRESS_INTERVAL == 0) {
+            onProgress(
+                LocationIndexProgress(
+                    completed = completed,
+                    total = total,
+                    withGps = withGps,
+                    resolved = resolved,
+                    retryable = retryable,
+                ),
+            )
+        }
     }
 
     private companion object {

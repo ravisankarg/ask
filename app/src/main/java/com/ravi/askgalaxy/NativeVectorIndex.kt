@@ -140,6 +140,12 @@ class NativeVectorIndex private constructor(
             }
         }
 
+        /** Clears only the persisted visual vector index; SQLite metadata remains intact. */
+        fun clearPersisted(context: Context) {
+            releaseResident()
+            indexFile(context.applicationContext).delete()
+        }
+
         private fun indexFile(context: Context): File =
             File(context.filesDir, "indexes/siglip2-768-4bit.tvim")
 

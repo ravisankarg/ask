@@ -30,7 +30,7 @@ class PreparationWorker(
         } catch (error: IOException) {
             val snapshot = store.read().copy(
                 phase = PreparationPhase.RETRYING,
-                message = "Connection interrupted. Ask Galaxy will resume automatically.",
+                message = "Model download paused: ${error.message ?: "I/O error"}. Ask Galaxy will retry automatically.",
                 error = error.message.orEmpty(),
             )
             store.write(snapshot)
@@ -51,6 +51,7 @@ class PreparationWorker(
     }
 
     private suspend fun runPreparation(): Result {
+        val indexProgressStore = IndexProgressStore(applicationContext)
         var snapshot = store.read().copy(
             phase = PreparationPhase.DOWNLOADING,
             message = "Installing on-device models in the background…",
@@ -59,11 +60,12 @@ class PreparationWorker(
         store.write(snapshot)
         setForeground(PreparationNotifier.foregroundInfo(applicationContext, snapshot))
 
+        val indexingModels = ModelCatalog.all.filter { it.required && it != ModelCatalog.gemma }
         val installer = ModelInstaller(applicationContext)
-        val report = installer.installAll { progress ->
+        val report = installer.installArtifacts(indexingModels) { progress ->
             snapshot = snapshot.copy(
                 phase = PreparationPhase.DOWNLOADING,
-                message = "Installing ${progress.artifact.name}…",
+                message = "Installing indexing model ${progress.artifact.name}…",
                 current = progress.bytesDownloaded,
                 total = progress.bytesTotal,
                 modelCurrent = progress.artifactIndex.toLong() - 1L,
@@ -123,6 +125,42 @@ class PreparationWorker(
             var lastPublishedStage: EmbeddingStage? = null
             var lastPublishedAtMs = 0L
             val progress = indexer.indexEmbeddingsBlocking { update ->
+                when (update.stage) {
+                    EmbeddingStage.LOCATION -> indexProgressStore.update(
+                        IndexProgressStage.LOCATION,
+                        update.locationCompleted.toLong(),
+                        update.locationTotal.toLong(),
+                    )
+                    EmbeddingStage.IMAGE -> indexProgressStore.update(
+                        IndexProgressStage.VISUAL,
+                        update.completed.toLong(),
+                        update.total.toLong(),
+                    )
+                    EmbeddingStage.OCR -> indexProgressStore.update(
+                        IndexProgressStage.OCR,
+                        update.ocrCompleted.toLong(),
+                        update.ocrTotal.toLong(),
+                    )
+                    EmbeddingStage.FACE -> indexProgressStore.update(
+                        IndexProgressStage.FACE,
+                        update.faceCompleted.toLong(),
+                        update.faceTotal.toLong(),
+                    )
+                    EmbeddingStage.CLUSTERING -> if (update.clusteringComplete) {
+                        indexProgressStore.update(
+                            IndexProgressStage.FACE,
+                            update.faceTotal.toLong(),
+                            update.faceTotal.toLong(),
+                            completed = true,
+                        )
+                    }
+                    EmbeddingStage.EPISODES -> indexProgressStore.update(
+                        IndexProgressStage.EPISODE,
+                        update.episodeCount.toLong(),
+                        update.episodeCount.toLong(),
+                        completed = update.episodeIndexComplete,
+                    )
+                }
                 val message = when (update.stage) {
                     EmbeddingStage.LOCATION ->
                         "Resolving photo locations: ${update.locationCompleted}/${update.locationTotal}"
@@ -201,6 +239,30 @@ class PreparationWorker(
             } else {
                 PreparationPhase.READY
             }
+            indexProgressStore.update(
+                IndexProgressStage.VISUAL,
+                progress.completed.toLong(),
+                progress.total.toLong(),
+                completed = true,
+            )
+            indexProgressStore.update(
+                IndexProgressStage.OCR,
+                progress.ocrCompleted.toLong(),
+                progress.ocrTotal.toLong(),
+                completed = true,
+            )
+            indexProgressStore.update(
+                IndexProgressStage.FACE,
+                progress.faceTotal.toLong(),
+                progress.faceTotal.toLong(),
+                completed = true,
+            )
+            indexProgressStore.update(
+                IndexProgressStage.EPISODE,
+                progress.episodeCount.toLong(),
+                progress.episodeCount.toLong(),
+                completed = true,
+            )
             snapshot = snapshot.copy(
                 phase = finalPhase,
                 message = if (progress.needsFaceTags) {

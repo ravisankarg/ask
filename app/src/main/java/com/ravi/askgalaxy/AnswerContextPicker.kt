@@ -5,6 +5,7 @@ import java.time.ZoneId
 import java.util.Locale
 
 enum class AnswerCoverageFacet {
+    CATEGORY_MATCH,
     RELEVANCE,
     VISUAL_DIVERSITY,
     PERSON,
@@ -23,21 +24,57 @@ data class AnswerContextBundle(
     val items: List<AnswerContextItem>,
     val metadataFields: Set<AnswerMetadataField>,
     val includeOcr: Boolean,
+    val queryCategory: QueryCategory,
+    val includeVisuals: Boolean,
+    val inputCandidateCount: Int,
+    val eligibleCandidateCount: Int,
 ) {
-    val images: List<GalleryMedia>
+    val records: List<GalleryMedia>
         get() = items.map { it.media }
 }
 
+/** Converts the Gemma category into the same eligibility policy used by search and answers. */
+object QueryCategoryContextPolicy {
+    const val SCENARY_ANSWER_IMAGE_LIMIT = 4
+    const val SCENARY_ANSWER_IMAGE_MAX_DIMENSION = 512
+
+    fun answerImageLimit(category: QueryCategory): Int = when (category) {
+        QueryCategory.SCENARY -> SCENARY_ANSWER_IMAGE_LIMIT
+        QueryCategory.DOC,
+        QueryCategory.PERSON,
+        QueryCategory.LOCATION,
+        QueryCategory.TIME,
+        -> 0
+    }
+
+    fun includesVisuals(category: QueryCategory): Boolean =
+        answerImageLimit(category) > 0
+
+    fun accepts(category: QueryCategory, media: GalleryMedia): Boolean = when (category) {
+        QueryCategory.DOC -> isDocumentLike(media)
+        QueryCategory.SCENARY -> !isDocumentLike(media)
+        QueryCategory.PERSON -> !media.personLabel.isNullOrBlank()
+        QueryCategory.LOCATION -> !media.locationName.isNullOrBlank()
+        QueryCategory.TIME ->
+            media.dateTakenMs != null ||
+                media.dateModifiedSeconds > 0L
+    }
+
+    fun isDocumentLike(media: GalleryMedia): Boolean =
+        media.contentClass == MediaContentClass.DOC
+}
+
 /**
- * Query-aware top-16 context policy.
+ * Query-aware top-8 record policy.
  *
  * Selection runs in two passes:
  * 1. reserve a bounded coverage budget for requested people/place/OCR/time and
  *    EvidenceBuilder episodes;
- * 2. fill remaining slots from the native visual order using multimodal
- *    novelty. Exact media IDs and repeated facet keys are never re-added.
+ * 2. fill remaining slots from text/metadata relevance. Scenery alone may use
+ *    the persisted SigLIP embedding order for diversity. No bitmap is decoded
+ *    or passed into the picker.
  *
- * The result is the complete LLM gallery context; callers should not append a
+ * The result is the complete LLM record context; callers should not append a
  * second uncurated metadata tail after this bundle.
  */
 class AnswerContextPicker(
@@ -52,18 +89,49 @@ class AnswerContextPicker(
         rankedCandidates: List<GalleryMedia>,
         evidenceGroups: List<EvidenceGroup>,
         evidenceScope: AnswerEvidenceScope,
-        maxImages: Int = MAX_IMAGES,
+        queryCategory: QueryCategory,
+        maxRecords: Int = MAX_RECORDS,
     ): AnswerContextBundle {
-        val candidates = rankedCandidates.distinctBy { it.mediaStoreId }
-        if (candidates.isEmpty() || maxImages <= 0) {
-            return AnswerContextBundle(emptyList(), evidenceScope.metadataFields, evidenceScope.needsOcr)
+        val inputCandidates = rankedCandidates.distinctBy { it.mediaStoreId }
+        val eligibleCandidates = inputCandidates.filter {
+            QueryCategoryContextPolicy.accepts(queryCategory, it)
         }
-        val safeMax = maxImages.coerceIn(1, MAX_IMAGES)
-        val visualOrder = selectDiverse(
-            candidates,
-            minOf(candidates.size, safeMax),
-        )
-        val visualRank = visualOrder.mapIndexed { index, media -> media.mediaStoreId to index }.toMap()
+        val includeVisuals = QueryCategoryContextPolicy.includesVisuals(queryCategory)
+        if (eligibleCandidates.isEmpty() || maxRecords <= 0) {
+            return AnswerContextBundle(
+                items = emptyList(),
+                metadataFields = evidenceScope.metadataFields,
+                includeOcr = queryCategory == QueryCategory.DOC,
+                queryCategory = queryCategory,
+                includeVisuals = includeVisuals,
+                inputCandidateCount = inputCandidates.size,
+                eligibleCandidateCount = eligibleCandidates.size,
+            )
+        }
+        val safeMax = maxRecords.coerceIn(1, MAX_RECORDS)
+        val originalRank = eligibleCandidates.mapIndexed { index, media ->
+            media.mediaStoreId to index
+        }.toMap()
+        val queryText = query.lowercase(Locale.ROOT)
+        val candidates = if (includeVisuals) {
+            eligibleCandidates
+        } else {
+            eligibleCandidates.sortedWith(
+                compareByDescending<GalleryMedia> {
+                    textEvidenceScore(queryText, it)
+                }.thenBy {
+                    originalRank[it.mediaStoreId] ?: Int.MAX_VALUE
+                },
+            )
+        }
+        val diversityOrder = if (includeVisuals) {
+            selectDiverse(candidates, minOf(candidates.size, safeMax))
+        } else {
+            candidates.take(safeMax)
+        }
+        val diversityRank = diversityOrder.mapIndexed { index, media ->
+            media.mediaStoreId to index
+        }.toMap()
         val relevanceRank = candidates.mapIndexed { index, media -> media.mediaStoreId to index }.toMap()
         val episodeByMediaId = buildMap {
             evidenceGroups.forEach { group ->
@@ -92,6 +160,8 @@ class AnswerContextPicker(
             }
         }
 
+        candidates.firstOrNull()?.let { add(it, AnswerCoverageFacet.CATEGORY_MATCH) }
+
         // Preserve one strong retrieval anchor before spending slots on
         // coverage. A second anchor is added only when the context budget is
         // large enough to retain broad diversity; prefer another episode
@@ -111,10 +181,9 @@ class AnswerContextPicker(
         }
 
         val orderedForCoverage = candidates.sortedWith(
-            compareBy<GalleryMedia> { visualRank[it.mediaStoreId] ?: Int.MAX_VALUE }
+            compareBy<GalleryMedia> { diversityRank[it.mediaStoreId] ?: Int.MAX_VALUE }
                 .thenBy { relevanceRank[it.mediaStoreId] ?: Int.MAX_VALUE },
         )
-        val queryText = query.lowercase(Locale.ROOT)
         val needsPeople = evidenceScope.needsPeopleMetadata ||
             Regex("\\b(who|person|people|with|without)\\b").containsMatchIn(queryText)
         val needsLocation = evidenceScope.needsLocationMetadata ||
@@ -169,6 +238,7 @@ class AnswerContextPicker(
             val episodeRepresentatives = evidenceGroups
                 .sortedBy { relevanceRank[it.representative.mediaStoreId] ?: Int.MAX_VALUE }
                 .map { it.representative }
+                .filter { it.mediaStoreId in relevanceRank }
                 .distinctBy { it.mediaStoreId }
                 .take(EPISODE_COVERAGE_LIMIT)
             if (episodeRepresentatives.isNotEmpty()) {
@@ -201,16 +271,36 @@ class AnswerContextPicker(
                         relevanceRank[it.mediaStoreId] ?: Int.MAX_VALUE
                     }
                 }
-            val episodeFill = selectDiverse(
-                unseenEpisodeRepresentatives,
-                (safeMax - selected.size).coerceAtLeast(0),
-            )
+            val episodeFill = if (includeVisuals) {
+                selectDiverse(
+                    unseenEpisodeRepresentatives,
+                    (safeMax - selected.size).coerceAtLeast(0),
+                )
+            } else {
+                unseenEpisodeRepresentatives.take((safeMax - selected.size).coerceAtLeast(0))
+            }
             episodeFill.forEach { add(it, AnswerCoverageFacet.EPISODE, safeMax) }
             if (selected.size < safeMax) {
-                selectDiverse(
-                    remaining.filterNot { it.mediaStoreId in selected },
-                    (safeMax - selected.size).coerceAtLeast(0),
-                ).forEach { add(it, AnswerCoverageFacet.VISUAL_DIVERSITY, safeMax) }
+                val finalCandidates = remaining.filterNot { it.mediaStoreId in selected }
+                val finalFill = if (includeVisuals) {
+                    selectDiverse(
+                        finalCandidates,
+                        (safeMax - selected.size).coerceAtLeast(0),
+                    )
+                } else {
+                    finalCandidates.take((safeMax - selected.size).coerceAtLeast(0))
+                }
+                finalFill.forEach {
+                    add(
+                        it,
+                        if (includeVisuals) {
+                            AnswerCoverageFacet.VISUAL_DIVERSITY
+                        } else {
+                            AnswerCoverageFacet.CATEGORY_MATCH
+                        },
+                        safeMax,
+                    )
+                }
             }
         }
 
@@ -233,7 +323,11 @@ class AnswerContextPicker(
         return AnswerContextBundle(
             items = chosen,
             metadataFields = metadataFields,
-            includeOcr = evidenceScope.needsOcr,
+            includeOcr = queryCategory == QueryCategory.DOC,
+            queryCategory = queryCategory,
+            includeVisuals = includeVisuals,
+            inputCandidateCount = inputCandidates.size,
+            eligibleCandidateCount = candidates.size,
         )
     }
 
@@ -252,6 +346,45 @@ class AnswerContextPicker(
 
     private fun personKey(media: GalleryMedia): String =
         media.personLabel.orEmpty().lowercase(Locale.ROOT).trim()
+
+    /**
+     * Text-only categories are ranked from fields already in memory. This
+     * favors an exact OCR/title match over a visually similar document while
+     * preserving the original hybrid rank as the stable tie-breaker.
+     */
+    private fun textEvidenceScore(queryText: String, media: GalleryMedia): Int {
+        val queryTokens = queryText
+            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .filter { it.length >= 3 && it !in TEXT_STOP_WORDS }
+            .distinct()
+        val name = media.displayName.lowercase(Locale.ROOT)
+        val ocr = media.ocrText.lowercase(Locale.ROOT)
+        val metadata = listOfNotNull(
+            media.personLabel,
+            media.locationName,
+            media.location,
+            media.mimeType,
+        ).joinToString(" ").lowercase(Locale.ROOT)
+        var score = 0
+        queryTokens.forEach { token ->
+            if (ocr.contains(token)) score += 5
+            if (name.contains(token)) score += 4
+            if (metadata.contains(token)) score += 3
+        }
+        queryTokens.windowed(2).forEach { pair ->
+            val phrase = pair.joinToString(" ")
+            if (ocr.contains(phrase)) score += 4
+            if (name.contains(phrase)) score += 3
+        }
+        if (AMOUNT_INTENT.containsMatchIn(queryText)) {
+            if (ocr.contains("total amount")) score += 8
+            if (ocr.contains("grand total")) score += 7
+            if (ocr.contains("ticket") && ocr.contains("price")) score += 7
+            if (ocr.contains("amount")) score += 3
+            if (ocr.contains("price")) score += 2
+        }
+        return score
+    }
 
     private fun locationKey(media: GalleryMedia): String =
         (media.locationName ?: media.location).orEmpty()
@@ -288,7 +421,7 @@ class AnswerContextPicker(
     )
 
     private companion object {
-        const val MAX_IMAGES = 16
+        const val MAX_RECORDS = 8
         const val SECOND_ANCHOR_RELEVANCE_WINDOW = 8
         const val EPISODE_COVERAGE_LIMIT = 4
         const val PERSON_COVERAGE_LIMIT = 3
@@ -299,5 +432,23 @@ class AnswerContextPicker(
         const val COVERAGE_BUDGET_NUMERATOR = 2
         const val COVERAGE_BUDGET_DENOMINATOR = 3
         const val MIN_COVERAGE_BUDGET = 4
+        val AMOUNT_INTENT = Regex("\\b(how much|spend|spent|cost|price|amount|total|paid)\\b")
+        val TEXT_STOP_WORDS = setOf(
+            "the",
+            "and",
+            "for",
+            "from",
+            "with",
+            "that",
+            "this",
+            "help",
+            "find",
+            "show",
+            "document",
+            "photo",
+            "photos",
+            "image",
+            "images",
+        )
     }
 }

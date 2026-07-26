@@ -5,6 +5,8 @@ import android.util.Log
 import java.io.Closeable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicInteger
 
 enum class EmbeddingStage {
     LOCATION,
@@ -194,6 +196,46 @@ class GallerySemanticIndexer(
         return finalProgress
     }
 
+    /** Rebuilds only the SigLIP image-vector index. */
+    fun reindexVisualsBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress =
+        indexImagesBlocking(onProgress)
+
+    /** Rebuilds faces, preserves recognizable labels where possible, and refreshes dependent episodes. */
+    fun reindexFacesBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress {
+        val faceProgress = faceIndexer.indexBlocking { update ->
+            onProgress(
+                EmbeddingProgress(
+                    completed = update.completed,
+                    total = update.total,
+                    skipped = update.skipped,
+                    stage = EmbeddingStage.FACE,
+                    faceCompleted = update.completed,
+                    faceTotal = update.total,
+                    facesFound = update.facesFound,
+                ),
+            )
+        }
+        val clusterCount = faceClusterer.rebuildBlocking()
+        val episodeCount = episodeIndexer.rebuildBlocking()
+        return EmbeddingProgress(
+            completed = faceProgress.completed,
+            total = faceProgress.total,
+            skipped = faceProgress.skipped,
+            stage = EmbeddingStage.EPISODES,
+            faceCompleted = faceProgress.completed,
+            faceTotal = faceProgress.total,
+            facesFound = faceProgress.facesFound,
+            clusterCount = clusterCount,
+            clusteringComplete = true,
+            episodeCount = episodeCount,
+            episodeIndexComplete = true,
+            needsFaceTags = database.hasUnnamedFaceClusters(),
+        ).also(onProgress)
+    }
+
+    /** Rebuilds only the derived episode membership tables. */
+    fun reindexEpisodesBlocking(): Int = episodeIndexer.rebuildBlocking()
+
     fun searchBlocking(query: String, limit: Int = 8): LongArray {
         return searchScoredBlocking(query, limit).map { it.mediaStoreId }.toLongArray()
     }
@@ -206,6 +248,37 @@ class GallerySemanticIndexer(
         queries: List<String>,
         limit: Int = 16,
         allowlist: LongArray? = null,
+    ): List<SemanticMatch> =
+        searchScoredBlocking(
+            queries = queries,
+            limit = limit,
+            allowlist = allowlist,
+            acceptScore = ::isAcceptedSemanticScore,
+        )
+
+    /**
+     * Returns the nearest finite neighbors without applying the public 0.10
+     * confidence cutoff. Retrieval uses this once so it can keep confident
+     * matches when present and fall back to ranked neighbors only when the
+     * strict result set is empty.
+     */
+    fun searchNearestScoredBlocking(
+        queries: List<String>,
+        limit: Int = 16,
+        allowlist: LongArray? = null,
+    ): List<SemanticMatch> =
+        searchScoredBlocking(
+            queries = queries,
+            limit = limit,
+            allowlist = allowlist,
+            acceptScore = Float::isFinite,
+        )
+
+    private fun searchScoredBlocking(
+        queries: List<String>,
+        limit: Int,
+        allowlist: LongArray?,
+        acceptScore: (Float) -> Boolean,
     ): List<SemanticMatch> {
         check(ModelCatalog.siglipText.isInstalled(appContext)) {
             "Install ${ModelCatalog.siglipText.relativePath} before semantic search"
@@ -230,6 +303,7 @@ class GallerySemanticIndexer(
             )
             result.ids.forEachIndexed { indexInResult, id ->
                 val match = SemanticMatch(id, result.scores.getOrElse(indexInResult) { 0f })
+                if (!acceptScore(match.score)) return@forEachIndexed
                 val previous = bestByMediaId[id]
                 if (previous == null || match.score > previous.score) {
                     bestByMediaId[id] = match
@@ -273,85 +347,93 @@ class GallerySemanticIndexer(
         val pending = database.pendingEmbeddings()
         if (pending.isEmpty()) return EmbeddingProgress(0, 0, 0, EmbeddingStage.IMAGE)
 
-        var completed = 0
-        var skipped = 0
-        SigLipImageEncoder.open(appContext).use { encoder ->
-            MediaBitmapLoader(appContext).use { loader ->
-                NativeVectorIndex.open(appContext).use { index ->
-                    val batchIds = ArrayList<Long>(BATCH_SIZE)
-                    val batchValues = ArrayList<Float>(BATCH_SIZE * SigLipImageEncoder.EMBEDDING_DIMENSION)
-                    for (media in pending) {
-                        val bitmap = runCatching { loader.load(media) }.getOrNull()
-                        if (bitmap == null) {
-                            skipped += 1
-                            database.markEmbeddingIndexed(media.mediaStoreId)
-                            continue
-                        }
-                        try {
-                            // A single damaged image, unsupported codec, or bad
-                            // interpreter result must not discard the work that
-                            // is already persisted in the vector index. Keep
-                            // this item out of the batch and mark it handled;
-                            // OCR and face indexing can still process it.
-                            val embedding = try {
-                                encoder.encode(bitmap)
-                            } catch (error: Exception) {
-                                Log.w(
-                                    TAG,
-                                    "Skipping visual embedding for ${media.mediaStoreId} (${media.displayName})",
-                                    error,
-                                )
-                                null
-                            }
-                            if (embedding == null || !embedding.isValid()) {
-                                if (embedding != null) {
-                                    Log.w(
-                                        TAG,
-                                        "Skipping invalid visual embedding for ${media.mediaStoreId} (${media.displayName})",
-                                    )
+        val completed = AtomicInteger(0)
+        val skipped = AtomicInteger(0)
+        val next = AtomicInteger(0)
+        val indexLock = Any()
+        val progressLock = Any()
+        val index = NativeVectorIndex.open(appContext)
+        val workerCount = InferenceParallelism.visualWorkerCount()
+        val workers = Executors.newFixedThreadPool(workerCount)
+        val futures = ArrayList<Future<*>>()
+        fun publish() {
+            synchronized(progressLock) {
+                onProgress(
+                    EmbeddingProgress(
+                        completed = completed.get(),
+                        total = pending.size,
+                        skipped = skipped.get(),
+                        stage = EmbeddingStage.IMAGE,
+                    ),
+                )
+            }
+        }
+        try {
+            repeat(workerCount) {
+                futures += workers.submit {
+                    SigLipImageEncoder.open(appContext).use { encoder ->
+                        MediaBitmapLoader(appContext).use { loader ->
+                            val batchIds = ArrayList<Long>(BATCH_SIZE)
+                            val batchValues = ArrayList<Float>(BATCH_SIZE * SigLipImageEncoder.EMBEDDING_DIMENSION)
+                            fun flushBatch() {
+                                if (batchIds.isEmpty()) return
+                                synchronized(indexLock) {
+                                    commitBatch(index, batchIds, batchValues)
+                                    batchIds.forEach { database.markEmbeddingIndexed(it) }
                                 }
-                                skipped += 1
-                                database.markEmbeddingIndexed(media.mediaStoreId)
-                                continue
-                            }
-                            batchIds += media.mediaStoreId
-                            embedding.forEach { batchValues += it }
-                            if (batchIds.size == BATCH_SIZE) {
-                                commitBatch(index, batchIds, batchValues)
-                                batchIds.forEach { database.markEmbeddingIndexed(it) }
-                                completed += batchIds.size
-                                onProgress(
-                                    EmbeddingProgress(
-                                        completed = completed,
-                                        total = pending.size,
-                                        skipped = skipped,
-                                        stage = EmbeddingStage.IMAGE,
-                                    ),
-                                )
+                                completed.addAndGet(batchIds.size)
                                 batchIds.clear()
                                 batchValues.clear()
+                                publish()
                             }
-                        } finally {
-                            bitmap.recycle()
+                            while (true) {
+                                val media = pending.getOrNull(next.getAndIncrement()) ?: break
+                                val bitmap = runCatching { loader.load(media) }.getOrNull()
+                                if (bitmap == null) {
+                                    synchronized(indexLock) { database.markEmbeddingIndexed(media.mediaStoreId) }
+                                    skipped.incrementAndGet()
+                                    publish()
+                                    continue
+                                }
+                                try {
+                                    val embedding = try {
+                                        encoder.encode(bitmap)
+                                    } catch (error: Exception) {
+                                        Log.w(
+                                            TAG,
+                                            "Skipping visual embedding for ${media.mediaStoreId} (${media.displayName})",
+                                            error,
+                                        )
+                                        null
+                                    }
+                                    if (embedding == null || !embedding.isValid()) {
+                                        if (embedding != null) {
+                                            Log.w(TAG, "Skipping invalid visual embedding for ${media.mediaStoreId} (${media.displayName})")
+                                        }
+                                        synchronized(indexLock) { database.markEmbeddingIndexed(media.mediaStoreId) }
+                                        skipped.incrementAndGet()
+                                        publish()
+                                        continue
+                                    }
+                                    batchIds += media.mediaStoreId
+                                    embedding.forEach { batchValues += it }
+                                    if (batchIds.size >= BATCH_SIZE) flushBatch()
+                                } finally {
+                                    bitmap.recycle()
+                                }
+                            }
+                            flushBatch()
                         }
-                    }
-                    if (batchIds.isNotEmpty()) {
-                        commitBatch(index, batchIds, batchValues)
-                        batchIds.forEach { database.markEmbeddingIndexed(it) }
-                        completed += batchIds.size
-                        onProgress(
-                            EmbeddingProgress(
-                                completed = completed,
-                                total = pending.size,
-                                skipped = skipped,
-                                stage = EmbeddingStage.IMAGE,
-                            ),
-                        )
                     }
                 }
             }
+            futures.forEach(Future<*>::get)
+        } finally {
+            workers.shutdownNow()
+            index.close()
         }
-        return EmbeddingProgress(completed, pending.size, skipped, EmbeddingStage.IMAGE)
+        publish()
+        return EmbeddingProgress(completed.get(), pending.size, skipped.get(), EmbeddingStage.IMAGE)
     }
 
     private fun commitBatch(
@@ -370,8 +452,12 @@ class GallerySemanticIndexer(
         private const val DIVERSITY_CANDIDATE_LIMIT = 100
         /** Retrieval budget only; presentation never truncates the returned set. */
         private const val MAX_SEARCH_RESULTS = 512
+        internal const val MIN_SEMANTIC_COSINE_SCORE = 0.10f
         private const val MAX_QUERY_VARIANTS = 4
         private const val TAG = "AskGalaxyImageIndex"
+
+        internal fun isAcceptedSemanticScore(score: Float): Boolean =
+            score.isFinite() && score >= MIN_SEMANTIC_COSINE_SCORE
 
         private fun FloatArray.isValid(): Boolean =
             size == SigLipImageEncoder.EMBEDDING_DIMENSION && all { it.isFinite() }

@@ -309,8 +309,13 @@ class GalleryMetadataReader(context: Context) {
         wantsTime: Boolean,
         wantsLocation: Boolean,
     ): ExifMetadata? = runCatching {
-        resolver.openInputStream(uri)?.use { input ->
-            val exif = ExifInterface(input)
+        val readableUri = if (wantsLocation) {
+            MediaLocationAccess.originalUri(appContext, uri) ?: return@runCatching null
+        } else {
+            uri
+        }
+        resolver.openFileDescriptor(readableUri, "r")?.use { descriptor ->
+            val exif = ExifInterface(descriptor.fileDescriptor)
             val dateTakenMs = if (wantsTime) {
                 listOf(
                     ExifInterface.TAG_DATETIME_ORIGINAL,
@@ -321,10 +326,9 @@ class GalleryMetadataReader(context: Context) {
                     .firstOrNull()
             } else null
             val location = if (wantsLocation) {
-                val coordinates = FloatArray(2)
-                if (exif.getLatLong(coordinates)) {
+                exif.latLong?.let { coordinates ->
                     String.format(Locale.US, "GPS %.6f, %.6f", coordinates[0], coordinates[1])
-                } else null
+                }
             } else null
             ExifMetadata(dateTakenMs, location)
         }
@@ -541,12 +545,19 @@ class GalleryMetadataReader(context: Context) {
                 latitude != null &&
                 longitude != null &&
                 latitude in -90.0..90.0 &&
-                longitude in -180.0..180.0
+                longitude in -180.0..180.0 &&
+                // A small number of cameras/exporters write 0°,0° as a
+                // missing-location sentinel. Treat "Null Island" as absent
+                // GPS so it is not geocoded or retried forever.
+                !(kotlin.math.abs(latitude) < NULL_ISLAND_EPSILON &&
+                    kotlin.math.abs(longitude) < NULL_ISLAND_EPSILON)
             ) {
                 latitude to longitude
             } else {
                 null
             }
         }
+
+        private const val NULL_ISLAND_EPSILON = 1.0e-5
     }
 }

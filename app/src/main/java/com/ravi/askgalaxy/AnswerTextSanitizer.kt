@@ -6,7 +6,7 @@ import java.util.Locale
 /** Keeps internal grounding language out of the user-facing answer card. */
 internal object AnswerTextSanitizer {
     fun clean(value: String): String {
-        var cleaned = value.trim()
+        var cleaned = stripPrivateModelArtifacts(value)
         cleaned = cleaned
             .replace(
                 Regex("(?i)^(?:as )?(?:your|the) evidence (?:is not there|is unavailable|is missing)\\s*[,;:.]?\\s*"),
@@ -62,13 +62,34 @@ internal object AnswerTextSanitizer {
             .replace(Regex("([,;:])\\s*([.!?])"), "$2")
             .replace(Regex("\\s{2,}"), " ")
             .trim()
+        if (cleaned.isBlank()) return ""
         cleaned = cleaned.replaceFirstChar { it.uppercaseChar() }
-        val summary = firstSentences(cleaned, MAX_SENTENCES)
-        return if (sentenceCount(summary) == 1) {
-            "$summary You can browse the matching moments below."
-        } else {
-            summary
+        return firstSentences(cleaned, MAX_SENTENCES)
+    }
+
+    /**
+     * Reasoning and prompt-echo text are private model protocol, not gallery
+     * content. Prefer an explicit final-answer section when one is present,
+     * then remove complete or dangling reasoning blocks and task wrappers.
+     */
+    private fun stripPrivateModelArtifacts(value: String): String {
+        var cleaned = value.trim()
+        cleaned = cleaned.replace(COMPLETE_THINK_BLOCK, " ")
+        val danglingThinkEnd = cleaned.lastIndexOf("</think>", ignoreCase = true)
+        if (danglingThinkEnd >= 0) {
+            cleaned = cleaned.substring(danglingThinkEnd + "</think>".length)
         }
+        cleaned = cleaned.replace(THINK_TAG, " ").trim()
+
+        val answerMarkers = ANSWER_MARKER.findAll(cleaned).toList()
+        if (answerMarkers.isNotEmpty()) {
+            cleaned = cleaned.substring(answerMarkers.last().range.last + 1)
+        }
+        return cleaned
+            .replace(Regex("(?im)^\\s*(?:ANSWER_TASK|EVIDENCE|CONTEXT|EVIDENCE_BUILDER)\\s*:\\s*$"), " ")
+            .replace(Regex("(?im)^\\s*(?:final answer|response)\\s*:\\s*"), "")
+            .replace(Regex("(?m)^\\s*```(?:text|markdown)?\\s*$"), " ")
+            .trim()
     }
 
     private fun firstSentences(value: String, limit: Int): String {
@@ -84,20 +105,8 @@ internal object AnswerTextSanitizer {
         return value.substring(0, end).trim()
     }
 
-    private fun sentenceCount(value: String): Int {
-        if (value.isBlank()) return 0
-        val iterator = BreakIterator.getSentenceInstance(Locale.US)
-        iterator.setText(value)
-        var count = 0
-        var start = iterator.first()
-        while (true) {
-            val end = iterator.next()
-            if (end == BreakIterator.DONE) break
-            if (value.substring(start, end).isNotBlank()) count += 1
-            start = end
-        }
-        return count
-    }
-
+    private val COMPLETE_THINK_BLOCK = Regex("(?is)<think\\b[^>]*>.*?</think>")
+    private val THINK_TAG = Regex("(?is)</?think\\b[^>]*>")
+    private val ANSWER_MARKER = Regex("(?im)^\\s*ANSWER\\s*:\\s*")
     private const val MAX_SENTENCES = 3
 }

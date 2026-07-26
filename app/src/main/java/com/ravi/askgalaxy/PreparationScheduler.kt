@@ -13,6 +13,7 @@ object PreparationScheduler {
 
     fun enqueue(context: Context) {
         val appContext = context.applicationContext
+        GemmaDownloadScheduler.enqueueIfNeeded(appContext)
         PreparationNotifier.createChannel(appContext)
         val request = OneTimeWorkRequestBuilder<PreparationWorker>()
             .setConstraints(
@@ -32,5 +33,15 @@ object PreparationScheduler {
             ExistingWorkPolicy.KEEP,
             request,
         )
+    }
+
+    /**
+     * Restarts only the resumable worker. It never clears SQLite rows, vector
+     * files, model files, or the per-item completion flags.
+     */
+    fun restart(context: Context) {
+        val appContext = context.applicationContext
+        WorkManager.getInstance(appContext).cancelUniqueWork(UNIQUE_WORK_NAME)
+        enqueue(appContext)
     }
 }

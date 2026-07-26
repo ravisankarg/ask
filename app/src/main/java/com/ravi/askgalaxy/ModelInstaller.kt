@@ -12,6 +12,7 @@ import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
+import kotlin.math.min
 
 data class ModelInstallProgress(
     val artifact: ModelArtifact,
@@ -88,6 +89,7 @@ class ModelInstaller(context: Context) {
                         artifactTotal,
                         0L,
                         total,
+                        artifact.expectedBytes,
                         onProgress,
                     )
                 }
@@ -160,6 +162,21 @@ class ModelInstaller(context: Context) {
             throw IOException("Model download HTTP $responseCode for ${artifact.name}")
         }
 
+        if (existing > 0L && responseCode == HttpURLConnection.HTTP_PARTIAL) {
+            val rangeStart = contentRangeStart(connection.getHeaderField("Content-Range"))
+            if (rangeStart != existing) {
+                connection.disconnect()
+                check(partial.delete()) { "Could not reset invalid partial model: ${partial.absolutePath}" }
+                existing = 0L
+                connection = openConnection(url, 0L)
+                responseCode = connection.responseCode
+                if (responseCode !in 200..299) {
+                    connection.disconnect()
+                    throw IOException("Model download HTTP $responseCode for ${artifact.name}")
+                }
+            }
+        }
+
         val responseLength = connection.contentLengthLong.coerceAtLeast(0L)
         val total = artifact.expectedBytes.takeIf { it > 0L }
             ?: if (responseLength > 0L) existing + responseLength else 0L
@@ -177,6 +194,7 @@ class ModelInstaller(context: Context) {
                         artifactTotal,
                         downloaded,
                         total,
+                        artifact.expectedBytes,
                         onProgress,
                     )
                     downloaded = partial.length()
@@ -207,6 +225,7 @@ class ModelInstaller(context: Context) {
         artifactTotal: Int,
         startingBytes: Long,
         total: Long,
+        expectedBytes: Long,
         onProgress: (ModelInstallProgress) -> Unit,
     ) {
         val buffer = ByteArray(BUFFER_SIZE)
@@ -216,7 +235,9 @@ class ModelInstaller(context: Context) {
             if (Thread.currentThread().isInterrupted) {
                 throw InterruptedIOException("Model download interrupted")
             }
-            val count = input.read(buffer)
+            val remaining = if (expectedBytes > 0L) expectedBytes - downloaded else buffer.size.toLong()
+            if (remaining <= 0L) break
+            val count = input.read(buffer, 0, min(buffer.size.toLong(), remaining).toInt())
             if (count < 0) break
             output.write(buffer, 0, count)
             downloaded += count
@@ -274,5 +295,12 @@ class ModelInstaller(context: Context) {
         private const val REPORT_BYTES = 4L * 1024L * 1024L
         private const val CONNECT_TIMEOUT_MS = 30_000
         private const val READ_TIMEOUT_MS = 60_000
+
+        internal fun contentRangeStart(header: String?): Long? {
+            val match = CONTENT_RANGE_PATTERN.matchEntire(header?.trim().orEmpty()) ?: return null
+            return match.groupValues[1].toLongOrNull()
+        }
+
+        private val CONTENT_RANGE_PATTERN = Regex("bytes\\s+(\\d+)-\\d+/\\d+")
     }
 }

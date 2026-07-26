@@ -23,8 +23,9 @@ android {
         applicationId = "com.ravi.askgalaxy"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -75,12 +76,18 @@ dependencies {
     implementation("androidx.core:core-ktx:1.16.0")
     implementation("androidx.exifinterface:exifinterface:1.4.1")
     implementation("androidx.work:work-runtime-ktx:2.10.0")
-    // LiteRT executes the encoder/OCR .tflite artifacts through native code.
+    // Bundled Text Recognition v2 is immediately available offline. Unlike
+    // the previous hand-written PP-OCR decoder, it also exposes calibrated
+    // line confidence and native layout/rotation handling.
+    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // LiteRT executes the visual/text encoders and face models through native code.
     implementation("com.google.ai.edge.litert:litert:1.0.1")
     // LiteRT-LM provides the native Gemma session runtime; the .litertlm file
     // is installed separately because the E4B artifact is too large to bundle.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.1")
 }
 
 val buildRustNative = tasks.register<Exec>("buildRustNative") {

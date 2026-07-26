@@ -61,38 +61,6 @@ object ModelCatalog {
         sourceLabel = "Same pinned SigLIP2 text-only repository revision",
     )
 
-    val ocrDetector = ModelArtifact(
-        name = "PP-OCRv5 detector",
-        relativePath = "models/ocr/ppocrv5_det_fp16.tflite",
-        runtime = "LiteRT",
-        required = true,
-        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocr_det_fp16.tflite?download=true",
-        expectedBytes = 10_094_464L,
-        sha256 = "b635b1d7f0e171a19beda7e8f386a62d4f0a3a1c46ed42a09603a902f2059ccc",
-        sourceLabel = "LiteRT Community pinned model revision",
-    )
-
-    val ocrRecognizer = ModelArtifact(
-        name = "PP-OCRv5 recognizer",
-        relativePath = "models/ocr/ppocrv5_rec_fp16.tflite",
-        runtime = "LiteRT",
-        required = true,
-        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocr_rec_fp16.tflite?download=true",
-        expectedBytes = 17_173_552L,
-        sha256 = "ef7bb5aba20a1717101f0f112dd8cb1ed8b043ebaf96af05a395c6905ca66456",
-        sourceLabel = "LiteRT Community pinned model revision",
-    )
-
-    val ocrDictionary = ModelArtifact(
-        name = "PP-OCRv5 dictionary",
-        relativePath = "models/ocr/ppocrv5_dict.txt",
-        runtime = "Kotlin OCR decoder",
-        required = true,
-        downloadUrl = "https://huggingface.co/litert-community/PP-OCRv5-LiteRT/resolve/217c5492431031c7149eae7d7db868d39f184f1b/ppocrv5_dict.txt?download=true",
-        expectedBytes = 74_012L,
-        sourceLabel = "LiteRT Community pinned model revision",
-    )
-
     val faceDetector = ModelArtifact(
         name = "YuNet face detector",
         relativePath = "models/face/yunet_fp16.tflite",
@@ -131,9 +99,6 @@ object ModelCatalog {
         siglipVision,
         siglipText,
         siglipTokenizer,
-        ocrDetector,
-        ocrRecognizer,
-        ocrDictionary,
         faceDetector,
         faceEmbedder,
         gemma,
