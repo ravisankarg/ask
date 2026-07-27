@@ -1,13 +1,13 @@
 const demos = [
   {
     query: "How much was the Odyssey ticket?",
-    plan: "[query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == Odyssey ticket price total]]",
+    plan: "[query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == {Odyssey} && {ticket}]]",
     shown: "1",
     count: "1"
   },
   {
     query: "What is my passport number?",
-    plan: "[query_category == doc] && [[semantic == passport identity document] + [ocr == Ravi passport]]",
+    plan: "[query_category == doc] && [[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]",
     shown: "3",
     count: "3"
   },

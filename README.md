@@ -140,9 +140,13 @@ compiled as a closed interval with equal `from_date` and `to_date`; a missing
 endpoint is rejected and repaired before retrieval.
 As soon as planning finishes, the effective C-like execution spec appears
 directly below the search bar while retrieval continues; a neighboring timing
-chip updates across later phases. The UI immediately displays up to the newest
-200 matches in a virtualized, expandable, vertically scrollable grid without
-exposing filenames. OCR preprocessing also persists one category per media row:
+chip updates across later phases. The UI immediately displays up to the top
+200 overall query matches in a virtualized, expandable, vertically scrollable grid without
+exposing filenames. Result order is the executor's overall query relevance,
+not a newest-first rewrite: scenery favors semantic score, documents put
+complete OCR conjunctions first, and person/location retain authoritative
+metadata scopes. Capture date breaks equal-score ties. OCR preprocessing also
+persists one category per media row:
 an image with any non-empty OCR is `doc`; every other image/video is `scenary`.
 The QP category is a hard search-index scope, so the result grid itself contains
 only eligible records. A query-aware Context Picker then chooses at most 8
@@ -171,7 +175,7 @@ user question
   -> prewarmed SigLIP text encoder -> semantic search over image embeddings
   -> SQLite matching over OCR, tagged people, and indexed place metadata
   -> optional keyword/structured matching over encrypted notification facts when requested
-  -> category-scoped matches -> immediate newest-first virtualized result grid
+  -> category-scoped matches -> immediate overall-relevance virtualized result grid
   -> indexed episode membership join
   -> Context Picker -> at most 8 eligible text/metadata records; scenery alone uses persisted SigLIP embedding diversity
   -> doc/person/location/time text-only answers; scenery may attach up to 4 images downscaled to a 512 px longest edge
@@ -179,14 +183,15 @@ user question
   -> 2–3 sentence answer without internal evidence labels + contextual follow-ups
 ```
 
-The v1 boundaries are deliberate:
+The v0.2 boundaries are deliberate:
 
 - OCR is extracted by bundled ML Kit Text Recognition v2 and matched by a
   dedicated planner-authored `ocr` predicate; OCR text does not have its own
   embedding index. In `doc` plans, one conceptual SigLIP `semantic` predicate
-  is fused with one short OCR-keyword predicate using `+`. OCR keywords use OR
-  recall, matching more keywords increases the OCR score, and a row found by
-  both branches receives an additional fusion boost.
+  is fused with one short OCR conjunction using `+`. Canonical syntax such as
+  `[ocr == {Ravi} && {passport}]` requires every word in the same photo OCR.
+  A complete conjunction is a perfect match and always ranks above
+  semantic-only document results in the UI and answer context.
 - Image semantics come from the SigLIP text encoder searching the image vector index.
 - Notification facts use local keyword and structured-field scoring; they are not sent through the SigLIP text encoder.
 - Gemma 4 E4B is the sole planner. It gets one repair turn for an invalid
@@ -196,11 +201,11 @@ The v1 boundaries are deliberate:
   document/OCR, or visual scene. Structured fields can only be spelling-corrected or canonically
   formatted. `semantic` is rewritten as one conceptual retrieval phrase, while
   `ocr` is planner-authored from likely printed words. Every `doc` plan fuses
-  those two branches with `+`; OCR uses OR recall and matched-term scoring, and
-  records found by both branches receive a fusion bonus. Broad untargeted
-  document aggregates, such as monthly spending, put likely printed vocabulary
-  such as receipt, bill, invoice, payment, and total amount in the OCR branch;
-  a named ticket, merchant, item, document, or subject keeps its precise terms.
+  those two branches with `+`; every braced OCR word is AND-required. Broad
+  document aggregates use only likely co-occurring words such as `total` and
+  `amount`, never mutually exclusive receipt/bill/invoice alternatives. A self
+  identity document uses the actual tagged name plus the document word, never
+  `person`, `self`, `me`, or `my`.
   The Context Picker uses
   at most 8 text records, and only scenery may attach up to 4 downscaled images.
   Planner and answer

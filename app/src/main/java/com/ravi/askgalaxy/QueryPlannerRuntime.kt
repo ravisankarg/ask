@@ -30,6 +30,9 @@ object QueryPlannerRuntime {
         "video", "videos",
     )
     private val isoDateToken = Regex("\\b\\d{4}(?:-\\d{2}(?:-\\d{2})?)?\\b")
+    private val explicitOcrAndSyntax = Regex(
+        "(?i)\\[ocr\\s*==\\s*\\{[^{}\\]]+\\}\\s*&&\\s*\\{[^{}\\]]+\\}",
+    )
 
     data class PlannedQuery(
         val plan: QueryPlan,
@@ -172,19 +175,19 @@ object QueryPlannerRuntime {
 
         Retrieval predicates use exactly one field from:
         person, mime type, from_date, to_date, location, semantic, ocr
-        Each predicate contains exactly ONE `field == value`. NEVER put `+`, `-`, `&&`, comma, or another `==` inside a predicate value.
+        Each ordinary predicate contains exactly ONE `field == value`. NEVER put `+`, `-`, `&&`, comma, or another `==` inside an ordinary predicate value. The only exception is the required OCR keyword syntax [ocr == {word1} && {word2}], where each braced word is required in the same OCR text.
 
         Structured fields:
         - Preserve every explicitly named Known person as a person predicate when the query asks about that person's presence in photos, scenes, places, times, or events. Correct only a close misspelling to the exact Known people label. A negated person must be subtracted.
-        - SELF PERSON: the task may provide one `Self person` label. For presence/identity uses of I, me, my, mine, or myself, emit that exact label as a person predicate; examples include photos of me, who was with me, where I went, when I visited, what I wore, and my birthday photos. Do not create a person predicate for grammatical ownership/agency in doc queries such as my passport, my password, my receipt, or how much I spent. In those identity-document doc queries, use the Self person label as printed-name OCR wording only when it helps identify the document. If Self person is `not set`, never invent one.
+        - SELF PERSON: the task may provide one `Self person` label. For presence/identity uses of I, me, my, mine, or myself, emit that exact label as a person predicate; examples include photos of me, who was with me, where I went, when I visited, what I wore, and my birthday photos. Do not create a person predicate for grammatical ownership/agency in doc queries such as my passport, my password, my receipt, or how much I spent. For a self identity-document query, place only the actual Self person name word(s) plus essential document word(s) in OCR. Never emit literal OCR keywords such as person, people, self, me, my, mine, myself, or owner. If Self person is `not set`, never invent one.
         - DOC PERSON NAMES: when a doc query names the document owner or subject, keep that name inside the ocr keywords; do not add a face/person predicate merely because the name is known. A passport, ID, mark sheet, bill, or account screenshot may contain the printed name without containing a tagged face.
         - Preserve one explicitly named place as location. Do not leave that place inside semantic. If multiple route endpoints are named, keep the route as semantic instead of choosing one.
         - Explicit photo/picture/image wording requires [mime type == photos]. Explicit video/clip wording requires [mime type == videos]. Correct spelling such as phootos. Movie ticket is content, never MIME.
         - Dates are ISO yyyy-MM-dd and appear only for an explicit temporal constraint. Resolve the complete requested range from Today. Last year is January 1 through December 31 of the previous year; last month is its full calendar month. One exact day requires equal from_date and to_date. After/before/since may use one open boundary. Never infer today.
         - semantic is one compact conceptual phrase for SigLIP image similarity. It may be clarified or paraphrased. Exclude question words, dates, time words, person names, location names, and MIME words already represented structurally.
-        - OCR HYBRID FOR EVERY DOC QUERY: emit exactly one semantic predicate plus one ocr predicate joined with `+` inside one group: [[semantic == conceptual document phrase] + [ocr == keyword1 keyword2 ...]]. `+` means either branch may retrieve a document and a document matching both receives a score boost. Never intersect semantic and ocr with `&&`.
-        - ocr is doc-only and contains 2-6 independent words likely printed in OCR. The predicate value is a whitespace-separated keyword list, never a phrase: [ocr == Ravi passport] executes as OCR contains Ravi OR OCR contains passport. Any one word may retrieve a row; matching more words raises its score. Do not write prose. Include an explicitly named document subject. For a self identity document such as my passport, use the exact Self person label as an OCR keyword. Do not add Self person to generic spending, receipt, bill, invoice, ticket, or payment queries unless the user explicitly named that person.
-        - BROAD DOCUMENT EXPANSION: for an aggregate or collection question with no named merchant, item, event, or document, use one broad document semantic phrase and concrete OCR alternatives such as receipt, bill, invoice, payment, paid, purchase, total, and amount. Never use spending, expenses, finances, paperwork, or documents as the only OCR keyword.
+        - OCR HYBRID FOR EVERY DOC QUERY: emit exactly one semantic predicate plus one OCR predicate joined with `+` inside one group: [[semantic == conceptual document phrase] + [ocr == {word1} && {word2}]]. The `&&` inside OCR means every braced word must occur in the same photo OCR text. A complete OCR match is perfect and always ranks above semantic-only document matches in the result grid and answer context. The outer `+` retains semantic-only fallback when no complete OCR match exists.
+        - ocr is doc-only and contains 2-6 essential words likely to coexist on the intended document. Every word is separately braced and joined by `&&`; never write an OCR phrase, synonyms, or alternatives. Include the actual document subject name when known. For my passport with Self person Ravi, write [ocr == {Ravi} && {passport}], never person/self/me/my/owner aliases.
+        - BROAD DOCUMENT EXPANSION: for an aggregate or collection question with no named merchant, item, event, or document, use one broad semantic phrase and only a small co-occurring OCR conjunction such as [ocr == {total} && {amount}]. Do not AND mutually exclusive document types such as receipt, bill, and invoice. Never use spending, expenses, finances, paperwork, or documents as OCR keywords.
         - Metadata-only co-occurrence queries and plural place/city lists need no positive semantic predicate. Do not invent relational phrases such as "appears with", "most frequent companion", "cities visited", "places visited", or "travel destination".
 
         Operators: postfix SORT_DATE/SORT_LOC, then + and -, then &&, then comma.
@@ -212,16 +215,17 @@ object QueryPlannerRuntime {
         who was with me at dinner on 5 October 2025 => [query_category == person] && [[from_date == 2025-10-05] && [to_date == 2025-10-05] && [semantic == dinner]]
         on which dates did we visit national parks last year => [query_category == time] && [[from_date == LAST_YEAR_START] && [to_date == LAST_YEAR_END] && [semantic == national park visit]] SORT_DATE
         what places did I visit last year => [query_category == location] && [[from_date == LAST_YEAR_START] && [to_date == LAST_YEAR_END]] SORT_LOC
-        when does my driving licence expire, Self person Ravi => [query_category == doc] && [[semantic == driving licence expiry document] + [ocr == Ravi driving licence expiry]]
-        passport number in the passport photo => [query_category == doc] && [[mime type == photos] && [[semantic == passport identity document] + [ocr == passport number]]]
-        what is Ravi passport number => [query_category == doc] && [[semantic == passport identity document] + [ocr == Ravi passport]]
-        what is Ravi driving licence number => [query_category == doc] && [[semantic == driving licence identity document] + [ocr == Ravi driving licence]]
-        what is Ravi Aadhaar number => [query_category == doc] && [[semantic == Aadhaar identity card] + [ocr == Ravi Aadhaar]]
-        what is Ravi date of birth => [query_category == doc] && [[semantic == identity record date of birth] + [ocr == Ravi DOB birth]]
-        what are Ravi exam marks => [query_category == doc] && [[semantic == exam mark sheet report card] + [ocr == Ravi marks score]]
-        what is the Wi-Fi password => [query_category == doc] && [[semantic == Wi-Fi credential card] + [ocr == wifi password]]
-        how much did I spend on the odyssy movie ticket => [query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == Odyssey ticket price total]]
-        how much did I spend last month => [query_category == doc] && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END] && [[semantic == purchase receipts bills invoices payment confirmations] + [ocr == receipt bill invoice payment total amount]]]
+        when does my driving licence expire, Self person Ravi => [query_category == doc] && [[semantic == driving licence expiry document] + [ocr == {Ravi} && {licence}]]
+        passport number in the passport photo => [query_category == doc] && [[mime type == photos] && [[semantic == passport identity document] + [ocr == {passport} && {number}]]]
+        what is my passport number, Self person Ravi => [query_category == doc] && [[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]
+        what is Ravi passport number => [query_category == doc] && [[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]
+        what is Ravi driving licence number => [query_category == doc] && [[semantic == driving licence identity document] + [ocr == {Ravi} && {licence}]]
+        what is Ravi Aadhaar number => [query_category == doc] && [[semantic == Aadhaar identity card] + [ocr == {Ravi} && {Aadhaar}]]
+        what is Ravi date of birth => [query_category == doc] && [[semantic == identity record date of birth] + [ocr == {Ravi} && {birth}]]
+        what are Ravi exam marks => [query_category == doc] && [[semantic == exam mark sheet report card] + [ocr == {Ravi} && {marks}]]
+        what is the Wi-Fi password => [query_category == doc] && [[semantic == Wi-Fi credential card] + [ocr == {wifi} && {password}]]
+        how much did I spend on the odyssy movie ticket => [query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == {Odyssey} && {ticket}]]
+        how much did I spend last month => [query_category == doc] && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END] && [[semantic == purchase receipts bills invoices payment confirmations] + [ocr == {total} && {amount}]]]
         photos that make great phone backgrounds => [query_category == scenary] && [[mime type == photos] && [semantic == beautiful phone wallpaper background]]
         clearest national park photo excluding selfies => [query_category == scenary] && [[[mime type == photos] && [semantic == clear national park landscape]] - [semantic == selfie]]
         which places did I visit in July 2025 from north to south excluding airport layovers => [query_category == location] && [[[from_date == 2025-07-01] && [to_date == 2025-07-31]] - [semantic == airport layover]] SORT_LOC
@@ -251,9 +255,10 @@ object QueryPlannerRuntime {
             "exclusion always uses subtraction. " +
             "Do not add semantic to metadata-only co-occurrence or plural place/city-list queries. " +
             "Time answers require SORT_DATE; plural place answers require SORT_LOC. " +
-            "Each bracket has one field == value and contains no operator. Every doc query requires one conceptual " +
-            "semantic predicate plus one 2-6 word OCR predicate joined by + inside one group; split the OCR " +
-            "value into independent words that execute with OR, never as one phrase. " +
+            "Each ordinary bracket has one field == value and contains no operator. Every doc query requires one " +
+            "conceptual semantic predicate plus [ocr == {word1} && {word2}] joined by outer + inside one group. " +
+            "Every braced OCR word is required in the same photo; a complete match ranks before semantic-only. " +
+            "For self documents use only the exact Self person name and document words, never person/self/me/my aliases. " +
             "Spending/expenses/documents are not useful OCR keywords. " +
             "Return only the expression. Query: ${cleanQuery(query)}"
 
@@ -283,13 +288,15 @@ object QueryPlannerRuntime {
             "The validator error is authoritative: $safeError. Fix that exact error and recompile the original query. " +
             "If the error names forbidden semantic words, remove those exact words from semantic; do not repeat them. " +
             "Do not reuse malformed syntax. Start [query_category == CATEGORY] &&. " +
-            "Each predicate must be exactly [field == plain value]; an operator can appear only BETWEEN complete " +
-            "predicates or groups. Put every negative constraint completely on the right side of subtraction, as " +
+            "Each ordinary predicate must be exactly [field == plain value]; an operator can appear only BETWEEN " +
+            "complete predicates or groups. OCR is the only exception and must be [ocr == {word1} && {word2}], " +
+            "where every word is required in the same OCR text. Put every negative constraint completely on the right side of subtraction, as " +
             "[query_category == CATEGORY] && [[[POSITIVE predicates]] - [[NEGATIVE predicates]]]. " +
             "Never append a negative predicate with && after the subtraction. Finish every subtraction before " +
             "appending a final SORT_DATE or SORT_LOC. " +
-            "For every doc query emit one conceptual semantic predicate + one 2-6 word OCR predicate in one " +
-            "fused group; each OCR word is an independent OR alternative, never a phrase. " +
+            "For every doc query emit one conceptual semantic predicate + one 2-6 word OCR conjunction in one " +
+            "fused group. Use only essential co-occurring words. For my identity document, use the exact Self " +
+            "person name plus the document word; never person, self, me, my, mine, myself, or owner. " +
             "Never use spending, expenses, finances, paperwork, " +
             "or documents alone as OCR keywords. Preserve explicit people, one place, photos/videos, " +
             "and map I/me/my/mine/myself to Self person only when they refer to that person's presence or identity, " +
@@ -340,9 +347,18 @@ object QueryPlannerRuntime {
             .joinToString(" ")
             .removePrefix("EXECUTION_SPEC:")
             .trim()
+        validatePlannerOcrSyntax(candidate)
         val plan = ExecutionSpecCompiler.compile(QueryExecutionSpec.parse(candidate))
         validateCompiledPlan(query, knownPersonLabels, plan, selfPersonLabel)
         return plan
+    }
+
+    internal fun validatePlannerOcrSyntax(candidate: String) {
+        if (Regex("(?i)\\[query_category\\s*==\\s*doc]").containsMatchIn(candidate)) {
+            require(explicitOcrAndSyntax.containsMatchIn(candidate)) {
+                "Doc OCR must use explicit AND syntax: [ocr == {word1} && {word2}]"
+            }
+        }
     }
 
     /** Re-runs every post-parse production validator against a compiled plan. */
@@ -586,6 +602,13 @@ internal object QueryStructuredIntentPolicy {
                 require(plan.ocrTerms.any { containsPhrase(it, selfLabel) }) {
                     "A self identity-document query must include Self person '$selfLabel' in OCR keywords"
                 }
+                val aliases = plan.ocrTerms
+                    .flatMap(OcrKeywordPolicy::keywords)
+                    .filter(SELF_OCR_ALIAS_WORDS::contains)
+                require(aliases.isEmpty()) {
+                    "Self document OCR must use the actual tagged name, not aliases: " +
+                        aliases.distinct().joinToString(", ")
+                }
             }
         } else {
             mentionedKnownPeople.forEach { label ->
@@ -777,6 +800,9 @@ internal object QueryStructuredIntentPolicy {
     private val EVENT_DISCOVERY_TERM = Regex(
         "(?i)\\b(?:outing|wedding|birthday|party|dinner|hiking|trek|camp|camping|" +
             "picnic|celebration|meeting|offsite)\\b",
+    )
+    private val SELF_OCR_ALIAS_WORDS = setOf(
+        "person", "people", "self", "me", "my", "mine", "myself", "owner",
     )
 }
 

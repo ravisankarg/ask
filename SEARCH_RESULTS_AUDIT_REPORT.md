@@ -5,6 +5,11 @@ Device: Samsung SM-S938B (`RZCY92NW2AZ`)
 Scope: structured retrieval and public result presentation. The verified
 Gemma-only QP was frozen.
 
+> Historical device snapshot: the counts and UI strings below record the
+> 2026-07-25 audit. The current contract supersedes newest-first presentation:
+> the public top 200 now preserves category-aware overall relevance, and the
+> private answer budget is eight records. See `V0_2_VALIDATION_REPORT.md`.
+
 ## Final contract
 
 ```text

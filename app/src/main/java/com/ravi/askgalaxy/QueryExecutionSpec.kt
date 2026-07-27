@@ -188,8 +188,14 @@ object ExecutionSpecRenderer {
     fun render(node: ExecutionNode): String = render(node, parentPrecedence = 0)
 
     private fun render(node: ExecutionNode, parentPrecedence: Int): String = when (node) {
-        is ExecutionNode.Predicate ->
-            "[${node.field.wireName} == ${renderValue(node.value)}]"
+        is ExecutionNode.Predicate -> {
+            val value = if (node.field == ExecutionField.OCR) {
+                renderOcrKeywords(node.value)
+            } else {
+                renderValue(node.value)
+            }
+            "[${node.field.wireName} == $value]"
+        }
         is ExecutionNode.Sorted -> {
             // SORT is a result-set modifier. Keep it at the expression tail so
             // the canonical form matches SQL/C-style reading without adding a
@@ -221,6 +227,12 @@ object ExecutionSpecRenderer {
         return "\"" + clean.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
     }
 
+    private fun renderOcrKeywords(value: String): String {
+        val keywords = value
+            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .filter(String::isNotBlank)
+        return keywords.joinToString(" && ") { "{$it}" }
+    }
 }
 
 private class ExecutionSpecParser(value: String) {
@@ -284,12 +296,68 @@ private class ExecutionSpecParser(value: String) {
 
         val fieldText = collectUntil(TokenKind.EQUALS)
         expect(TokenKind.EQUALS)
-        val value = collectUntil(TokenKind.RIGHT_BRACKET)
-        expect(TokenKind.RIGHT_BRACKET)
         val field = ExecutionField.fromWireName(fieldText)
             ?: throw IllegalArgumentException("Unsupported execution field '$fieldText'")
+        val value = if (field == ExecutionField.OCR) {
+            collectOcrValue()
+        } else {
+            collectUntil(TokenKind.RIGHT_BRACKET)
+        }
+        expect(TokenKind.RIGHT_BRACKET)
         require(value.isNotBlank()) { "Execution predicate value is empty" }
         return ExecutionNode.Predicate(field, unquote(value))
+    }
+
+    /**
+     * OCR is the one predicate whose displayed value is an explicit keyword
+     * conjunction: [ocr == {Ravi} && {passport}]. It compiles to the compact
+     * internal value "Ravi passport"; the AND tokens never become AST-level
+     * set intersections.
+     */
+    private fun collectOcrValue(): String {
+        val values = ArrayList<String>()
+        var expectKeyword = true
+        var usedExplicitAnd = false
+        while (peek() != null && peek()?.kind != TokenKind.RIGHT_BRACKET) {
+            val token = peek()!!
+            if (expectKeyword) {
+                require(token.kind == TokenKind.WORD) {
+                    "Expected {keyword} inside ocr predicate but found '${token.text}'"
+                }
+                val unquoted = unquote(token.text)
+                val keyword = if (
+                    unquoted.startsWith("{") &&
+                    unquoted.endsWith("}") &&
+                    unquoted.length > 2
+                ) {
+                    unquoted.substring(1, unquoted.lastIndex)
+                } else {
+                    unquoted
+                }
+                require(keyword.isNotBlank() && '{' !in keyword && '}' !in keyword) {
+                    "Invalid OCR keyword '${token.text}'"
+                }
+                values += keyword
+                position += 1
+                expectKeyword = false
+            } else if (token.kind == TokenKind.AND) {
+                usedExplicitAnd = true
+                position += 1
+                expectKeyword = true
+            } else if (!usedExplicitAnd && token.kind == TokenKind.WORD) {
+                // Backward-compatible parsing for previously persisted/logged
+                // [ocr == Ravi passport] expressions.
+                expectKeyword = true
+            } else {
+                throw IllegalArgumentException(
+                    "Expected && between OCR keywords but found '${token.text}'",
+                )
+            }
+        }
+        require(values.isNotEmpty() && !expectKeyword) {
+            "OCR predicate must end with a keyword"
+        }
+        return values.joinToString(" ")
     }
 
     private fun collectUntil(kind: TokenKind): String {

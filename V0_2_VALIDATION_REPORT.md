@@ -14,8 +14,9 @@ This checkpoint covers the complete current working tree:
 - self-identity face tagging plus fixed finish/skip actions;
 - five-way Gemma query routing and canonical execution AST;
 - document retrieval with one SigLIP semantic branch plus one OCR-only
-  2–6-keyword OR branch;
-- semantic/OCR score fusion with a bonus for records found by both;
+  2–6-word same-photo AND branch;
+- same-photo OCR conjunctions with a strict perfect tier above semantic-only
+  document fallback;
 - at most eight answer records, full stored OCR/metadata text, text-only
   non-scenery answers, and at most four 512 px scenery images;
 - v0.2 UI/version badge and refreshed architecture site.
@@ -30,8 +31,9 @@ GRADLE_USER_HOME="$PWD/.gradle-user" \
   :app:testDebugUnitTest :app:assembleDebug
 ```
 
-Result: `BUILD SUCCESSFUL`; 46 actionable Gradle tasks, including the complete
-debug JVM contract suite, Rust native build, APK packaging, and debug assembly.
+Result: `BUILD SUCCESSFUL`; 47 JVM tests passed with zero failures. The 46
+actionable Gradle tasks include the Rust native build, APK packaging, and debug
+assembly.
 
 The query/retrieval tests specifically verify:
 
@@ -39,9 +41,14 @@ The query/retrieval tests specifically verify:
   passwords, DOB, age, marks, bills, receipts, and ticket prices;
 - self label insertion into identity-document OCR keywords without adding a
   face-presence filter;
-- OCR OR recall, duplicate-keyword removal, matched-term scoring, and the
-  semantic/OCR fusion bonus. `[ocr == Ravi passport]` is explicitly tokenized
-  as `Ravi OR passport`; neither word depends on the other being present;
+- explicit OCR conjunction parsing and duplicate removal.
+  `[ocr == {Ravi} && {passport}]` matches only when both words occur in the
+  same photo OCR; partial matches score zero and complete matches outrank
+  semantic-only documents;
+- self-document plans use the actual tagged name and document word while
+  rejecting `person`, `self`, `me`, `my`, and related aliases;
+- the public top-200 preserves category-aware overall query rank rather than
+  replacing it with newest-first ordering;
 - Odyssey ticket and broad monthly-spending hybrid plans;
 - eight-record evidence selection and text-only document answer context;
 - four-image scenery bounds and answer-output sanitation.
@@ -61,7 +68,7 @@ Artifact:
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
-SHA-256 3f0943dc8bdb3d85896e1649dcd97d158449a097a9c334261abf38e8c8a0f6e4
+SHA-256 6b7953a3227fb4b0c8da3383d8ea2f512852681c3973214964e9a0a93950e40b
 ```
 
 Install command:

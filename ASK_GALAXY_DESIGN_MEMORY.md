@@ -36,7 +36,7 @@ Search field visible
   -> recursively execute hard category/person/date/location/MIME sets
   -> search TurboQuant + SQLite OCR/metadata inside the accumulated hard scope
   -> keep semantic cosine >= 0.10; use scoped positive fallback only if empty
-  -> publish up to the newest 200 matches in the sole scrollable grid
+  -> publish up to 200 category-aware overall-relevance matches in the sole grid
   -> persisted episode membership join
   -> Context Picker selects at most 8 eligible cross-episode records without decoding images
   -> scenery uses persisted SigLIP embedding diversity and up to 4 downscaled
@@ -62,9 +62,10 @@ Search field visible
   encoder or copy all vectors into Kotlin.
 - OCR is indexing-time data and uses a distinct planner-authored `ocr`
   predicate. A doc plan fuses one conceptual SigLIP semantic phrase with one
-  short OCR-keyword list using `+`; OCR keywords are OR alternatives, matching
-  more keywords raises the OCR score, and semantic+OCR overlap gets a fusion
-  bonus. OCR exclusions run before evidence selection.
+  explicit conjunction such as `[ocr == {Ravi} && {passport}]` using `+`.
+  Every OCR word must occur in the same photo; a complete match is the perfect
+  tier above semantic-only fallback in both UI results and answer context.
+  OCR exclusions run before evidence selection.
 - OCR inputs preserve aspect ratio; long images use overlapping region-decoded
   tiles. Confidence/structure gating removes isolated hallucinations.
   `ocr_signature` enables OCR-only migrations without touching visual,
@@ -148,8 +149,8 @@ Search field visible
   generic browse sentence.
 - Follow-ups are useful, deduplicated, and capped at three. G1-G8 and C1-C4
   are private join labels and never appear in UI text. User-visible results
-  remain the newest 200 matches in the sole scrollable grid before, during, and
-  after answer generation. The effective QP spec appears below the search bar
+  remain the top 200 overall query matches in the sole scrollable grid before,
+  during, and after answer generation. The effective QP spec appears below the search bar
   immediately after planning; Time stats show completed phase durations beside it.
 - Personal context is opt-in, separately encrypted, filtered, bounded, and
   queried only when the plan requests it. It must never become an implicit
@@ -169,7 +170,7 @@ Search field visible
 
 ## Current validation memory
 
-- The current v0.2 pipeline passes 46 JVM contract tests plus the Rust/JNI and
+- The current v0.2 pipeline passes 47 JVM contract tests plus the Rust/JNI and
   debug APK build. The APK passes v2 signature and zip-alignment verification,
   installs with `adb install -r -d`, and launches normally on Samsung SM-S938B
   device `RZCY92NW2AZ`.
@@ -187,12 +188,12 @@ Search field visible
   `from_date`/`to_date` values of `2025-10-05` and returned 21 scoped results.
 - The document-retrieval contract now requires
   `[query_category == doc] && [[semantic == conceptual phrase] +
-  [ocr == printed keywords]]`. JVM tests verify OCR OR recall, matched-keyword
-  scoring, semantic/OCR overlap boosting, self-name passport planning, and the
-  Odyssey ticket plan. Re-run the live query matrix before claiming device
-  answer quality for this new contract.
+  [ocr == {word1} && {word2}]]`. JVM tests verify complete same-photo OCR
+  conjunctions, perfect-tier precedence over semantic-only results,
+  self-name-only passport planning, alias rejection, and the Odyssey ticket
+  plan. Re-run the live query matrix before claiming device answer quality.
 - The installed and local v0.2 debug APK SHA-256 is
-  `3f0943dc8bdb3d85896e1649dcd97d158449a097a9c334261abf38e8c8a0f6e4`.
+  `6b7953a3227fb4b0c8da3383d8ea2f512852681c3973214964e9a0a93950e40b`.
   Data-preserving reinstall kept the gallery DB hash
   `2a804f5b9a26f7f193bf947f6fa8caa17e229c7c5a9ffbc383c2ae830170d539`,
   SigLIP index hash

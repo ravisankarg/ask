@@ -130,11 +130,12 @@ user query
      accepting cosine scores >= 0.10 when confident matches exist; otherwise a
      positive-only nearest-neighbor fallback publishes up to 200 candidates
      inside the accumulated category/person/date/location/MIME allowlist)
-  -> SQLite executes planner-authored OCR keywords with OR recall plus exact
-     person, MIME, capture-date, and readable-place branches
-  -> doc retrieval fuses SigLIP semantic similarity + OCR keyword score;
-     rows present in both branches receive an additive rank boost
-  -> the full bounded match set is returned newest-first to the virtualized UI
+  -> SQLite requires every planner-authored braced OCR word in the same row,
+     plus exact person, MIME, capture-date, and readable-place branches
+  -> doc retrieval places complete OCR conjunctions above semantic-only fallback
+  -> category-aware overall relevance is preserved into the virtualized UI:
+     scenery semantic score first, doc OCR tier first, person/location exact
+     metadata scope first, then capture-date tie-breaking
   -> optional encrypted personal-context matcher runs only for a context scope
   -> persisted episode membership supplies cross-event diversity at query time
   -> Context Picker chooses at most 8 eligible records without decoding images;

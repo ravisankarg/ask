@@ -7,6 +7,11 @@ Semantic cosine cutoff: `0.10` inclusive, with a positive-only scoped
 nearest-neighbor fallback when both strict semantic and metadata results are
 empty
 
+> Historical device snapshot: this report preserves the 2026-07-25 measured
+> behavior. The current contract uses an eight-record context, text-only
+> non-scenery answers, category-aware overall result ranking, and complete
+> same-photo OCR conjunctions. See `V0_2_VALIDATION_REPORT.md`.
+
 ## Final pipeline contract
 
 1. The OCR indexing pass atomically persists OCR text and `content_class`.
@@ -19,10 +24,12 @@ empty
    single category predicate to the outer `category && retrieval` envelope.
 4. The category becomes a hard native/SQLite allowlist. The executor also
    intersects final IDs with that allowlist as a safety boundary.
-5. The UI receives up to the newest 200 scoped matches. The private Context
-   Picker independently selects at most 16 eligible records.
-6. `doc` and `scenary` may attach pixels. `person`, `location`, and `time`
-   use metadata-only records and skip visual decode/reranking.
+5. The UI receives up to 200 scoped matches in overall-relevance order. The
+   current private Context Picker independently selects at most eight eligible
+   records.
+6. Only `scenary` may attach pixels, capped at four images downscaled to a
+   512 px longest edge. `doc`, `person`, `location`, and `time` use text and
+   metadata only.
 
 ## Installed-index verification
 

@@ -92,7 +92,7 @@ search field visible
   -> effective QP output shown below the search bar before retrieval
   -> recursive set execution over person/date/location/MIME/semantic predicates
   -> SigLIP2 text vector + native TurboQuant search and SQLite metadata branches
-  -> newest 200 matches shown immediately in the sole scrollable grid
+  -> top 200 category-aware overall-relevance matches shown immediately
   -> persisted episode membership join
   -> QP category hard-scopes the indexed result set
   -> Context Picker selects at most 8 eligible representatives without decoding images
@@ -320,9 +320,9 @@ Requirements:
 - Current OCR retrieval is keyword/SQLite matching, not a semantic OCR vector
   index. Do not describe it as semantic search.
 - Every `doc` query must fuse one conceptual semantic branch with one
-  planner-authored OCR-keyword branch using `+`. OCR keywords are matched
-  against `ocr_text` only with OR recall; matching more terms raises the OCR
-  score, and matching both retrieval branches earns a fusion bonus.
+  planner-authored OCR conjunction using `+`. Every braced OCR word must match
+  the same `ocr_text`; partial matches are excluded. A complete OCR conjunction
+  is the perfect tier above every semantic-only document result.
 - OCR exclusions must be applied before answer evidence selection.
 - For selected document evidence, pass the complete OCR text to Gemma; do not
   use query-term-centered windows or prompt-side OCR truncation.
@@ -482,13 +482,12 @@ Planner requirements:
   date range.
 - Every `doc` plan must contain exactly one conceptual `semantic` predicate
   and one planner-authored `ocr` predicate joined by `+` in the same group.
-  The `ocr` value contains 2–6 independent likely printed words. It is a
-  compact whitespace-separated list, not a phrase: `[ocr == Ravi passport]`
-  executes as `Ravi OR passport`. Match each word against `ocr_text` only;
-  any one word admits the row and matching more words raises the OCR score.
-  Fuse semantic and OCR result sets so a row found by both receives the sum of
-  both scores plus a small fusion bonus. Never join the two branches with
-  `&&`, which would discard valid single-branch matches.
+  The `ocr` value contains 2–6 essential likely co-occurring words in explicit
+  syntax: `[ocr == {Ravi} && {passport}]`. Every braced word must occur in the
+  same `ocr_text`; partial matches do not enter the OCR branch. The outer `+`
+  retains semantic-only fallback, but every complete OCR match ranks above it.
+  For self identity documents, use only the actual tagged name and document
+  words; reject `person`, `self`, `me`, `my`, and similar aliases.
 - Passport, driving licence/DL, SSN/social-security number, PAN, Aadhaar/Aadhar,
   ID number, Wi-Fi password, password, user ID, DOB/date of birth, exact age,
   marks, grades, scores, and report-card fields request written facts and must
@@ -512,13 +511,13 @@ Planner requirements:
 - Required undated example:
   `how much I spend on car repair` →
   `[query_category == doc] &&
-  [[semantic == car repair payment record] + [ocr == car repair invoice total]]`.
+  [[semantic == car repair payment record] + [ocr == {car} && {repair}]]`.
 - Required broad aggregate example:
   `how much did I spend last month` →
   `[query_category == doc] && [[from_date == LAST_MONTH_START] &&
   [to_date == LAST_MONTH_END] &&
   [[semantic == purchase receipt payment record] +
-  [ocr == receipt bill invoice payment total amount]]]`.
+  [ocr == {total} && {amount}]]]`.
 - `semantic` may be clarified or paraphrased into one conceptual phrase, and
   `ocr` is planner-authored from likely printed words. Preserve exact names,
   places, time intent, and negation; every other structured value may receive
@@ -649,15 +648,15 @@ Current execution model:
 ```text
 canonical AST -> recursive union/add/intersection/subtraction evaluation
 semantic predicate -> TurboQuant image search + SQLite OCR/place/person branch
-ocr predicate -> OCR-only SQLite OR-keyword search with matched-term scoring
-semantic + ocr -> fused union; dual-branch matches receive an additive bonus
+ocr predicate -> OCR-only SQLite AND over all braced words in one row
+semantic + ocr -> OCR-perfect tier followed by semantic-only fallback
 semantic vector branch -> prefer cosine scores at or above 0.10
 empty positive semantic + metadata branch -> up to 200 nearest candidates
   inside the accumulated hard scope
 negative semantic branch -> strict cutoff only; never subtract nearest fallback
 hard predicate -> indexed person, MIME, date, or location ID set
 postfix sort -> capture date or readable place ordering
-full evaluated set -> newest 200 shown immediately in the virtualized UI
+full evaluated set -> top 200 category-aware overall relevance shown immediately
 ```
 
 Requirements:
@@ -669,11 +668,14 @@ Requirements:
 - Semantic query variants are bounded and deduplicated. Once hard scope is
   active, one sanitized semantic branch is usually enough; extra branches
   must not escape the scope or multiply latency.
-- Normalize and deduplicate planner-authored OCR keywords, then OR-match them
-  against `ocr_text` only. A record matching one term remains eligible, while
-  records matching more terms score higher. Keep generic OCR terms paired with
-  specific document, merchant, item, or subject keywords so fusion and
-  matched-term scoring rank the intended record first.
+- Normalize and deduplicate planner-authored OCR words, then require all of
+  them in the same `ocr_text`. Treat a complete conjunction as a perfect match
+  above semantic-only fallback. Use only essential co-occurring words; do not
+  AND mutually exclusive document-type synonyms.
+- Preserve executor order in the public grid. Scenery ranks semantic score
+  first; documents rank complete OCR conjunctions first; person/location
+  retain exact metadata scopes and use semantic relevance within that scope.
+  Capture date is an equal-score tie-breaker, not a replacement ranking.
 - Apply person/time/location/MIME/negative operations before evidence curation,
   diversity, or answer generation.
 - Keep the index resident and release only the text encoder/model component
@@ -938,7 +940,7 @@ total
 
 - The effective execution spec belongs in the live QP panel, not hidden inside
   end-of-answer timing details. Raw planner JSON remains diagnostic-only.
-- Display up to the newest 200 results, keep `GridView` as the sole vertical
+- Display up to the top 200 overall query-ranked results, keep `GridView` as the sole vertical
   scroller, and never replace that grid with the private top-8 answer context.
 - UI errors should be conversational and actionable. Avoid “evidence” as a
   generic error noun; say “matching photos or details” instead.

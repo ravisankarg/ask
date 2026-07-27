@@ -151,15 +151,17 @@ class QueryAndDiversityContractTest {
         assertTrue(prompt.contains("what is Ravi Aadhaar number"))
         assertTrue(prompt.contains("what is the Wi-Fi password"))
         assertTrue(prompt.contains("when does my driving licence expire"))
+        assertTrue(prompt.contains("[ocr == {Ravi} && {passport}]"))
+        assertTrue(prompt.contains("never person/self/me/my/owner aliases"))
     }
 
     @Test
-    fun broad_monthly_spending_plan_keeps_ocr_alternatives_inside_date_scope() {
+    fun broad_monthly_spending_plan_keeps_required_ocr_words_inside_date_scope() {
         val raw =
             "[query_category == doc] && [[from_date == 2026-06-01] && " +
                 "[to_date == 2026-06-30] && " +
                 "[[semantic == purchase receipts bills invoices payment confirmations] + " +
-                "[ocr == receipt bill invoice payment total amount]]]"
+                "[ocr == {total} && {amount}]]]"
 
         val spec = QueryExecutionSpec.parse(raw)
         val plan = ExecutionSpecCompiler.compile(spec)
@@ -173,7 +175,7 @@ class QueryAndDiversityContractTest {
             plan.semanticQueries,
         )
         assertEquals(
-            listOf("receipt bill invoice payment total amount"),
+            listOf("total amount"),
             plan.ocrTerms,
         )
         assertTrue(plan.answerEvidenceScope.needsOcr)
@@ -188,20 +190,48 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun ocr_keywords_use_or_recall_and_dual_branch_matches_get_fusion_boost() {
+    fun ocr_keywords_require_complete_and_match_and_outrank_semantic_only() {
         val keywords = OcrKeywordPolicy.keywords("Ravi passport Ravi")
 
         assertEquals(listOf("ravi", "passport"), keywords)
-        assertEquals(0.5f, OcrKeywordPolicy.score("PASSPORT", keywords))
-        assertEquals(0.5f, OcrKeywordPolicy.score("Ravi", keywords))
+        assertEquals(0f, OcrKeywordPolicy.score("PASSPORT", keywords))
+        assertEquals(0f, OcrKeywordPolicy.score("Ravi", keywords))
         assertEquals(1.0f, OcrKeywordPolicy.score("Ravi Passport Number", keywords))
+        assertFalse(OcrKeywordPolicy.matchesAll("PASSPORT", keywords))
+        assertTrue(OcrKeywordPolicy.matchesAll("Ravi Passport Number", keywords))
 
         val semanticOnly = RetrievalScoreFusion.merge(null, 0.42f, fused = true)
-        val ocrOnly = RetrievalScoreFusion.merge(null, 0.5f, fused = true)
-        val both = RetrievalScoreFusion.merge(semanticOnly, 0.5f, fused = true)
+        val ocrOnly = RetrievalScoreFusion.merge(
+            null,
+            OcrKeywordPolicy.PERFECT_MATCH_SCORE,
+            fused = true,
+        )
+        val both = RetrievalScoreFusion.merge(
+            semanticOnly,
+            OcrKeywordPolicy.PERFECT_MATCH_SCORE,
+            fused = true,
+        )
+        assertTrue(ocrOnly > semanticOnly)
         assertTrue(both > semanticOnly)
         assertTrue(both > ocrOnly)
-        assertEquals(0.97f, both, 0.0001f)
+        assertEquals(2.47f, both, 0.0001f)
+
+        val rendered = QueryExecutionSpec.parse(
+            "[query_category == doc] && [[semantic == passport identity document] + " +
+                "[ocr == {Ravi} && {passport}]]",
+        ).render()
+        assertTrue(rendered.contains("[ocr == {Ravi} && {passport}]"))
+        assertEquals(rendered, QueryExecutionSpec.parse(rendered).render())
+        QueryPlannerRuntime.validatePlannerOcrSyntax(rendered)
+        try {
+            QueryPlannerRuntime.validatePlannerOcrSyntax(
+                "[query_category == doc] && [[semantic == passport identity document] + " +
+                    "[ocr == Ravi passport]]",
+            )
+            fail("Expected old implicit OCR syntax to be rejected")
+        } catch (_: IllegalArgumentException) {
+            // Expected.
+        }
     }
 
     @Test
@@ -375,7 +405,7 @@ class QueryAndDiversityContractTest {
         val documentPlan = ExecutionSpecCompiler.compile(
             QueryExecutionSpec.parse(
                 "[query_category == doc] && [[semantic == passport identity document] + " +
-                    "[ocr == Ravi passport]]",
+                    "[ocr == {Ravi} && {passport}]]",
             ),
         )
         QueryPlannerRuntime.validateCompiledPlan(
@@ -384,6 +414,24 @@ class QueryAndDiversityContractTest {
             documentPlan,
             selfPersonLabel = "Ravi",
         )
+
+        val aliasPollutedPlan = ExecutionSpecCompiler.compile(
+            QueryExecutionSpec.parse(
+                "[query_category == doc] && [[semantic == passport identity document] + " +
+                    "[ocr == {Ravi} && {passport} && {self}]]",
+            ),
+        )
+        try {
+            QueryPlannerRuntime.validateCompiledPlan(
+                "What is my passport number?",
+                listOf("Ravi"),
+                aliasPollutedPlan,
+                selfPersonLabel = "Ravi",
+            )
+            fail("Expected self/person aliases in identity-document OCR to be rejected")
+        } catch (_: IllegalArgumentException) {
+            // Expected.
+        }
     }
 
     @Test
@@ -391,7 +439,7 @@ class QueryAndDiversityContractTest {
         val correct = ExecutionSpecCompiler.compile(
             QueryExecutionSpec.parse(
                 "[query_category == doc] && [[semantic == passport identity document] + " +
-                    "[ocr == Ravi passport]]",
+                    "[ocr == {Ravi} && {passport}]]",
             ),
         )
         QueryStructuredIntentPolicy.validate(
@@ -403,7 +451,8 @@ class QueryAndDiversityContractTest {
         val faceScoped = ExecutionSpecCompiler.compile(
             QueryExecutionSpec.parse(
                 "[query_category == doc] && [[person == Ravi] && " +
-                    "[[semantic == passport identity document] + [ocr == Ravi passport]]]",
+                    "[[semantic == passport identity document] + " +
+                    "[ocr == {Ravi} && {passport}]]]",
             ),
         )
         try {
@@ -685,7 +734,7 @@ class QueryAndDiversityContractTest {
         val plan = ExecutionSpecCompiler.compile(
             QueryExecutionSpec.parse(
                 "[query_category == doc] && [[semantic == Odyssey movie ticket price] + " +
-                    "[ocr == Odyssey ticket price total]]",
+                    "[ocr == {Odyssey} && {ticket}]]",
             ),
         )
 
@@ -694,7 +743,7 @@ class QueryAndDiversityContractTest {
         assertEquals(QueryCategory.DOC, plan.queryCategory)
         assertEquals(null, plan.mediaType)
         assertEquals(listOf("Odyssey movie ticket price"), plan.semanticQueries)
-        assertEquals(listOf("Odyssey ticket price total"), plan.ocrTerms)
+        assertEquals(listOf("Odyssey ticket"), plan.ocrTerms)
         assertEquals("", plan.fromDate)
         assertEquals("", plan.toDate)
     }
@@ -867,7 +916,8 @@ class QueryAndDiversityContractTest {
 
         assertTrue(expression.startsWith("["))
         assertTrue(expression.endsWith("SORT_DATE"))
-        assertFalse(expression.contains('{'))
+        assertTrue(expression.contains('{'))
+        assertTrue(expression.contains("&&"))
         assertFalse(expression.contains('\n'))
         assertEquals(expression, QueryExecutionSpec.parse(expression).render())
     }
@@ -994,12 +1044,27 @@ class QueryAndDiversityContractTest {
             evidenceGroups = emptyList(),
             evidenceScope = QueryCategory.DOC.answerEvidenceScope(),
             queryCategory = QueryCategory.DOC,
+            ocrKeywords = listOf("odyssey", "ticket"),
             maxRecords = 2,
         )
 
         assertEquals(2L, context.records.first().mediaStoreId)
         assertFalse(context.includeVisuals)
         assertEquals(0, embeddingDiversityCalls)
+    }
+
+    @Test
+    fun public_result_window_preserves_executor_overall_relevance_order() {
+        val semanticBestButOldest = media(3).copy(dateModifiedSeconds = 10)
+        val middle = media(1).copy(dateModifiedSeconds = 30)
+        val newestButLowestScore = media(2).copy(dateModifiedSeconds = 50)
+
+        val shown = SearchResultPresentationPolicy.top(
+            rankedCandidates = listOf(semanticBestButOldest, middle, newestButLowestScore),
+            limit = 2,
+        )
+
+        assertEquals(listOf(3L, 1L), shown.map { it.mediaStoreId })
     }
 
     @Test

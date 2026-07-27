@@ -97,13 +97,15 @@ class GalleryIndexer(context: Context) {
                         )
                     }
                     val candidates = searchExecution.candidates
-                    val uiGallery = candidates
-                        .sortedWith(
-                            compareByDescending<GalleryMedia> {
-                                it.dateTakenMs ?: it.dateModifiedSeconds * 1000L
-                            }.thenByDescending { it.mediaStoreId },
-                        )
-                        .take(UI_RESULT_LIMIT)
+                    // StructuredSearchExecutor owns category-aware relevance:
+                    // scenery favors semantics, documents favor complete OCR
+                    // conjunctions, and person/location hard metadata scopes
+                    // are ranked before tie-breaking by recency. Never replace
+                    // that overall query rank with a newest-first UI sort.
+                    val uiGallery = SearchResultPresentationPolicy.top(
+                        rankedCandidates = candidates,
+                        limit = UI_RESULT_LIMIT,
+                    )
                     // Publish the practical browsing window before episode
                     // joining, Context Picker reranking, or Gemma answer work.
                     runCatching { onMatches(uiGallery, candidates.size) }
@@ -150,15 +152,24 @@ class GalleryIndexer(context: Context) {
                     // The picker always operates on indexed records. Scenery
                     // alone uses persisted SigLIP embeddings for diversity;
                     // no phase here opens or decodes an image.
-                    val diversityCandidates = (
-                        evidenceBuild.representativeCandidates + candidates
-                        ).distinctBy { it.mediaStoreId }
+                    val diversityCandidates = if (
+                        searchExecution.queryCategory == QueryCategory.DOC
+                    ) {
+                        // Preserve OCR-perfect then semantic-only rank before
+                        // the document-specific Context Picker rechecks it.
+                        (candidates + evidenceBuild.representativeCandidates)
+                            .distinctBy { it.mediaStoreId }
+                    } else {
+                        (evidenceBuild.representativeCandidates + candidates)
+                            .distinctBy { it.mediaStoreId }
+                    }
                     val answerContext = answerContextPicker.pick(
                         query = query,
                         rankedCandidates = diversityCandidates,
                         evidenceGroups = evidenceBuild.contextGroups,
                         evidenceScope = searchExecution.answerEvidenceScope,
                         queryCategory = searchExecution.queryCategory,
+                        ocrKeywords = searchExecution.ocrKeywords,
                         maxRecords = MAX_ANSWER_RECORDS,
                     )
                     Log.i(
@@ -192,7 +203,7 @@ class GalleryIndexer(context: Context) {
                     SigLipTextEncoder.releaseResident()
                     SearchResponse(
                         // The result browser is independent from the top-8
-                        // answer context. Show up to 200 newest matches while
+                        // answer context. Show up to 200 query-ranked matches while
                         // retaining the full evaluated count.
                         gallery = uiGallery,
                         totalGalleryMatches = candidates.size,
@@ -582,6 +593,7 @@ class GalleryIndexer(context: Context) {
                     effectivePlanJson = "(empty)",
                     queryCategory = effectivePlan.queryCategory,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
+                    ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
@@ -595,6 +607,7 @@ class GalleryIndexer(context: Context) {
                 effectivePlanJson = renderedExecutionSpec,
                 queryCategory = effectivePlan.queryCategory,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
+                ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
             )
         }
     }
@@ -1257,6 +1270,7 @@ class GalleryIndexer(context: Context) {
         val effectivePlanJson: String,
         val queryCategory: QueryCategory,
         val answerEvidenceScope: AnswerEvidenceScope,
+        val ocrKeywords: List<String>,
     )
 
     private data class ParsedAnswer(
@@ -1322,6 +1336,17 @@ class GalleryIndexer(context: Context) {
         }
         return scanned
     }
+}
+
+/**
+ * The executor's order is the product's overall query score. Presentation may
+ * bound that list, but it must never substitute a date/name/file sort.
+ */
+internal object SearchResultPresentationPolicy {
+    fun top(
+        rankedCandidates: List<GalleryMedia>,
+        limit: Int,
+    ): List<GalleryMedia> = rankedCandidates.take(limit.coerceAtLeast(0))
 }
 
 private fun android.database.Cursor.getIntOrZero(column: Int): Int =

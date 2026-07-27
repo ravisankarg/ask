@@ -26,8 +26,9 @@
       <a href="#architecture">Architecture</a>
       <a href="#indexing">Indexing</a>
       <a href="#query-flow">Query flow</a>
+      <a href="#context-picker">Evidence</a>
+      <a href="#validation">Validation</a>
       <a href="#modules">Modules</a>
-      <a href="#roadmap">Next steps</a>
     </nav>
     <a class="header-link" href="https://github.com/ravisankarg/ask">View source <span>↗</span></a>
   </header>
@@ -74,7 +75,7 @@
               <span>QP output <i>ready</i></span>
               <span>◷ 14.0 s</span>
             </div>
-            <code id="demo-plan">[query_category == doc] &amp;&amp; [[semantic == Odyssey movie ticket price] + [ocr == Odyssey ticket price total]]</code>
+            <code id="demo-plan">[query_category == doc] &amp;&amp; [[semantic == Odyssey movie ticket price] + [ocr == {Odyssey} &amp;&amp; {ticket}]]</code>
           </div>
           <div class="result-head">
             <span><strong>1</strong> of 1 match</span>
@@ -97,7 +98,7 @@
     <section class="statement shell" data-reveal>
       <p>Search is the product. <span>The answer is a layer on top.</span></p>
       <div>
-        The user always gets the newest 200 matching photos in one smooth grid.
+        The user always gets the top 200 overall query matches in one smooth grid.
         A separate Context Picker privately distills at most 8 category-eligible records for Gemma—never
         replacing the results the user can browse.
       </div>
@@ -196,10 +197,10 @@
             <span>2</span><div><h3>Compile the QP spec</h3><p>Emit one query_category plus the canonical C-like AST and show it below the search bar immediately.</p></div>
           </article>
           <article data-reveal>
-            <span>3</span><div><h3>Execute hybrid retrieval</h3><p>For documents, fuse one SigLIP semantic branch with independent OCR words: “Ravi passport” means Ravi OR passport, never a phrase. More word matches score higher; semantic + OCR overlap gets an extra boost.</p></div>
+            <span>3</span><div><h3>Execute hybrid retrieval</h3><p>For documents, every braced OCR word must occur in the same photo: {Ravi} AND {passport}. That complete conjunction is a perfect match above semantic-only fallback.</p></div>
           </article>
           <article data-reveal>
-            <span>4</span><div><h3>Publish results first</h3><p>Render up to 200 newest matches in the sole vertical scroller while context work continues.</p></div>
+            <span>4</span><div><h3>Publish results first</h3><p>Render up to 200 overall-relevance matches without re-sorting by date: semantic-first scenery, OCR-first documents, metadata-scoped people and places.</p></div>
           </article>
           <article data-reveal>
             <span>5</span><div><h3>Distill answer context</h3><p>Join episode membership and choose no more than 8 records. Preserve full stored OCR and metadata without prompt truncation.</p></div>
@@ -226,7 +227,7 @@
           </div>
           <div class="grammar-example">
             <small>“What is my passport number?” · Self person Ravi</small>
-            <code>[query_category == doc] &amp;&amp; [[semantic == passport identity document] + [ocr == Ravi passport]]</code>
+            <code>[query_category == doc] &amp;&amp; [[semantic == passport identity document] + [ocr == {Ravi} &amp;&amp; {passport}]]</code>
           </div>
         </aside>
       </div>
@@ -280,6 +281,140 @@
           </div>
         </div>
       </div>
+
+      <div class="shell evidence-detail" data-reveal>
+        <div class="evidence-intro">
+          <p class="eyebrow"><span></span> Private evidence flow</p>
+          <h3>One retrieval. Two deliberately different outputs.</h3>
+          <p>The result browser and answer context share the corrected QP scope, then separate. The user sees up to 200 relevance-ranked matches immediately; Gemma receives a private, category-safe subset of at most eight records.</p>
+        </div>
+        <div class="evidence-pipeline" aria-label="Evidence Picker pipeline">
+          <article><span>01</span><b>Corrected QP spec</b><small>category + hard predicates</small></article>
+          <i>→</i>
+          <article><span>02</span><b>Scoped retrieval</b><small>overall relevance order</small></article>
+          <i>→</i>
+          <article class="pipeline-public"><span>03A</span><b>Public grid</b><small>up to 200 matches</small></article>
+          <i class="pipeline-split">↘</i>
+          <article class="pipeline-private"><span>03B</span><b>Private picker</b><small>up to 8 records</small></article>
+          <i>→</i>
+          <article><span>04</span><b>Gemma answer</b><small>category-safe context</small></article>
+        </div>
+
+        <div class="picker-rules">
+          <article>
+            <span>Gate</span>
+            <h4>Reject before ranking</h4>
+            <p>Every candidate must satisfy its category eligibility. If nothing is eligible, the evidence bundle is empty—unrelated results are never substituted.</p>
+          </article>
+          <article>
+            <span>Cover</span>
+            <h4>Spend five slots on breadth</h4>
+            <p>Anchor the strongest matches, then round-robin across people, places, OCR, months, and episodes before filling remaining slots by score.</p>
+          </article>
+          <article>
+            <span>Deduplicate</span>
+            <h4>Prefer a new reason to answer</h4>
+            <p>Stable media IDs prevent repeats. Episode membership suppresses near-duplicate moments; scenery also uses persisted SigLIP distance for visual novelty.</p>
+          </article>
+          <article>
+            <span>Decode late</span>
+            <h4>Selection stays text + vectors</h4>
+            <p>The picker loads no photo pixels. Only after selection may scenery decode at most four images, each reduced to a 512 px longest edge.</p>
+          </article>
+        </div>
+
+        <div class="policy-table-wrap">
+          <table class="policy-table">
+            <thead>
+              <tr>
+                <th>QP category</th>
+                <th>Hard eligibility</th>
+                <th>What wins inside the 8-record budget</th>
+                <th>Gemma receives</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th><code>doc</code></th>
+                <td><code>contentClass == DOC</code></td>
+                <td>Complete same-photo OCR conjunctions first, then text evidence, then original result rank.</td>
+                <td>Full OCR + metadata; text only, no pixels.</td>
+              </tr>
+              <tr>
+                <th><code>scenary</code></th>
+                <td>Not classified as a document</td>
+                <td>Semantic relevance, persisted SigLIP visual diversity, and episode coverage.</td>
+                <td>Metadata + up to four selected 512 px images.</td>
+              </tr>
+              <tr>
+                <th><code>person</code></th>
+                <td>At least one named <code>personLabel</code></td>
+                <td>Strong anchors plus coverage across as many as three distinct named people.</td>
+                <td>Names, time, place, OCR, and episode text; no pixels.</td>
+              </tr>
+              <tr>
+                <th><code>location</code></th>
+                <td>A readable <code>locationName</code></td>
+                <td>Strong anchors plus coverage across as many as three distinct places.</td>
+                <td>Place, time, people, OCR, and episode text; no pixels.</td>
+              </tr>
+              <tr>
+                <th><code>time</code></th>
+                <td>Capture date, or modified-time fallback</td>
+                <td>Strong anchors plus timeline breadth across as many as four distinct year-month buckets.</td>
+                <td>Dates, place, people, OCR, and episode text; no pixels.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="episode-note"><b>Episode layer:</b> evidence construction inspects the top 100 retrieved candidates and may retain up to 32 episode representatives for context selection. Compact episode summaries are added to the final answer prompt only for event-noun plus count/list intent, capped at 12 episodes.</p>
+      </div>
+    </section>
+
+    <section id="validation" class="section shell">
+      <div class="section-heading" data-reveal>
+        <p class="eyebrow"><span></span> Validation snapshot</p>
+        <h2>50 planner cases.<br>Five intent families.</h2>
+        <p>This July 25 device audit measured Gemma planning, parsing, and validators—not gallery retrieval, Evidence Picker behavior, or answer generation. It is retained as a historical baseline; later OCR grammar and ranking changes were not rerun in this table.</p>
+      </div>
+      <div class="audit-grid">
+        <div class="audit-table-wrap" data-reveal>
+          <table class="audit-table">
+            <thead>
+              <tr>
+                <th>Category</th>
+                <th>Queries</th>
+                <th>Passed</th>
+                <th>Failed</th>
+                <th>Repair</th>
+                <th>Mean</th>
+                <th>Median</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><th><code>doc</code></th><td>10</td><td>10</td><td>0</td><td>0</td><td>41.2 s</td><td>40.6 s</td></tr>
+              <tr><th><code>scenary</code></th><td>10</td><td>10</td><td>0</td><td>1</td><td>43.1 s</td><td>40.8 s</td></tr>
+              <tr><th><code>person</code></th><td>10</td><td>10</td><td>0</td><td>0</td><td>40.7 s</td><td>40.7 s</td></tr>
+              <tr><th><code>location</code></th><td>10</td><td>10</td><td>0</td><td>4</td><td>56.4 s</td><td>51.6 s</td></tr>
+              <tr><th><code>time</code></th><td>10</td><td>10</td><td>0</td><td>2</td><td>46.4 s</td><td>40.9 s</td></tr>
+              <tr class="audit-total"><th>Total</th><td>50</td><td>50 · 100%</td><td>0</td><td>7</td><td>45.6 s</td><td>40.8 s</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <aside class="audit-summary" data-reveal>
+          <p class="card-kicker">Device audit</p>
+          <strong>37m 58s</strong>
+          <span>2,278.046 seconds total</span>
+          <dl>
+            <div><dt>50 / 50</dt><dd>accepted plans</dd></div>
+            <div><dt>7</dt><dd>queries repaired</dd></div>
+            <div><dt>2</dt><dd>needed second repair</dd></div>
+            <div><dt>0</dt><dd>final rejections</dd></div>
+          </dl>
+          <a href="https://github.com/ravisankarg/ask/blob/main/QP_ONLY_50_AUDIT_REPORT.md">Read all 50 cases and acceptance rules ↗</a>
+        </aside>
+      </div>
     </section>
 
     <section id="modules" class="section shell">
@@ -300,16 +435,16 @@
         <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Media + metadata</h3><p>Incremental MediaStore scan, stable signatures, capture dates, raw GPS, dimensions, video duration.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GalleryIndexer.kt">GalleryIndexer · MetadataReader ↗</a></article>
         <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Location enrichment</h3><p>ACCESS_MEDIA_LOCATION + original photo EXIF, system geocoder first, serialized rounded-coordinate fallback, and a location-only migration.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/LocationIndexer.kt">MediaLocationAccess · LocationIndexer ↗</a></article>
         <article class="module-card" data-kind="index search" data-reveal><span>Index + search</span><h3>Visual semantics</h3><p>Aligned SigLIP2 image/text towers, normalized 768-D vectors, device-calibrated 0.10 confidence gate, scoped non-empty fallback.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GallerySemanticIndexer.kt">SemanticIndexer · SigLIP encoders ↗</a></article>
-        <article class="module-card" data-kind="index search" data-reveal><span>Index + search</span><h3>OCR</h3><p>Bundled ML Kit OCR, aspect-preserving long-image tiles, full stored text, isolated rebuild, and planner-authored OR-keyword retrieval.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/OcrIndexer.kt">OcrIndexer · MlKitOcrEngine ↗</a></article>
+        <article class="module-card" data-kind="index search" data-reveal><span>Index + search</span><h3>OCR</h3><p>Bundled ML Kit OCR, aspect-preserving long-image tiles, full stored text, isolated rebuild, and same-photo all-word conjunctions.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/OcrIndexer.kt">OcrIndexer · MlKitOcrEngine ↗</a></article>
         <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Faces + identity</h3><p>YuNet landmarks, FaceNet-512, encrypted clusters, fixed finish/skip actions, and one exclusive “This is me” label.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/FaceClustersActivity.kt">FaceIndexer · Clusterer · Face UI ↗</a></article>
         <article class="module-card" data-kind="index answer" data-reveal><span>Index + answer</span><h3>Episode index</h3><p>Precomputed event headers and memberships from time, place, and people for fast query-time coverage.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/EpisodeIndex.kt">EpisodeIndex · EvidenceBuilder ↗</a></article>
         <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Query processor</h3><p>Gemma-only five-way routing, document-intent guards, self-name resolution, and one semantic + one OCR branch for every doc plan.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/QueryPlannerRuntime.kt">QueryPlannerRuntime · QueryPlan ↗</a></article>
-        <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Structured executor</h3><p>Recursive hard scopes; OCR lists split into independent word-level OR probes; matched-word scoring, semantic/OCR fusion bonus, and scoped semantic fallback.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/StructuredSearchExecutor.kt">QueryExecutionSpec · Executor ↗</a></article>
+        <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Structured executor</h3><p>Recursive hard scopes and category-aware overall ranking: semantic-first scenery, OCR-perfect documents, metadata-scoped people/places, then stable tie-breakers.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/StructuredSearchExecutor.kt">QueryExecutionSpec · Executor ↗</a></article>
         <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Context Picker</h3><p>Strict indexed category eligibility, text-only metadata paths, and episode/SigLIP diversity under a hard 8-record budget.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerContextPicker.kt">AnswerContextPicker · DiversitySelector ↗</a></article>
         <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Gemma runtime</h3><p>Full OCR/metadata text for non-scenes; scenery alone may attach four images downscaled to a 512 px longest edge, with OOM recovery.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GemmaRuntime.kt">GemmaRuntime · GalleryIndexer ↗</a></article>
         <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Response guardrails</h3><p>Duplicate-aware context, natural 2–3 sentences, reasoning/task/ID removal, and no synthetic filler.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerTextSanitizer.kt">AnswerTextSanitizer · AnswerModels ↗</a></article>
         <article class="module-card" data-kind="platform answer" data-reveal><span>Optional context</span><h3>Personal signals</h3><p>Opt-in future notifications, sensitive-alert rejection, separate encryption, bounded local matching.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/PersonalContextDatabase.kt">PersonalContext modules ↗</a></article>
-        <article class="module-card" data-kind="platform search" data-reveal><span>Product UI</span><h3>Search + recovery</h3><p>v0.2 badge, live QP/timing telemetry, newest-200 grid, per-stage progress bars, and separate clear/rebuild controls for every index.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/MainActivity.kt">MainActivity · SettingsActivity ↗</a></article>
+        <article class="module-card" data-kind="platform search" data-reveal><span>Product UI</span><h3>Search + recovery</h3><p>v0.2 badge, live QP/timing telemetry, relevance-ranked top-200 grid, per-stage progress bars, and separate clear/rebuild controls for every index.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/MainActivity.kt">MainActivity · SettingsActivity ↗</a></article>
         <article class="module-card" data-kind="platform search" data-reveal><span>Native core</span><h3>Rust TurboQuant</h3><p>4-bit persistent IdMap index, exact stable IDs, tokenizer JNI, atomic index replacement, arm64 ABI.</p><a href="https://github.com/ravisankarg/ask/blob/main/native/askgalaxy-native/src/lib.rs">native/askgalaxy-native ↗</a></article>
       </div>
     </section>
@@ -334,8 +469,8 @@
         <h2>From strong system to effortless product.</h2>
       </div>
       <div class="roadmap-grid">
-        <article data-reveal><span>Done · v0.2</span><h3>Harden answer generation</h3><p>Eight-record evidence, text-only document answers, bounded scenery images, memory-failure recovery, and private-output sanitation.</p><b>Performance</b></article>
-        <article data-reveal><span>Now</span><h3>Expand live query matrix</h3><p>Automate person, place, date, negation, OCR fusion, event-count, typo, and empty-hard-scope checks on representative devices.</p><b>Quality</b></article>
+        <article data-reveal><span>Done · v0.2</span><h3>Bound answer inputs</h3><p>Eight-record evidence, text-only document answers, bounded scenery images, and private-output sanitation.</p><b>Performance</b></article>
+        <article data-reveal><span>Now</span><h3>Expand live query matrix</h3><p>Automate category ranking, OCR conjunction, person/place scope, date, negation, event-count, typo, and empty-hard-scope checks on representative devices.</p><b>Quality</b></article>
         <article data-reveal><span>Next</span><h3>Calibrate episode boundaries</h3><p>Measure event purity and coverage across travel days, dense bursts, multi-day outings, and sparse archives.</p><b>Retrieval</b></article>
         <article data-reveal><span>Done</span><h3>Restore photo locations</h3><p>9,834 photos now carry readable indexed places through original EXIF; the isolated rebuild preserved every non-location index.</p><b>Metadata</b></article>
         <article data-reveal><span>Then</span><h3>Production distribution</h3><p>Add product signing, model delivery policy, upgrade migrations, privacy copy, and release telemetry.</p><b>Release</b></article>

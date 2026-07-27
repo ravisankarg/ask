@@ -15,15 +15,25 @@ class StructuredSearchExecutor(
     fun execute(
         spec: QueryExecutionSpec,
     ): List<GalleryMedia> {
-        val categoryAllowlist = database.mediaStoreIdsForQueryCategory(
-            spec.requiredQueryCategory(),
-        )
+        val queryCategory = spec.requiredQueryCategory()
+        val categoryAllowlist = database.mediaStoreIdsForQueryCategory(queryCategory)
         if (categoryAllowlist.isEmpty()) return emptyList()
         val evaluated = evaluate(spec.root, categoryAllowlist)
         val scoreById = evaluated.scores.filterKeys { it in categoryAllowlist }
         if (scoreById.isEmpty()) return emptyList()
         val rows = database.findByMediaStoreIds(scoreById.keys.toLongArray())
         val comparator = when {
+            queryCategory == QueryCategory.DOC -> documentComparator(
+                scoreById = scoreById,
+                sorts = evaluated.sorts,
+            )
+            queryCategory == QueryCategory.SCENARY ||
+                queryCategory == QueryCategory.PERSON ||
+                queryCategory == QueryCategory.LOCATION ->
+                relevanceFirstComparator(
+                    scoreById = scoreById,
+                    sorts = evaluated.sorts,
+                )
             ExecutionSort.DATE in evaluated.sorts ->
                 compareByDescending<GalleryMedia> {
                     it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
@@ -41,6 +51,62 @@ class StructuredSearchExecutor(
         // Return the complete evaluated set; the UI virtualizes it and the
         // answer Context Picker independently chooses at most 8 items.
         return rows.sortedWith(comparator)
+    }
+
+    /**
+     * Scenery uses semantic relevance as its primary signal. Person and
+     * location plans have already applied their exact indexed metadata scopes,
+     * so semantic relevance orders records inside that authoritative scope.
+     * Explicit date/location sorting and recency are tie-breakers.
+     */
+    private fun relevanceFirstComparator(
+        scoreById: Map<Long, Float>,
+        sorts: Set<ExecutionSort>,
+    ): Comparator<GalleryMedia> {
+        val relevance = compareByDescending<GalleryMedia> {
+            scoreById[it.mediaStoreId] ?: 0f
+        }
+        return when {
+            ExecutionSort.DATE in sorts ->
+                relevance.thenByDescending {
+                    it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
+                }
+            ExecutionSort.LOCATION in sorts ->
+                relevance.thenBy {
+                    (it.locationName ?: it.location).orEmpty().lowercase()
+                }
+            else ->
+                relevance.thenByDescending {
+                    it.dateTakenMs ?: it.dateModifiedSeconds * 1000L
+                }
+        }
+    }
+
+    /**
+     * Document results have two strict tiers. A complete OCR-keyword match is
+     * always above semantic-only retrieval; requested sorting and relevance
+     * operate only within each tier.
+     */
+    private fun documentComparator(
+        scoreById: Map<Long, Float>,
+        sorts: Set<ExecutionSort>,
+    ): Comparator<GalleryMedia> {
+        val tier = compareByDescending<GalleryMedia> {
+            (scoreById[it.mediaStoreId] ?: 0f) >= OcrKeywordPolicy.PERFECT_MATCH_SCORE
+        }
+        return when {
+            ExecutionSort.DATE in sorts ->
+                tier.thenByDescending {
+                    it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
+                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
+            ExecutionSort.LOCATION in sorts ->
+                tier.thenBy {
+                    (it.locationName ?: it.location).orEmpty().lowercase()
+                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
+            else ->
+                tier.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
+                    .thenByDescending { it.dateTakenMs ?: it.dateModifiedSeconds * 1000L }
+        }
     }
 
     private fun evaluate(
@@ -246,7 +312,7 @@ class StructuredSearchExecutor(
         val scores = LinkedHashMap<Long, Float>()
         matches.forEach { match ->
             if (match.media.mediaStoreId in categoryAllowlist) {
-                scores[match.media.mediaStoreId] = match.score.coerceAtLeast(FALLBACK_ZERO_SCORE)
+                scores[match.media.mediaStoreId] = OcrKeywordPolicy.PERFECT_MATCH_SCORE
             }
         }
         return EvaluatedSet(scores)
@@ -324,13 +390,17 @@ internal object OcrKeywordPolicy {
         .distinct()
 
     fun score(ocrText: String, keywords: List<String>): Float {
-        if (keywords.isEmpty()) return 0f
+        return if (matchesAll(ocrText, keywords)) 1f else 0f
+    }
+
+    fun matchesAll(ocrText: String, keywords: List<String>): Boolean {
+        if (keywords.isEmpty()) return false
         val normalized = ocrText.lowercase()
-        val matched = keywords.count(normalized::contains)
-        return matched.toFloat() / keywords.size.toFloat()
+        return keywords.all(normalized::contains)
     }
 
     const val MAX_KEYWORDS = 6
+    const val PERFECT_MATCH_SCORE = 2f
 }
 
 internal object RetrievalScoreFusion {

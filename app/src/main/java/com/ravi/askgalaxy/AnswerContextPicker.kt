@@ -90,6 +90,7 @@ class AnswerContextPicker(
         evidenceGroups: List<EvidenceGroup>,
         evidenceScope: AnswerEvidenceScope,
         queryCategory: QueryCategory,
+        ocrKeywords: List<String> = emptyList(),
         maxRecords: Int = MAX_RECORDS,
     ): AnswerContextBundle {
         val inputCandidates = rankedCandidates.distinctBy { it.mediaStoreId }
@@ -113,6 +114,50 @@ class AnswerContextPicker(
             media.mediaStoreId to index
         }.toMap()
         val queryText = query.lowercase(Locale.ROOT)
+        if (queryCategory == QueryCategory.DOC) {
+            val normalizedKeywords = ocrKeywords
+                .map(String::lowercase)
+                .distinct()
+                .take(OcrKeywordPolicy.MAX_KEYWORDS)
+            val candidates = eligibleCandidates.sortedWith(
+                compareByDescending<GalleryMedia> {
+                    OcrKeywordPolicy.matchesAll(it.ocrText, normalizedKeywords)
+                }.thenByDescending {
+                    textEvidenceScore(queryText, it)
+                }.thenBy {
+                    originalRank[it.mediaStoreId] ?: Int.MAX_VALUE
+                },
+            )
+            val chosen = candidates.take(safeMax).map { media ->
+                val coverage = linkedSetOf(
+                    AnswerCoverageFacet.CATEGORY_MATCH,
+                    AnswerCoverageFacet.RELEVANCE,
+                    AnswerCoverageFacet.OCR,
+                )
+                AnswerContextItem(media, coverage)
+            }
+            val metadataFields = buildSet {
+                addAll(evidenceScope.metadataFields)
+                if (chosen.any { !it.media.personLabel.isNullOrBlank() }) {
+                    add(AnswerMetadataField.PEOPLE)
+                }
+                if (chosen.any {
+                        !it.media.locationName.isNullOrBlank() || !it.media.location.isNullOrBlank()
+                    }
+                ) {
+                    add(AnswerMetadataField.LOCATION)
+                }
+            }
+            return AnswerContextBundle(
+                items = chosen,
+                metadataFields = metadataFields,
+                includeOcr = true,
+                queryCategory = queryCategory,
+                includeVisuals = false,
+                inputCandidateCount = inputCandidates.size,
+                eligibleCandidateCount = candidates.size,
+            )
+        }
         val candidates = if (includeVisuals) {
             eligibleCandidates
         } else {

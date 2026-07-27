@@ -1297,8 +1297,8 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     /**
      * Matches planner-selected document keywords against OCR text only.
-     * Keywords are alternatives: any one term admits the row, while matching
-     * more terms raises its score before semantic/OCR fusion.
+     * Every keyword must occur in the same row. A row satisfying the complete
+     * keyword set is a perfect OCR match; partial matches are not returned.
      */
     fun searchOcrKeywordsRanked(
         keywords: List<String>,
@@ -1308,10 +1308,10 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .map { it.trim().lowercase() }
             .filter(String::isNotBlank)
             .distinct()
-            .take(8)
+            .take(OcrKeywordPolicy.MAX_KEYWORDS)
             .toList()
         if (terms.isEmpty()) return emptyList()
-        val selection = terms.joinToString(" OR ") {
+        val selection = terms.joinToString(" AND ") {
             "LOWER(ocr_text) LIKE ? ESCAPE '\\'"
         }
         val args = terms.map { term ->
@@ -1325,10 +1325,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .map { media ->
                 MetadataMatch(media, OcrKeywordPolicy.score(media.ocrText, terms))
             }
-            .sortedWith(
-                compareByDescending<MetadataMatch> { it.score }
-                    .thenByDescending { it.media.dateModifiedSeconds },
-            )
+            .sortedByDescending { it.media.dateModifiedSeconds }
             .take(limit.coerceIn(1, MAX_SEARCH_RESULTS))
             .toList()
     }
