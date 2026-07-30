@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 import android.Manifest
 import android.app.Activity
+import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -38,6 +39,9 @@ class MainActivity : Activity() {
     private lateinit var facePromptStatus: TextView
     private lateinit var facePromptPreview: LinearLayout
     private lateinit var query: EditText
+    private lateinit var gemmaWarmupStatus: TextView
+    private lateinit var gemmaWarmupPanel: LinearLayout
+    private lateinit var gemmaWarmupIndicator: ProgressBar
     private lateinit var resultPanel: LinearLayout
     private lateinit var answer: TextView
     private lateinit var followUpPanel: LinearLayout
@@ -59,7 +63,6 @@ class MainActivity : Activity() {
     private var expandedSourceId: String? = null
     private var facePromptRequested = false
     private var searchReady = false
-    private var plannerPreloadStarted = false
     private var resultAdapter: SearchResultAdapter? = null
     private var lastSubmittedQuery = ""
     private var lastSubmittedAtMs = 0L
@@ -311,6 +314,29 @@ class MainActivity : Activity() {
         }
         searchCard.addView(query, LinearLayout.LayoutParams(0, dp(60), 1f))
         searchPanel.addView(searchCard, matchWrap())
+        gemmaWarmupPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(7), dp(12), 0)
+            visibility = View.GONE
+        }
+        gemmaWarmupIndicator = ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(Color.rgb(65, 105, 225))
+            visibility = View.GONE
+        }
+        gemmaWarmupPanel.addView(
+            gemmaWarmupIndicator,
+            LinearLayout.LayoutParams(dp(18), dp(18)).apply {
+                rightMargin = dp(8)
+            },
+        )
+        gemmaWarmupStatus = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.rgb(91, 95, 110))
+        }
+        gemmaWarmupPanel.addView(gemmaWarmupStatus, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        searchPanel.addView(gemmaWarmupPanel, matchWrap())
 
         // Planning is a first-class, live search artifact. This panel sits
         // immediately below the query and is updated before retrieval starts,
@@ -535,22 +561,46 @@ class MainActivity : Activity() {
         preparationPanel.visibility = if (ready) View.GONE else View.VISIBLE
         facePromptPanel.visibility = if (waitingForFaceTags) View.VISIBLE else View.GONE
         searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
+        if (ready) {
+            val plannerReady = GemmaRuntime.isPlannerReady()
+            query.isEnabled = plannerReady
+            query.alpha = if (plannerReady) 1f else 0.62f
+            gemmaWarmupPanel.visibility = if (plannerReady) View.GONE else View.VISIBLE
+            gemmaWarmupIndicator.visibility = if (plannerReady) View.GONE else View.VISIBLE
+            gemmaWarmupStatus.text = if (plannerReady) {
+                "Gemma 4 E4B ready • local ${GemmaRuntime.backendPlacement()}"
+            } else {
+                "Warming Gemma 4 E4B • preparing private search…"
+            }
+            if (!plannerReady && gemmaWarmupStatus.animation == null) {
+                gemmaWarmupStatus.startAnimation(AlphaAnimation(0.45f, 1f).apply {
+                    duration = 900L
+                    repeatMode = android.view.animation.Animation.REVERSE
+                    repeatCount = android.view.animation.Animation.INFINITE
+                })
+            } else if (plannerReady) {
+                gemmaWarmupStatus.clearAnimation()
+            }
+        } else if (::gemmaWarmupStatus.isInitialized) {
+            query.isEnabled = false
+            gemmaWarmupPanel.visibility = View.GONE
+            gemmaWarmupIndicator.visibility = View.GONE
+            gemmaWarmupStatus.clearAnimation()
+        }
         if (ready && !searchReady) {
             searchReady = true
             SigLipTextEncoder.preloadAsync(this)
             NativeVectorIndex.preloadAsync(this)
         } else if (!ready) {
             searchReady = false
-            plannerPreloadStarted = false
         }
-        if (ready && !plannerPreloadStarted) {
+        if (ready && !GemmaRuntime.isPlannerReady()) {
             // Gemma occupies several GiB of mapped/native state on the target
             // device. Do not make it compete with the one-time OCR migration;
             // a user search can still load it on demand.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
             if (pendingOcr == 0) {
-                plannerPreloadStarted = true
                 GemmaRuntime.preloadPlannerAsync(
                     this,
                     QueryPlannerRuntime.plannerSystemInstruction(),
@@ -570,6 +620,14 @@ class MainActivity : Activity() {
     }
 
     private fun search() {
+        if (!::query.isInitialized || !query.isEnabled || !GemmaRuntime.isPlannerReady()) {
+            if (::gemmaWarmupStatus.isInitialized) {
+                gemmaWarmupPanel.visibility = View.VISIBLE
+                gemmaWarmupIndicator.visibility = View.VISIBLE
+                gemmaWarmupStatus.text = "Warming Gemma 4 E4B • almost ready…"
+            }
+            return
+        }
         val text = query.text?.toString().orEmpty().trim()
         if (text.isBlank()) return
         val now = System.currentTimeMillis()
@@ -665,6 +723,14 @@ class MainActivity : Activity() {
                     answer.text = "I found ${response.totalGalleryMatches} matching item${if (response.totalGalleryMatches == 1) "" else "s"}."
                 } else {
                     answer.text = "I found relevant personal context."
+                }
+                if (!response.needsAnswer) {
+                    response.plannerSession?.close()
+                    setModelLoading(false, "")
+                    followUpPanel.visibility = View.GONE
+                    followUpRow.removeAllViews()
+                    sourcePanel.visibility = View.GONE
+                    return@runOnUiThread
                 }
                 val contextCount = response.answerContext?.items?.size
                     ?: response.answerGallery.size.coerceAtMost(8)
@@ -784,9 +850,28 @@ class MainActivity : Activity() {
             "Answer generation" to timings.answerGenerationMs,
             "Follow-up query/actions" to timings.followUpMs,
         ).filter { (_, durationMs) -> durationMs > 0L }
-        val rows = phaseRows + listOf(
+        val rows = buildList {
+            phaseRows.forEach { (label, durationMs) ->
+                add(label to durationMs)
+                if (label == "Query planning") {
+                    timings.plannerProfile?.let { profile ->
+                        if (profile.prefillMs > 0L) add("  ↳ QP prefill (${profile.prefillTokens} tok)" to profile.prefillMs)
+                        if (profile.decodeMs > 0L) add("  ↳ QP token generation (${profile.decodeTokens} tok)" to profile.decodeMs)
+                        if (profile.timeToFirstTokenMs > 0L) add("  ↳ QP time to first token" to profile.timeToFirstTokenMs)
+                    }
+                }
+                if (label == "Answer generation") {
+                    timings.answerProfile?.let { profile ->
+                        if (profile.prefillMs > 0L) add("  ↳ AP prefill (${profile.prefillTokens} tok)" to profile.prefillMs)
+                        if (profile.decodeMs > 0L) add("  ↳ AP token generation (${profile.decodeTokens} tok)" to profile.decodeMs)
+                        if (profile.timeToFirstTokenMs > 0L) add("  ↳ AP time to first token" to profile.timeToFirstTokenMs)
+                    }
+                }
+            }
+            add(
             (if (phaseLabel == "Total") "Total" else "Total so far") to timings.totalMs,
-        )
+            )
+        }
         rows.forEachIndexed { index, (label, durationMs) ->
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -799,8 +884,10 @@ class MainActivity : Activity() {
             }
             row.addView(TextView(this).apply {
                 text = label
-                textSize = if (index == rows.lastIndex) 13f else 12f
-                setTextColor(if (index == rows.lastIndex) Color.rgb(35, 38, 49) else Color.rgb(91, 95, 110))
+                val indented = label.startsWith("  ↳")
+                textSize = if (index == rows.lastIndex) 13f else if (indented) 11f else 12f
+                setTextColor(if (index == rows.lastIndex) Color.rgb(35, 38, 49) else if (indented) Color.rgb(105, 109, 125) else Color.rgb(91, 95, 110))
+                if (indented) setPadding(dp(12), dp(2), 0, dp(2))
                 if (index == rows.lastIndex) setTypeface(typeface, Typeface.BOLD)
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             row.addView(TextView(this).apply {
@@ -811,6 +898,17 @@ class MainActivity : Activity() {
                 gravity = Gravity.END
             }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             timeStatsDetails.addView(row, matchWrap())
+        }
+        listOfNotNull(
+            timings.plannerProfile?.let { "QP placement: ${it.backendPlacement}" },
+            timings.answerProfile?.let { "Answer placement: ${it.backendPlacement}" },
+        ).forEach { placement ->
+            timeStatsDetails.addView(TextView(this).apply {
+                text = placement
+                textSize = 11f
+                setTextColor(Color.rgb(91, 95, 110))
+                setPadding(0, dp(3), 0, dp(3))
+            }, matchWrap())
         }
         timeStatsPanel.visibility = View.VISIBLE
         timeStatsDetails.visibility = if (wasExpanded) View.VISIBLE else View.GONE

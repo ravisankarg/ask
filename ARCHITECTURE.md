@@ -147,9 +147,10 @@ user query
 
 The Gemma-emitted category controls search eligibility, answer metadata fields,
 and whether bounded scenery inputs are attached. Planner and answer conversations share
-the resident Gemma engine, but not the planner turn:
-only the stable planner prefill is reused for query planning, which prevents
-planner syntax and routing language from leaking into the natural-language answer.
+the resident Gemma engine, but not each other's turns: the planner session is closed
+immediately after planning, while a separate answer system-prefix conversation may
+be warmed during retrieval. This prevents planner syntax and routing language from
+leaking into the natural-language answer.
 The frozen QP and language graph stay on CPU. Only Gemma's image
 encoder/adapter uses the LiteRT GPU backend, with a CPU-vision initialization
 fallback for unsupported devices; this keeps the individual visual inputs below the

@@ -791,6 +791,9 @@ Fixed runtime contract:
 - close the consumed planner session immediately after the planning turn,
   before SQLite/native retrieval, EXIF decode, board construction, or answer
   prompt assembly, so its KV memory cannot compete with later phases;
+- while retrieval and answer-context selection run, warm a separate clean
+  answer system-prefix session; never seed it with planner history or the
+  planner execution turn;
 - answer uses a clean conversation to prevent planner syntax leakage;
 - planner sampling is deliberately constrained (`topK=16`, `topP=0.90`,
   temperature `0.10`); answer sampling is low-variance but natural (`topK=40`,

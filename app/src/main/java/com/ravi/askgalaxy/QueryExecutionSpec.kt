@@ -35,6 +35,26 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
     }
 
+    /** Validates that every new planner result explicitly declares answer routing. */
+    fun requiredAnswerNeeded(): Boolean {
+        val answers = ArrayList<ExecutionNode.Predicate>(1)
+        fun collect(node: ExecutionNode) {
+            when (node) {
+                is ExecutionNode.Predicate -> if (node.field == ExecutionField.ANSWER_NEEDED) answers += node
+                is ExecutionNode.Sorted -> collect(node.value)
+                is ExecutionNode.Binary -> {
+                    collect(node.left)
+                    collect(node.right)
+                }
+            }
+        }
+        collect(root)
+        require(answers.size == 1) {
+            "Planner spec must contain exactly one answer_needed predicate"
+        }
+        return answers.single().value == "true"
+    }
+
     /**
      * Normalizes Gemma's routing predicate without planning any user intent.
      * All non-category predicates and operators remain model-authored.
@@ -42,9 +62,13 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
     fun canonicalizeCategoryEnvelope(): QueryExecutionSpec {
         requiredQueryCategory()
         lateinit var category: ExecutionNode.Predicate
+        lateinit var answerNeeded: ExecutionNode.Predicate
         fun withoutCategory(node: ExecutionNode): ExecutionNode? = when (node) {
             is ExecutionNode.Predicate -> if (node.field == ExecutionField.QUERY_CATEGORY) {
                 category = node
+                null
+            } else if (node.field == ExecutionField.ANSWER_NEEDED) {
+                answerNeeded = node
                 null
             } else {
                 node
@@ -68,9 +92,13 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
         return QueryExecutionSpec(
             ExecutionNode.Binary(
-                category,
+                answerNeeded,
                 ExecutionBinaryOperator.INTERSECT,
-                retrieval,
+                ExecutionNode.Binary(
+                    category,
+                    ExecutionBinaryOperator.INTERSECT,
+                    retrieval,
+                ),
             ),
         )
     }
@@ -101,6 +129,9 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
                             -> require(runCatching { LocalDate.parse(node.value) }.isSuccess) {
                                 "${node.field.wireName} must be an ISO yyyy-MM-dd date"
                             }
+                            ExecutionField.ANSWER_NEEDED -> require(
+                                node.value == "true" || node.value == "false",
+                            ) { "answer_needed must be true or false" }
                             ExecutionField.QUERY_CATEGORY -> require(
                                 QueryCategory.fromWireName(node.value) != null,
                             ) {
@@ -128,7 +159,9 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
 
 enum class ExecutionField(val wireName: String) {
     QUERY_CATEGORY("query_category"),
+    ANSWER_NEEDED("answer_needed"),
     PERSON("person"),
+    PEOPLE_ONLY("people_only"),
     MIME_TYPE("mime type"),
     FROM_DATE("from_date"),
     TO_DATE("to_date"),
@@ -142,7 +175,9 @@ enum class ExecutionField(val wireName: String) {
             value.lowercase().replace(Regex("\\s+"), " ").trim()
         ) {
             "query_category" -> QUERY_CATEGORY
+            "answer_needed" -> ANSWER_NEEDED
             "person" -> PERSON
+            "people_only" -> PEOPLE_ONLY
             "mime type" -> MIME_TYPE
             "from_date" -> FROM_DATE
             "to_date" -> TO_DATE
@@ -501,6 +536,7 @@ private class ExecutionSpecParser(value: String) {
  */
 object ExecutionSpecCompiler {
     fun compile(spec: QueryExecutionSpec): QueryPlan {
+        val requiredAnswerNeeded = spec.requiredAnswerNeeded()
         val canonicalSpec = spec.canonicalizeCategoryEnvelope()
         val queryCategory = canonicalSpec.requiredQueryCategory()
         val semantic = ArrayList<String>()
@@ -509,6 +545,7 @@ object ExecutionSpecCompiler {
         val negativeOcr = ArrayList<String>()
         val people = ArrayList<String>()
         val excludedPeople = ArrayList<String>()
+        val onlyPeople = ArrayList<String>()
         var mediaType: QueryMediaType? = null
         var fromDate = ""
         var toDate = ""
@@ -519,9 +556,17 @@ object ExecutionSpecCompiler {
         fun visit(node: ExecutionNode, subtract: Boolean = false) {
             when (node) {
                 is ExecutionNode.Predicate -> when (node.field) {
+                    ExecutionField.ANSWER_NEEDED -> if (!subtract) {
+                        require(node.value.equals(requiredAnswerNeeded.toString(), ignoreCase = true)) {
+                            "answer_needed must be a single consistent predicate"
+                        }
+                    }
                     ExecutionField.QUERY_CATEGORY -> Unit
                     ExecutionField.PERSON ->
                         if (subtract) excludedPeople += node.value else people += node.value
+                    ExecutionField.PEOPLE_ONLY -> if (!subtract) {
+                        onlyPeople += node.value.split(',').map(String::trim).filter(String::isNotBlank)
+                    }
                     ExecutionField.MIME_TYPE -> if (!subtract) {
                         mediaType = requireNotNull(QueryMediaType.fromToken(node.value)) {
                             "Invalid canonical MIME value '${node.value}'"
@@ -569,6 +614,7 @@ object ExecutionSpecCompiler {
                 emptyList()
             },
             personNames = people.distinctBy { it.lowercase() },
+            onlyPersonNames = onlyPeople.distinctBy { it.lowercase() },
             ocrTerms = if (answerScope.needsOcr) cleanOcr else emptyList(),
             excludedPersonNames = excludedPeople.distinctBy { it.lowercase() },
             excludedOcrTerms = if (answerScope.needsOcr) {
@@ -585,6 +631,8 @@ object ExecutionSpecCompiler {
             mediaType = mediaType,
             queryCategory = queryCategory,
             needsPersonalContext = answerScope.needsPersonalContext,
+            needsAnswer = requiredAnswerNeeded,
+            answerIntentExplicit = true,
             answerEvidenceScope = answerScope,
             executionSpec = canonicalSpec,
         )

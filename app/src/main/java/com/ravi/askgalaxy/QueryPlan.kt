@@ -250,6 +250,7 @@ data class QueryPlan(
     val metadataQueries: List<String>,
     val personNames: List<String>,
     val ocrTerms: List<String>,
+    val onlyPersonNames: List<String> = emptyList(),
     val excludedPersonNames: List<String> = emptyList(),
     val excludedOcrTerms: List<String> = emptyList(),
     val negativeSemanticQueries: List<String> = emptyList(),
@@ -261,6 +262,8 @@ data class QueryPlan(
     val recentFirst: Boolean = false,
     val sortByLocation: Boolean = false,
     val needsPersonalContext: Boolean = false,
+    val needsAnswer: Boolean = true,
+    val answerIntentExplicit: Boolean = false,
     val mediaType: QueryMediaType? = null,
     val queryCategory: QueryCategory = QueryCategory.SCENARY,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
@@ -320,6 +323,10 @@ data class QueryPlan(
 
     fun canonicalExecutionSpec(): QueryExecutionSpec? {
         executionSpec?.let { return it }
+        val answerPredicate = ExecutionNode.Predicate(
+            ExecutionField.ANSWER_NEEDED,
+            needsAnswer.toString(),
+        )
         val categoryPredicate = ExecutionNode.Predicate(
             ExecutionField.QUERY_CATEGORY,
             queryCategory.wireName,
@@ -339,6 +346,9 @@ data class QueryPlan(
             }
             locationHint.takeIf(String::isNotBlank)?.let {
                 add(ExecutionNode.Predicate(ExecutionField.LOCATION, it))
+            }
+            onlyPersonNames.filter(String::isNotBlank).takeIf { it.isNotEmpty() }?.let {
+                add(ExecutionNode.Predicate(ExecutionField.PEOPLE_ONLY, it.joinToString(",")))
             }
         }
         val retrievalPredicates: List<ExecutionNode> = semanticQueries
@@ -390,9 +400,13 @@ data class QueryPlan(
         }
         if (root != null) {
             root = ExecutionNode.Binary(
-                categoryPredicate,
+                answerPredicate,
                 ExecutionBinaryOperator.INTERSECT,
-                root,
+                ExecutionNode.Binary(
+                    categoryPredicate,
+                    ExecutionBinaryOperator.INTERSECT,
+                    root,
+                ),
             )
         }
         if (recentFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.DATE)

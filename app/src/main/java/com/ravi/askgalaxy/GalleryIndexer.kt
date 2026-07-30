@@ -44,6 +44,8 @@ class GalleryIndexer(context: Context) {
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val previewExecutor: ExecutorService = Executors.newFixedThreadPool(2)
     private val answerExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    @Volatile
+    private var lastAnswerProfile: GemmaRuntime.GenerationProfile? = null
 
     fun scanAsync(onFinished: (Result<Long>) -> Unit) {
         executor.execute {
@@ -81,11 +83,11 @@ class GalleryIndexer(context: Context) {
                         ),
                     )
                     var planningFinished = planningStarted
-                    val searchExecution = searchBlocking(query) { plannerJson, effectivePlanJson ->
+                    val searchExecution = searchBlocking(query) { plannerJson, effectivePlanJson, plannerProfile ->
                         planningFinished = System.nanoTime()
                         timings = timings.copy(
                             queryPlanningMs = elapsedMs(planningStarted, planningFinished),
-                        )
+                        ).withPlannerProfile(plannerProfile)
                         onProgress(
                             SearchProgress(
                                 stage = SearchStage.QUERY_PLANNED,
@@ -221,6 +223,7 @@ class GalleryIndexer(context: Context) {
                         plannerJson = searchExecution.plannerJson,
                         effectivePlanJson = searchExecution.effectivePlanJson,
                         queryCategory = searchExecution.queryCategory,
+                        needsAnswer = searchExecution.needsAnswer,
                         answerEvidenceScope = searchExecution.answerEvidenceScope,
                         timings = timings,
                     )
@@ -326,6 +329,21 @@ class GalleryIndexer(context: Context) {
         onFinished: (Result<AnswerResult>) -> Unit,
     ) {
         answerExecutor.execute {
+            if (!response.needsAnswer) {
+                response.plannerSession?.close()
+                onFinished(
+                    Result.success(
+                        AnswerResult(
+                            text = "",
+                            sources = emptyList(),
+                            plannerJson = response.plannerJson,
+                            effectivePlanJson = response.effectivePlanJson,
+                            timings = response.timings,
+                        ),
+                    ),
+                )
+                return@execute
+            }
             val plannerSession = response.plannerSession
             // The answer path deliberately uses a clean conversation; the
             // planner KV is no longer useful after retrieval. Release it
@@ -418,6 +436,7 @@ class GalleryIndexer(context: Context) {
                     "No readable result evidence for Gemma"
                 }
                 val gemma = GemmaRuntime.shared(appContext)
+                lastAnswerProfile = null
                 val answerStarted = System.nanoTime()
                 val output = try {
                     val answerPrompt = buildAnswerPrompt(
@@ -491,7 +510,9 @@ class GalleryIndexer(context: Context) {
                     text = parsed.text,
                     sources = buildAnswerSources(attachedResults, response.personalContext),
                     followUps = followUps,
-                    timings = response.timings.withAnswerTimings(answerGenerationMs, followUpMs),
+                    timings = response.timings
+                        .withAnswerTimings(answerGenerationMs, followUpMs)
+                        .withAnswerProfile(lastAnswerProfile),
                     plannerJson = response.plannerJson,
                     effectivePlanJson = response.effectivePlanJson,
                 )
@@ -522,7 +543,11 @@ class GalleryIndexer(context: Context) {
 
     private fun searchBlocking(
         query: String,
-        onQueryPlanned: (plannerJson: String, effectivePlanJson: String) -> Unit = { _, _ -> },
+        onQueryPlanned: (
+            plannerJson: String,
+            effectivePlanJson: String,
+            plannerProfile: GemmaRuntime.GenerationProfile?,
+        ) -> Unit = { _, _, _ -> },
     ): SearchExecution {
         val plannedQuery = QueryPlannerRuntime.planWithSession(
             appContext,
@@ -534,6 +559,10 @@ class GalleryIndexer(context: Context) {
         // a clean conversation, so holding this session through SQLite,
         // native retrieval, and diversity only increases memory pressure.
         plannedQuery.session?.close()
+        // Warm only the clean answer system prefix while retrieval and context
+        // selection run. The planner turn is already closed and can never enter
+        // the answer conversation.
+        GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
         var plan = plannedQuery.plan
         // Gemma is the sole source of person predicates. The database only
         // resolves those already-validated planner values to real local face
@@ -585,19 +614,29 @@ class GalleryIndexer(context: Context) {
             )
             val executionSpec = effectivePlan.canonicalExecutionSpec()
             if (executionSpec == null) {
-                onQueryPlanned(plannedQuery.plannerJson, "(empty)")
+                onQueryPlanned(
+                    plannedQuery.plannerJson,
+                    "(empty)",
+                    plannedQuery.generationProfile,
+                )
                 return SearchExecution(
                     candidates = emptyList(),
                     plannerSession = null,
                     plannerJson = plannedQuery.plannerJson,
                     effectivePlanJson = "(empty)",
                     queryCategory = effectivePlan.queryCategory,
+                    needsAnswer = effectivePlan.needsAnswer,
+                    plannerProfile = plannedQuery.generationProfile,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
                     ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
-            onQueryPlanned(plannedQuery.plannerJson, renderedExecutionSpec)
+            onQueryPlanned(
+                plannedQuery.plannerJson,
+                renderedExecutionSpec,
+                plannedQuery.generationProfile,
+            )
             Log.i(TAG, "Executing QP spec: ${renderedExecutionSpec.take(600)}")
             val candidates = structuredSearchExecutor.execute(executionSpec)
             return SearchExecution(
@@ -606,6 +645,8 @@ class GalleryIndexer(context: Context) {
                 plannerJson = plannedQuery.plannerJson,
                 effectivePlanJson = renderedExecutionSpec,
                 queryCategory = effectivePlan.queryCategory,
+                needsAnswer = effectivePlan.needsAnswer,
+                plannerProfile = plannedQuery.generationProfile,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
                 ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
             )
@@ -800,10 +841,18 @@ class GalleryIndexer(context: Context) {
         gemma: GemmaRuntime,
         prompt: String,
         images: List<ByteArray>,
+        usePrefilledAnswer: Boolean = true,
     ): String {
-        val session = gemma.createAnswerConversation(ANSWER_SYSTEM_INSTRUCTION)
+        val session = if (usePrefilledAnswer) {
+            GemmaRuntime.takePrefilledAnswerSession(allowTextOnlyRawSession = images.isEmpty())
+                ?: gemma.createAnswerConversation(ANSWER_SYSTEM_INSTRUCTION)
+        } else {
+            gemma.createAnswerConversation(ANSWER_SYSTEM_INSTRUCTION)
+        }
         return try {
-            session.generate(prompt, images)
+            val output = session.generate(prompt, images)
+            lastAnswerProfile = session.lastGenerationProfile
+            output
         } finally {
             session.close()
         }
@@ -823,6 +872,7 @@ class GalleryIndexer(context: Context) {
                 gemma,
                 "$prompt\nIMPORTANT: Return only the natural-language answer and QUERY follow-up lines. Do not repeat task text, JSON, routing keys, code, or a query plan.",
                 images,
+                usePrefilledAnswer = false,
             )
         }
         return if (looksLikePlannerOutput(generated)) {
@@ -1269,6 +1319,8 @@ class GalleryIndexer(context: Context) {
         val plannerJson: String,
         val effectivePlanJson: String,
         val queryCategory: QueryCategory,
+        val needsAnswer: Boolean,
+        val plannerProfile: GemmaRuntime.GenerationProfile?,
         val answerEvidenceScope: AnswerEvidenceScope,
         val ocrKeywords: List<String>,
     )

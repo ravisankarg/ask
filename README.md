@@ -155,8 +155,9 @@ stay text-only. Only `scenary` uses persisted SigLIP diversity and may attach
 up to four images downscaled to a 512 px longest edge. Episode coverage and
 relevance minimize duplicate context.
 Gemma 4 stays resident, but planner and answer use
-clean conversations: only the stable planner prefill is reused, never the
-planner's execution turn. If the user opts in under
+clean conversations: the planner session is closed immediately after planning,
+and a separate answer system-prefix prefill may be warmed during retrieval;
+neither role ever reuses the other's execution turn. If the user opts in under
 Settings and grants Android notification access, relevant future travel, receipt,
 delivery, and appointment alerts are searched separately only when the planner asks
 for personal context. OTP/PIN/password and bank-security alerts are skipped, no

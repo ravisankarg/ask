@@ -1101,6 +1101,32 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         return ids
     }
 
+    /** Returns media whose detected faces are exactly the requested named people. */
+    fun mediaStoreIdsForOnlyPersonLabels(labels: List<String>): Set<Long> {
+        val normalizedLabels = labels.map(::normalizePersonText)
+            .filter(String::isNotBlank)
+            .distinct()
+        if (normalizedLabels.isEmpty()) return emptySet()
+        val placeholders = normalizedLabels.joinToString(",") { "?" }
+        val args = normalizedLabels.toTypedArray()
+        val ids = LinkedHashSet<Long>()
+        readableDatabase.rawQuery(
+            "SELECT DISTINCT f.media_store_id FROM $TABLE_FACE_EMBEDDINGS f " +
+                "WHERE EXISTS (SELECT 1 FROM $TABLE_FACE_EMBEDDINGS wanted " +
+                "JOIN $TABLE_FACE_CLUSTERS wc ON wc.cluster_id = wanted.cluster_id " +
+                "WHERE wanted.media_store_id = f.media_store_id " +
+                "AND LOWER(TRIM(wc.label)) IN ($placeholders)) " +
+                "AND NOT EXISTS (SELECT 1 FROM $TABLE_FACE_EMBEDDINGS other " +
+                "LEFT JOIN $TABLE_FACE_CLUSTERS oc ON oc.cluster_id = other.cluster_id " +
+                "WHERE other.media_store_id = f.media_store_id " +
+                "AND (oc.label IS NULL OR LOWER(TRIM(oc.label)) NOT IN ($placeholders)))",
+            args + args,
+        ).use { cursor ->
+            while (cursor.moveToNext()) ids += cursor.getLong(0)
+        }
+        return ids
+    }
+
     private fun namedPersonLabels(): List<String> {
         val labels = LinkedHashSet<String>()
         readableDatabase.query(

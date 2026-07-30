@@ -44,6 +44,7 @@ data class SearchResponse(
     val plannerJson: String = "",
     val effectivePlanJson: String = "",
     val queryCategory: QueryCategory = QueryCategory.SCENARY,
+    val needsAnswer: Boolean = true,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
     val timings: PhaseTimings = PhaseTimings(),
 )
@@ -56,11 +57,19 @@ data class PhaseTimings(
     val evidenceCurationMs: Long = 0L,
     val answerGenerationMs: Long = 0L,
     val followUpMs: Long = 0L,
+    val plannerProfile: GemmaRuntime.GenerationProfile? = null,
+    val answerProfile: GemmaRuntime.GenerationProfile? = null,
 ) {
     fun withAnswerTimings(answerMs: Long, followUpPhaseMs: Long): PhaseTimings = copy(
         answerGenerationMs = answerMs,
         followUpMs = followUpPhaseMs,
     )
+
+    fun withPlannerProfile(profile: GemmaRuntime.GenerationProfile?): PhaseTimings =
+        if (profile == null) this else copy(plannerProfile = profile)
+
+    fun withAnswerProfile(profile: GemmaRuntime.GenerationProfile?): PhaseTimings =
+        if (profile == null) this else copy(answerProfile = profile)
 
     val totalMs: Long
         get() = queryPlanningMs + searchMs + diverseRerankingMs + evidenceCurationMs + answerGenerationMs + followUpMs

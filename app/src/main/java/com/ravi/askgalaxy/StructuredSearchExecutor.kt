@@ -200,9 +200,14 @@ class StructuredSearchExecutor(
     ): EvaluatedSet =
         when (predicate.field) {
             ExecutionField.QUERY_CATEGORY -> hardSet(categoryAllowlist)
+            ExecutionField.ANSWER_NEEDED -> hardSet(categoryAllowlist)
             ExecutionField.PERSON -> {
                 val labels = database.resolveNamedPersonLabels(listOf(predicate.value))
                 hardSet(database.mediaStoreIdsForPersonLabels(labels))
+            }
+            ExecutionField.PEOPLE_ONLY -> {
+                val labels = database.resolveNamedPersonLabels(predicate.value.split(','))
+                hardSet(database.mediaStoreIdsForOnlyPersonLabels(labels))
             }
             ExecutionField.MIME_TYPE -> {
                 val type = requireNotNull(QueryMediaType.fromToken(predicate.value)) {

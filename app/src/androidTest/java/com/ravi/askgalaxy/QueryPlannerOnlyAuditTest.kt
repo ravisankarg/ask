@@ -54,6 +54,7 @@ class QueryPlannerOnlyAuditTest {
                     context = context,
                     query = case.query,
                     knownPersonLabels = KNOWN_PEOPLE,
+                    selfPersonLabel = SELF_PERSON,
                 )
                 planned.session?.close()
 
@@ -67,8 +68,16 @@ class QueryPlannerOnlyAuditTest {
                     "expected category ${case.expectedCategory.wireName}, got " +
                         parsed.requiredQueryCategory().wireName
                 }
+                check(parsed.requiredAnswerNeeded() == case.expectedAnswerNeeded) {
+                    "expected answer_needed=${case.expectedAnswerNeeded}"
+                }
                 val compiled = ExecutionSpecCompiler.compile(parsed)
-                QueryPlannerRuntime.validateCompiledPlan(case.query, KNOWN_PEOPLE, compiled)
+                QueryPlannerRuntime.validateCompiledPlan(
+                    case.query,
+                    KNOWN_PEOPLE,
+                    compiled,
+                    SELF_PERSON,
+                )
                 check(compiled.executionSpecString() == planned.plannerJson) {
                     "compiled canonical expression changed"
                 }
@@ -207,6 +216,20 @@ class QueryPlannerOnlyAuditTest {
         if (forbidsLocationSort) {
             check(!plan.sortByLocation) { "query gained unrequested SORT_LOC" }
         }
+        check(plan.answerIntentExplicit) { "missing explicit answer_needed predicate" }
+        check(plan.needsAnswer == expectedAnswerNeeded) {
+            "expected answer_needed=$expectedAnswerNeeded, got ${plan.needsAnswer}"
+        }
+        if (expectedOnlyPeople.isNotEmpty()) {
+            check(plan.onlyPersonNames.map(String::lowercase).toSet() ==
+                expectedOnlyPeople.map(String::lowercase).toSet()) {
+                "expected people_only=$expectedOnlyPeople, got ${plan.onlyPersonNames}"
+            }
+        } else {
+            check(plan.onlyPersonNames.isEmpty()) {
+                "unexpected people_only=${plan.onlyPersonNames}"
+            }
+        }
     }
 
     private data class AuditCase(
@@ -223,6 +246,8 @@ class QueryPlannerOnlyAuditTest {
         val requiredPeople: Set<String> = emptySet(),
         val excludedPeople: Set<String> = emptySet(),
         val expectedLocation: String? = null,
+        val expectedAnswerNeeded: Boolean = expectedCategory != QueryCategory.SCENARY,
+        val expectedOnlyPeople: Set<String> = emptySet(),
         val requiresSemantic: Boolean = true,
         val forbidsSemantic: Boolean = false,
         val requiresNegativeSemantic: Boolean = false,
@@ -270,8 +295,9 @@ class QueryPlannerOnlyAuditTest {
     }
 
     private companion object {
-        const val TAG = "QP_ONLY_50"
+        const val TAG = "QP_ONLY_57"
         val KNOWN_PEOPLE = listOf("Ravi", "Meghana", "Ramani")
+        const val SELF_PERSON = "Ravi"
 
         val CASES = listOf(
             AuditCase(
@@ -323,6 +349,10 @@ class QueryPlannerOnlyAuditTest {
                 expectedToDate = "2025-08-31",
                 requiresDateSort = true,
             ),
+            AuditCase(
+                "D11", QueryCategory.DOC, "simple", "clear",
+                "Ravi passport number",
+            ),
 
             AuditCase(
                 "S01", QueryCategory.SCENARY, "simple", "typo",
@@ -368,12 +398,39 @@ class QueryPlannerOnlyAuditTest {
                 "S09", QueryCategory.SCENARY, "complex", "moderate",
                 "What did I eat on my trip to Barcelona?",
                 expectedLocation = "Barcelona",
+                expectedAnswerNeeded = true,
             ),
             AuditCase(
                 "S10", QueryCategory.SCENARY, "complex", "ambiguous",
                 "Show the clearest photo from every national park I visited, excluding selfies.",
                 expectedMedia = QueryMediaType.PHOTOS,
                 requiresNegativeSemantic = true,
+            ),
+            AuditCase(
+                "S11", QueryCategory.SCENARY, "simple", "clear",
+                "me alone",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi"),
+                expectedOnlyPeople = setOf("Ravi"),
+                requiresSemantic = false,
+                expectedAnswerNeeded = false,
+            ),
+            AuditCase(
+                "S12", QueryCategory.SCENARY, "medium", "clear",
+                "me with Ramani only",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi", "Ramani"),
+                expectedOnlyPeople = setOf("Ravi", "Ramani"),
+                requiresSemantic = false,
+                expectedAnswerNeeded = false,
+            ),
+            AuditCase(
+                "S13", QueryCategory.SCENARY, "medium", "clear",
+                "Ravi and Ramani alone at the beach",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi", "Ramani"),
+                expectedOnlyPeople = setOf("Ravi", "Ramani"),
+                expectedAnswerNeeded = false,
             ),
 
             AuditCase(
@@ -433,6 +490,12 @@ class QueryPlannerOnlyAuditTest {
                     "excluding restaurant screenshots?",
                 requiredPeople = setOf("Ravi"),
                 requiresNegativeSemantic = true,
+            ),
+            AuditCase(
+                "P11", QueryCategory.PERSON, "medium", "clear",
+                "Who is with me in beach sunset photos?",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi"),
             ),
 
             AuditCase(
@@ -498,6 +561,18 @@ class QueryPlannerOnlyAuditTest {
                 forbidsSemantic = true,
                 requiresNegativeSemantic = true,
                 requiresLocationSort = true,
+            ),
+            AuditCase(
+                "L11", QueryCategory.LOCATION, "medium", "clear",
+                "Where I took beach sunset photos",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi"),
+            ),
+            AuditCase(
+                "L12", QueryCategory.LOCATION, "complex", "clear",
+                "Where did I take beach sunset photos with Ramani?",
+                expectedMedia = QueryMediaType.PHOTOS,
+                requiredPeople = setOf("Ravi", "Ramani"),
             ),
 
             AuditCase(
