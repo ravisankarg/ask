@@ -37,14 +37,16 @@ data class AnswerContextBundle(
 object QueryCategoryContextPolicy {
     const val SCENARY_ANSWER_IMAGE_LIMIT = 4
     const val SCENARY_ANSWER_IMAGE_MAX_DIMENSION = 512
+    const val ANSWER_IMAGE_MAX_DIMENSION = SCENARY_ANSWER_IMAGE_MAX_DIMENSION
 
-    fun answerImageLimit(category: QueryCategory): Int = when (category) {
-        QueryCategory.SCENARY -> SCENARY_ANSWER_IMAGE_LIMIT
-        QueryCategory.DOC,
-        QueryCategory.PERSON,
-        QueryCategory.LOCATION,
-        QueryCategory.TIME,
-        -> 0
+    fun answerImageLimit(
+        category: QueryCategory,
+        modelVariant: GemmaModelVariant? = null,
+    ): Int = when {
+        category == QueryCategory.DOC && modelVariant == GemmaModelVariant.E2B ->
+            SCENARY_ANSWER_IMAGE_LIMIT
+        category == QueryCategory.SCENARY -> SCENARY_ANSWER_IMAGE_LIMIT
+        else -> 0
     }
 
     fun includesVisuals(category: QueryCategory): Boolean =
@@ -65,7 +67,7 @@ object QueryCategoryContextPolicy {
 }
 
 /**
- * Query-aware top-8 record policy.
+ * Query-aware top-4 record policy.
  *
  * Selection runs in two passes:
  * 1. reserve a bounded coverage budget for requested people/place/OCR/time and
@@ -119,21 +121,47 @@ class AnswerContextPicker(
                 .map(String::lowercase)
                 .distinct()
                 .take(OcrKeywordPolicy.MAX_KEYWORDS)
-            val candidates = eligibleCandidates.sortedWith(
+            // The executor has already produced the document hybrid order:
+            // complete OCR conjunction first, then the fused SigLIP/OCR score.
+            // Do not throw that signal away by globally counting query words in
+            // every OCR field. A ticket or insurance form can mention a
+            // document in a classifier/localisation line and otherwise outrank
+            // the actual scan. Mine only this bounded hybrid window, then use
+            // local OCR co-occurrence for the compact Gemma evidence.
+            val hybridWindow = eligibleCandidates.take(DOCUMENT_HYBRID_WINDOW)
+            // The public result grid may retain semantic-only neighbours so a
+            // user can browse them. They are not answer evidence. A document
+            // image enters the private top-four only when it contains every
+            // OCR keyword emitted by the query plan. Four is a ceiling, not a
+            // quota: never diversity-fill a missing OCR match with a visually
+            // similar ticket, receipt, or unrelated scan.
+            val strictOcrMatches = hybridWindow.filter { media ->
+                OcrKeywordPolicy.matchesAll(media.ocrText, normalizedKeywords)
+            }
+            val relevanceOrdered = strictOcrMatches.sortedWith(
                 compareByDescending<GalleryMedia> {
-                    OcrKeywordPolicy.matchesAll(it.ocrText, normalizedKeywords)
-                }.thenByDescending {
-                    textEvidenceScore(queryText, it)
+                    documentLineEvidenceScore(queryText, normalizedKeywords, it)
                 }.thenBy {
                     originalRank[it.mediaStoreId] ?: Int.MAX_VALUE
                 },
             )
+            // Diversity may now suppress duplicate scans, but it can operate
+            // only on strict OCR matches. A distinct renewal/reissue can take
+            // a slot; an unrelated semantic neighbour cannot.
+            val candidates = if (relevanceOrdered.size > safeMax) {
+                selectDiverse(relevanceOrdered, safeMax)
+            } else {
+                relevanceOrdered
+            }
             val chosen = candidates.take(safeMax).map { media ->
                 val coverage = linkedSetOf(
                     AnswerCoverageFacet.CATEGORY_MATCH,
                     AnswerCoverageFacet.RELEVANCE,
                     AnswerCoverageFacet.OCR,
                 )
+                if (relevanceOrdered.indexOfFirst { it.mediaStoreId == media.mediaStoreId } > 0) {
+                    coverage += AnswerCoverageFacet.VISUAL_DIVERSITY
+                }
                 AnswerContextItem(media, coverage)
             }
             val metadataFields = buildSet {
@@ -155,7 +183,7 @@ class AnswerContextPicker(
                 queryCategory = queryCategory,
                 includeVisuals = false,
                 inputCandidateCount = inputCandidates.size,
-                eligibleCandidateCount = candidates.size,
+                eligibleCandidateCount = strictOcrMatches.size,
             )
         }
         val candidates = if (includeVisuals) {
@@ -431,6 +459,65 @@ class AnswerContextPicker(
         return score
     }
 
+    /**
+     * Scores a document only when requested words occur together in a short
+     * OCR neighbourhood. It is field-agnostic, so it works for identity,
+     * policy, invoice, certificate, and application fields without a
+     * passport-specific rule.
+     */
+    private fun documentLineEvidenceScore(
+        queryText: String,
+        ocrKeywords: List<String>,
+        media: GalleryMedia,
+    ): Int {
+        val queryTerms = (queryText
+            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .map(::documentTerm)
+            .filter { it.length >= 3 && it !in TEXT_STOP_WORDS } +
+            ocrKeywords.map(::documentTerm))
+            .filter { it.length >= 3 && it !in TEXT_STOP_WORDS }
+            .distinct()
+        if (queryTerms.isEmpty()) return 0
+
+        val lines = media.ocrText.lineSequence()
+            .map { it.lowercase(Locale.ROOT) }
+            .filter(String::isNotBlank)
+            .toList()
+        if (lines.isEmpty()) return 0
+
+        var best = 0
+        lines.indices.forEach { index ->
+            val window = lines.subList(
+                (index - DOCUMENT_OCR_NEIGHBOUR_LINES).coerceAtLeast(0),
+                (index + DOCUMENT_OCR_NEIGHBOUR_LINES + 1).coerceAtMost(lines.size),
+            ).joinToString(" ")
+            val normalizedWindow = documentTerm(window)
+            val matchedTerms = queryTerms.count { term -> containsDocumentTerm(normalizedWindow, term) }
+            if (matchedTerms == 0) return@forEach
+
+            val sameLineMatches = queryTerms.count { term ->
+                containsDocumentTerm(documentTerm(lines[index]), term)
+            }
+            var score = matchedTerms * DOCUMENT_WINDOW_TERM_WEIGHT +
+                sameLineMatches * DOCUMENT_SAME_LINE_WEIGHT
+            if ("localization" in normalizedWindow || "classification" in normalizedWindow) {
+                score -= DOCUMENT_CLASSIFIER_PENALTY
+            }
+            best = maxOf(best, score)
+        }
+        return best
+    }
+
+    private fun documentTerm(value: String): String = value
+        .lowercase(Locale.ROOT)
+        .replace(Regex("(?<![\\p{L}\\p{N}])no\\.?(?![\\p{L}\\p{N}])"), "number")
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .trim()
+
+    private fun containsDocumentTerm(text: String, term: String): Boolean =
+        Regex("(?<![\\p{L}\\p{N}])${Regex.escape(term)}(?![\\p{L}\\p{N}])")
+            .containsMatchIn(text)
+
     private fun locationKey(media: GalleryMedia): String =
         (media.locationName ?: media.location).orEmpty()
             .lowercase(Locale.ROOT)
@@ -467,6 +554,13 @@ class AnswerContextPicker(
 
     private companion object {
         const val MAX_RECORDS = 8
+        // Mine the top-eight hybrid-ranked records, while the caller retains
+        // its four-record prompt budget for answer latency.
+        const val DOCUMENT_HYBRID_WINDOW = 8
+        const val DOCUMENT_OCR_NEIGHBOUR_LINES = 2
+        const val DOCUMENT_WINDOW_TERM_WEIGHT = 10
+        const val DOCUMENT_SAME_LINE_WEIGHT = 5
+        const val DOCUMENT_CLASSIFIER_PENALTY = 12
         const val SECOND_ANCHOR_RELEVANCE_WINDOW = 8
         const val EPISODE_COVERAGE_LIMIT = 4
         const val PERSON_COVERAGE_LIMIT = 3

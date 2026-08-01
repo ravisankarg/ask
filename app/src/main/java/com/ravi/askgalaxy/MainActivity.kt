@@ -13,7 +13,6 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.LruCache
-import android.view.animation.AlphaAnimation
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -27,6 +26,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.graphics.drawable.GradientDrawable
 
@@ -35,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var preparationStatus: TextView
     private lateinit var preparationProgress: ProgressBar
     private lateinit var searchPanel: LinearLayout
+    private lateinit var conversationScroll: ScrollView
     private lateinit var facePromptPanel: LinearLayout
     private lateinit var facePromptStatus: TextView
     private lateinit var facePromptPreview: LinearLayout
@@ -44,6 +45,7 @@ class MainActivity : Activity() {
     private lateinit var gemmaWarmupIndicator: ProgressBar
     private lateinit var resultPanel: LinearLayout
     private lateinit var answer: TextView
+    private lateinit var conversationPanel: LinearLayout
     private lateinit var followUpPanel: LinearLayout
     private lateinit var followUpRow: LinearLayout
     private lateinit var sourcePanel: LinearLayout
@@ -63,15 +65,22 @@ class MainActivity : Activity() {
     private var expandedSourceId: String? = null
     private var facePromptRequested = false
     private var searchReady = false
+    /** Launch warmup is one-shot; later planner warmups follow answer completion. */
+    private var launchPlannerWarmupRequested = false
     private var resultAdapter: SearchResultAdapter? = null
     private var lastSubmittedQuery = ""
     private var lastSubmittedAtMs = 0L
+    /** The visible result set is reused by follow-up chips; no new QP/search. */
+    private var activeSearchResponse: SearchResponse? = null
+    private var followUpInFlight = false
+    private var deferredFreshQuery: String? = null
     private var timeStatsSummary = "Timing…"
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
         override fun run() {
-            refreshPreparation()
-            handler.postDelayed(this, 1_000L)
+            // Poll only while WorkManager is preparing the gallery/model.
+            // Gemma readiness itself is delivered as a one-shot callback.
+            if (refreshPreparation()) handler.postDelayed(this, 1_000L)
         }
     }
 
@@ -80,6 +89,20 @@ class MainActivity : Activity() {
         PreparationNotifier.createChannel(this)
         galleryIndexer = GalleryIndexer(this)
         setContentView(createContent())
+        GemmaRuntime.setPlannerWarmupStateListener {
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    refreshPreparation()
+                    val deferredQuery = deferredFreshQuery
+                    if (GemmaRuntime.isPlannerReady() && !deferredQuery.isNullOrBlank()) {
+                        deferredFreshQuery = null
+                        query.setText(deferredQuery)
+                        query.setSelection(query.text.length)
+                        query.post { search() }
+                    }
+                }
+            }
+        }
         if (!hasGalleryPermission()) {
             requestPermissions(galleryPermissions(), GALLERY_PERMISSION_REQUEST)
         } else if (!requestPhotoLocationPermissionIfNeeded()) {
@@ -134,6 +157,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        GemmaRuntime.setPlannerWarmupStateListener(null)
         if (::resultGrid.isInitialized) {
             resultGrid.adapter = null
             resultAdapter?.dispose()
@@ -161,11 +185,19 @@ class MainActivity : Activity() {
     }
 
     private fun createContent(): View {
+        conversationScroll = ScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+        }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(30), dp(24), dp(30))
-            setBackgroundColor(Color.WHITE)
+            setBackgroundColor(Color.rgb(247, 247, 249))
         }
+        conversationScroll.addView(root, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
 
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -199,11 +231,18 @@ class MainActivity : Activity() {
             leftMargin = dp(9)
         })
         header.addView(titleGroup, LinearLayout.LayoutParams(0, dp(56), 1f))
-        header.addView(ImageButton(this).apply {
-            setImageResource(android.R.drawable.ic_menu_manage)
+        header.addView(TextView(this).apply {
+            text = "⋯"
+            textSize = 28f
+            gravity = Gravity.CENTER
             setContentDescription("Settings")
-            setColorFilter(Color.rgb(50, 53, 62))
-            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(Color.rgb(28, 28, 30))
+            background = roundedBackground(
+                Color.WHITE,
+                dp(18).toFloat(),
+                Color.rgb(229, 229, 234),
+            )
+            elevation = dp(1).toFloat()
             setOnClickListener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
             }
@@ -287,12 +326,17 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(18), 0, dp(12), 0)
-            background = roundedBackground(Color.rgb(245, 246, 249), dp(24).toFloat())
+            background = roundedBackground(
+                Color.WHITE,
+                dp(22).toFloat(),
+                Color.rgb(229, 229, 234),
+            )
+            elevation = dp(1).toFloat()
         }
         searchCard.addView(TextView(this).apply {
             text = "⌕"
             textSize = 28f
-            setTextColor(Color.rgb(96, 99, 110))
+            setTextColor(Color.rgb(142, 142, 147))
             gravity = Gravity.CENTER
         }, LinearLayout.LayoutParams(dp(36), dp(60)))
         query = EditText(this).apply {
@@ -302,6 +346,8 @@ class MainActivity : Activity() {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
             imeOptions = EditorInfo.IME_ACTION_SEARCH
             background = null
+            setTextColor(Color.rgb(28, 28, 30))
+            setHintTextColor(Color.rgb(142, 142, 147))
             setPadding(dp(8), 0, 0, 0)
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_SEARCH) {
@@ -415,6 +461,12 @@ class MainActivity : Activity() {
             setPadding(dp(6), 0, dp(6), dp(14))
         }
         resultPanel.addView(answer, matchWrap())
+        conversationPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(6), 0, dp(6), dp(10))
+        }
+        resultPanel.addView(conversationPanel, matchWrap())
         followUpPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
@@ -506,35 +558,32 @@ class MainActivity : Activity() {
         }
         resultPanel.addView(
             resultGrid,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(520)),
         )
         // Keep the full search browser ahead of the bounded answer context.
-        // The 8 records selected for Gemma must never look like a replacement
+        // The 4 records selected for Gemma must never look like a replacement
         // for the user-visible result set.
         resultPanel.addView(sourcePanel, matchWrap())
-        searchPanel.addView(
-            resultPanel,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
-        )
-        root.addView(
-            searchPanel,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
-        )
+        searchPanel.addView(resultPanel, matchWrap())
+        root.addView(searchPanel, matchWrap())
 
-        // GridView is now the only vertical scroller on the search surface.
-        // This preserves row virtualization and makes all 200 results directly
-        // reachable before, during, and after answer generation.
-        return root
+        // The page is the primary scroll surface, so the query, QP output,
+        // history, and follow-up turns all move naturally together. The
+        // bounded grid keeps thumbnail virtualization rather than expanding
+        // every one of the 30 result cards at once.
+        return conversationScroll
     }
 
-    private fun refreshPreparation() {
+    /** @return true only while preparation progress needs periodic polling. */
+    private fun refreshPreparation(): Boolean {
         val snapshot = PreparationStore(this).read()
         val indexPrepared = snapshot.isPrepared
-        val gemmaReady = ModelCatalog.gemma.isInstalled(this)
-        val gemmaPart = ModelCatalog.gemma.partFile(this)
+        val selectedGemma = ModelCatalog.gemma(this)
+        val gemmaReady = selectedGemma.isInstalled(this)
+        val gemmaPart = selectedGemma.partFile(this)
         val gemmaBytes = gemmaPart.takeIf { it.isFile }?.length() ?: 0L
-        val gemmaPercent = if (ModelCatalog.gemma.expectedBytes > 0L) {
-            ((gemmaBytes * 100L) / ModelCatalog.gemma.expectedBytes).toInt().coerceIn(0, 100)
+        val gemmaPercent = if (selectedGemma.expectedBytes > 0L) {
+            ((gemmaBytes * 100L) / selectedGemma.expectedBytes).toInt().coerceIn(0, 100)
         } else {
             0
         }
@@ -551,7 +600,7 @@ class MainActivity : Activity() {
             }
         } else if (gemmaOnly) {
             if (gemmaBytes > 0L) {
-                "Gallery index is ready. Installing Gemma 4: ${formatBytes(gemmaBytes)} / ${formatBytes(ModelCatalog.gemma.expectedBytes)}"
+                "Gallery index is ready. Installing ${selectedGemma.name}: ${formatBytes(gemmaBytes)} / ${formatBytes(selectedGemma.expectedBytes)}"
             } else {
                 "Gallery index is ready. Gemma 4 download is queued…"
             }
@@ -563,25 +612,26 @@ class MainActivity : Activity() {
         searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
         if (ready) {
             val plannerReady = GemmaRuntime.isPlannerReady()
-            query.isEnabled = plannerReady
-            query.alpha = if (plannerReady) 1f else 0.62f
-            gemmaWarmupPanel.visibility = if (plannerReady) View.GONE else View.VISIBLE
-            gemmaWarmupIndicator.visibility = if (plannerReady) View.GONE else View.VISIBLE
+            val hasReusableFollowUpContext = activeSearchResponse != null && !followUpInFlight
+            // A submitted query must consume the prewarmed QP system KV.
+            // An uncached Conversation re-prefills the 12K system context and
+            // can take minutes, so wait for the one explicit QP warmup.
+            query.isEnabled = plannerReady || hasReusableFollowUpContext
+            query.alpha = if (query.isEnabled) 1f else 0.62f
+            val showWarmup = !plannerReady && !hasReusableFollowUpContext
+            gemmaWarmupPanel.visibility = if (showWarmup) View.VISIBLE else View.GONE
+            gemmaWarmupIndicator.visibility = if (showWarmup) View.VISIBLE else View.GONE
             gemmaWarmupStatus.text = if (plannerReady) {
-                "Gemma 4 E4B ready • local ${GemmaRuntime.backendPlacement()}"
+                "${GemmaModelSelection.selected(this).displayName} ready • local ${GemmaRuntime.backendPlacement()}"
+            } else if (hasReusableFollowUpContext) {
+                "Follow-up answers are ready from the current results"
             } else {
-                "Warming Gemma 4 E4B • preparing private search…"
+                "Warming ${GemmaModelSelection.selected(this).displayName} • preparing private search…"
             }
-            if (!plannerReady && gemmaWarmupStatus.animation == null) {
-                gemmaWarmupStatus.startAnimation(AlphaAnimation(0.45f, 1f).apply {
-                    duration = 900L
-                    repeatMode = android.view.animation.Animation.REVERSE
-                    repeatCount = android.view.animation.Animation.INFINITE
-                })
-            } else if (plannerReady) {
-                gemmaWarmupStatus.clearAnimation()
-            }
+            // The spinner is enough; do not continuously fade the status text.
+            gemmaWarmupStatus.clearAnimation()
         } else if (::gemmaWarmupStatus.isInitialized) {
+            launchPlannerWarmupRequested = false
             query.isEnabled = false
             gemmaWarmupPanel.visibility = View.GONE
             gemmaWarmupIndicator.visibility = View.GONE
@@ -594,13 +644,15 @@ class MainActivity : Activity() {
         } else if (!ready) {
             searchReady = false
         }
-        if (ready && !GemmaRuntime.isPlannerReady()) {
+        if (ready && !launchPlannerWarmupRequested) {
             // Gemma occupies several GiB of mapped/native state on the target
-            // device. Do not make it compete with the one-time OCR migration;
-            // a user search can still load it on demand.
+            // device. Do not make it compete with the one-time OCR migration.
+            // This is the only launch-time QP system prefill; subsequent
+            // planner warmups are scheduled after the answer session closes.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
             if (pendingOcr == 0) {
+                launchPlannerWarmupRequested = true
                 GemmaRuntime.preloadPlannerAsync(
                     this,
                     QueryPlannerRuntime.plannerSystemInstruction(),
@@ -608,6 +660,7 @@ class MainActivity : Activity() {
             }
         }
         if (waitingForFaceTags && !facePromptRequested) refreshFacePrompt()
+        return !ready
     }
 
     private fun formatBytes(bytes: Long): String {
@@ -620,15 +673,32 @@ class MainActivity : Activity() {
     }
 
     private fun search() {
-        if (!::query.isInitialized || !query.isEnabled || !GemmaRuntime.isPlannerReady()) {
+        if (!::query.isInitialized) return
+        val requestedText = query.text?.toString().orEmpty().trim()
+        if (!GemmaRuntime.isPlannerReady()) {
+            if (requestedText.isNotBlank()) {
+                // A typed fresh search intentionally trades the kept answer
+                // KV for a planner KV; chip follow-ups never take this path.
+                // Answer KV is intentionally resident after a turn. A plain
+                // planner preload refuses to run while it is reserved, which
+                // used to leave this fresh-search path stuck forever.
+                deferredFreshQuery = requestedText
+                query.isEnabled = false
+                query.alpha = 0.62f
+                GemmaRuntime.preloadPlannerAfterAnswerAsync(
+                    this,
+                    QueryPlannerRuntime.plannerSystemInstruction(),
+                )
+            }
             if (::gemmaWarmupStatus.isInitialized) {
                 gemmaWarmupPanel.visibility = View.VISIBLE
                 gemmaWarmupIndicator.visibility = View.VISIBLE
-                gemmaWarmupStatus.text = "Warming Gemma 4 E4B • almost ready…"
+                gemmaWarmupStatus.text = "Warming ${GemmaModelSelection.selected(this).displayName} • almost ready…"
             }
             return
         }
-        val text = query.text?.toString().orEmpty().trim()
+        if (!query.isEnabled) return
+        val text = requestedText
         if (text.isBlank()) return
         val now = System.currentTimeMillis()
         if (text.equals(lastSubmittedQuery, ignoreCase = true) && now - lastSubmittedAtMs < 1_500L) {
@@ -637,13 +707,23 @@ class MainActivity : Activity() {
         lastSubmittedQuery = text
         lastSubmittedAtMs = now
         val generation = ++searchGeneration
+        activeSearchResponse = null
+        followUpInFlight = false
+        // The consumed QP KV is now unavailable by design. Keep the field
+        // locked through QP, answer-prefix warmup, answer generation, then
+        // the next explicit planner warmup.
+        query.isEnabled = false
+        query.alpha = 0.62f
         // Keep Gemma 4 resident across planning and answer generation. The
         // prewarmed planner conversation is intentionally claimed by this
         // query so its system-preface KV cache is reused.
         SigLipTextEncoder.preloadAsync(this)
         NativeVectorIndex.preloadAsync(this)
         resultPanel.visibility = View.VISIBLE
+        answer.visibility = View.VISIBLE
         answer.text = "Searching your private gallery…"
+        conversationPanel.removeAllViews()
+        conversationPanel.visibility = View.GONE
         resultGrid.adapter = null
         resultAdapter?.dispose()
         resultAdapter = null
@@ -672,7 +752,7 @@ class MainActivity : Activity() {
                         true,
                         when (progress.stage) {
                             SearchStage.QUERY_PLANNING ->
-                                "Gemma 4 E4B is planning this query locally…"
+                                "${GemmaModelSelection.selected(this).displayName} is planning this query locally…"
                             SearchStage.QUERY_PLANNED -> {
                                 renderQpOutput(progress.effectivePlanJson)
                                 renderTimeStats(progress.timings, "Planning")
@@ -698,13 +778,15 @@ class MainActivity : Activity() {
             runOnUiThread {
                 if (generation != searchGeneration) return@runOnUiThread
                 val response = result.getOrElse { error ->
+                    activeSearchResponse = null
                     setModelLoading(false, "")
                     renderQpFailure()
+                    warmPlannerForNextSearch()
                     answer.text = if (
-                        error.message.orEmpty().contains("Gemma 4 E4B", ignoreCase = true) ||
-                        error.cause?.message.orEmpty().contains("Gemma 4 E4B", ignoreCase = true)
+                        error.message.orEmpty().contains("Gemma 4", ignoreCase = true) ||
+                        error.cause?.message.orEmpty().contains("Gemma 4", ignoreCase = true)
                     ) {
-                        "Gemma 4 E4B couldn't prepare this search query yet."
+                        "${GemmaModelSelection.selected(this).displayName} couldn't prepare this search query yet."
                     } else {
                         "Search paused while the on-device index is unavailable."
                     }
@@ -713,8 +795,10 @@ class MainActivity : Activity() {
                 renderQpOutput(response.effectivePlanJson)
                 renderTimeStats(response.timings, "Search")
                 if (response.gallery.isEmpty() && response.personalContext.isEmpty()) {
+                    activeSearchResponse = null
                     response.plannerSession?.close()
                     setModelLoading(false, "")
+                    warmPlannerForNextSearch()
                     answer.text = "I couldn't find matching photos or personal context yet."
                     return@runOnUiThread
                 }
@@ -725,15 +809,18 @@ class MainActivity : Activity() {
                     answer.text = "I found relevant personal context."
                 }
                 if (!response.needsAnswer) {
+                    activeSearchResponse = null
                     response.plannerSession?.close()
                     setModelLoading(false, "")
                     followUpPanel.visibility = View.GONE
                     followUpRow.removeAllViews()
                     sourcePanel.visibility = View.GONE
+                    warmPlannerForNextSearch()
                     return@runOnUiThread
                 }
+                activeSearchResponse = response
                 val contextCount = response.answerContext?.items?.size
-                    ?: response.answerGallery.size.coerceAtMost(8)
+                    ?: response.answerGallery.size.coerceAtMost(4)
                 val hasVisualContext = response.answerContext?.includeVisuals == true &&
                     contextCount > 0
                 val visualCount = if (hasVisualContext) {
@@ -746,42 +833,64 @@ class MainActivity : Activity() {
                 setModelLoading(
                     true,
                     if (hasVisualContext && response.personalContext.isNotEmpty()) {
-                        "Gemma 4 E4B is joining $visualCount downscaled scenery images with $contextCount text records and personal context…"
+                        "${GemmaModelSelection.selected(this).displayName} is joining $visualCount downscaled scenery images with $contextCount text records and personal context…"
                     } else if (hasVisualContext) {
-                        "Gemma 4 E4B is joining $visualCount downscaled scenery images with $contextCount text records…"
+                        "${GemmaModelSelection.selected(this).displayName} is joining $visualCount downscaled scenery images with $contextCount text records…"
                     } else {
-                        "Gemma 4 E4B is reading $contextCount scoped OCR/metadata record${if (contextCount == 1) "" else "s"}…"
+                        "${GemmaModelSelection.selected(this).displayName} is reading $contextCount scoped OCR/metadata record${if (contextCount == 1) "" else "s"}…"
                     },
                 )
-                galleryIndexer.answerAsync(text, response) { answerResult ->
-                    runOnUiThread {
-                        if (generation != searchGeneration) return@runOnUiThread
-                        setModelLoading(false, "")
-                        answerResult.fold(
-                            onSuccess = {
-                                answer.text = it.text.ifBlank {
-                                    "I couldn't find enough photos or details to answer that yet."
-                                }
-                                // The top-8 Context Picker output is private
-                                // answer input, not a second user-facing result
-                                // set. Keep only the full search browser visible.
-                                sourcePanel.visibility = View.GONE
-                                sourceRow.removeAllViews()
-                                sourceDetails.removeAllViews()
-                                renderFollowUps(it.followUps, emptyList(), generation)
-                                renderQpOutput(it.effectivePlanJson)
-                                renderTimeStats(it.timings, "Total")
-                            },
-                            onFailure = {
-                                followUpPanel.visibility = View.GONE
-                                followUpRow.removeAllViews()
-                                sourcePanel.visibility = View.GONE
-                                renderTimeStats(response.timings, "Search")
-                                answer.text = "I found matching photos, but couldn't generate an answer on this device yet."
-                            },
-                        )
-                    }
-                }
+                galleryIndexer.answerAsync(
+                    query = text,
+                    response = response,
+                    onFinished = { answerResult ->
+                        runOnUiThread {
+                            if (generation != searchGeneration) return@runOnUiThread
+                            setModelLoading(false, "")
+                            answerResult.fold(
+                                onSuccess = {
+                                    answer.visibility = View.GONE
+                                    appendConversationTurn(
+                                        question = text,
+                                        answerText = it.text.ifBlank {
+                                            "I couldn't find enough photos or details to answer that yet."
+                                        },
+                                    )
+                                    // Replace the broad search browser with the
+                                    // exact four gallery records used for this
+                                    // answer. This makes the answer auditable at
+                                    // a glance without exposing an unrelated
+                                    // tail of search results.
+                                    renderAnswerEvidence(it.sources, generation)
+                                    sourcePanel.visibility = View.GONE
+                                    sourceRow.removeAllViews()
+                                    sourceDetails.removeAllViews()
+                                    renderFollowUps(emptyList(), emptyList(), generation)
+                                    renderQpOutput(it.effectivePlanJson)
+                                    renderTimeStats(it.timings, "Total")
+                                    refreshPreparation()
+                                },
+                                onFailure = {
+                                    followUpPanel.visibility = View.GONE
+                                    followUpRow.removeAllViews()
+                                    sourcePanel.visibility = View.GONE
+                                    renderTimeStats(response.timings, "Search")
+                                    answer.visibility = View.VISIBLE
+                                    answer.text = "I found matching photos, but couldn't generate an answer on this device yet."
+                                },
+                            )
+                        }
+                    },
+                    onFollowUps = { suggestions ->
+                        runOnUiThread {
+                            if (generation == searchGeneration && suggestions.isNotEmpty()) {
+                                renderFollowUpsAfterAnswer(suggestions, generation)
+                            }
+                        }
+                    },
+                    warmPlannerAfterAnswer = false,
+                    warmAnswerAfterAnswer = true,
+                )
             }
         }
     }
@@ -791,17 +900,17 @@ class MainActivity : Activity() {
         modelProgress.visibility = if (visible) View.VISIBLE else View.GONE
         modelStatus.visibility = if (visible) View.VISIBLE else View.GONE
         modelStatus.text = message
-        if (visible) {
-            if (modelStatus.animation == null) {
-                modelStatus.startAnimation(AlphaAnimation(0.45f, 1f).apply {
-                    duration = 900L
-                    repeatMode = android.view.animation.Animation.REVERSE
-                    repeatCount = android.view.animation.Animation.INFINITE
-                })
-            }
-        } else {
-            modelStatus.clearAnimation()
-        }
+        // Keep the status text stable; the progress indicator alone conveys
+        // active work without repeatedly fading the rest of the screen.
+        modelStatus.clearAnimation()
+    }
+
+    /** Replaces a QP session consumed by a browse, empty, or failed search. */
+    private fun warmPlannerForNextSearch() {
+        GemmaRuntime.preloadPlannerAfterAnswerAsync(
+            this,
+            QueryPlannerRuntime.plannerSystemInstruction(),
+        )
     }
 
     private fun showQueryPlanningTelemetry() {
@@ -845,7 +954,7 @@ class MainActivity : Activity() {
         val phaseRows = listOf(
             "Query planning" to timings.queryPlanningMs,
             "Search / hybrid retrieval" to timings.searchMs,
-            "Top 8 context selection" to timings.diverseRerankingMs,
+            "Top 4 context selection" to timings.diverseRerankingMs,
             "Evidence curation" to timings.evidenceCurationMs,
             "Answer generation" to timings.answerGenerationMs,
             "Follow-up query/actions" to timings.followUpMs,
@@ -855,6 +964,7 @@ class MainActivity : Activity() {
                 add(label to durationMs)
                 if (label == "Query planning") {
                     timings.plannerProfile?.let { profile ->
+                        if (profile.startupPrefillMs > 0L) add("  ↳ QP system warm-up (overlapped)" to profile.startupPrefillMs)
                         if (profile.prefillMs > 0L) add("  ↳ QP prefill (${profile.prefillTokens} tok)" to profile.prefillMs)
                         if (profile.decodeMs > 0L) add("  ↳ QP token generation (${profile.decodeTokens} tok)" to profile.decodeMs)
                         if (profile.timeToFirstTokenMs > 0L) add("  ↳ QP time to first token" to profile.timeToFirstTokenMs)
@@ -862,8 +972,9 @@ class MainActivity : Activity() {
                 }
                 if (label == "Answer generation") {
                     timings.answerProfile?.let { profile ->
-                        if (profile.prefillMs > 0L) add("  ↳ AP prefill (${profile.prefillTokens} tok)" to profile.prefillMs)
-                        if (profile.decodeMs > 0L) add("  ↳ AP token generation (${profile.decodeTokens} tok)" to profile.decodeMs)
+                        if (profile.startupPrefillMs > 0L) add("  ↳ AP system warm-up (overlapped)" to profile.startupPrefillMs)
+                        if (profile.prefillMs > 0L) add("  ↳ AP answer-prompt prefill" + profile.prefillTokens.takeIf { it > 0 }?.let { " ($it tok)" }.orEmpty() to profile.prefillMs)
+                        if (profile.decodeMs > 0L) add("  ↳ AP token generation" + profile.decodeTokens.takeIf { it > 0 }?.let { " ($it tok)" }.orEmpty() to profile.decodeMs)
                         if (profile.timeToFirstTokenMs > 0L) add("  ↳ AP time to first token" to profile.timeToFirstTokenMs)
                     }
                 }
@@ -930,6 +1041,7 @@ class MainActivity : Activity() {
         generation: Long,
         totalMatches: Int = matches.size,
     ) {
+        resultGrid.layoutParams = resultGrid.layoutParams.apply { height = dp(520) }
         val current = resultAdapter
         if (current == null || current.generation != generation || !current.hasSameItems(matches)) {
             resultGrid.adapter = null
@@ -944,6 +1056,21 @@ class MainActivity : Activity() {
             "All ${matches.size} match${if (matches.size == 1) "" else "es"} • newest first • scroll to browse"
         }
         resultCount.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    /** Shows the answer's exact gallery inputs instead of the broad result set. */
+    private fun renderAnswerEvidence(sources: List<AnswerSource>, generation: Long) {
+        val evidence = sources.mapNotNull { source ->
+            source.media?.takeIf { source.type == AnswerSourceType.GALLERY_IMAGE }
+        }.distinctBy { it.mediaStoreId }.take(4)
+        if (evidence.isEmpty()) return
+        renderResults(evidence, generation)
+        resultGrid.layoutParams = resultGrid.layoutParams.apply {
+            height = dp(220 * ((evidence.size + 1) / 2))
+        }
+        resultGrid.requestLayout()
+        resultCount.text = "Evidence used for this answer • ${evidence.size} selected photo${if (evidence.size == 1) "" else "s"}"
+        resultCount.visibility = View.VISIBLE
     }
 
     private inner class SearchResultAdapter(
@@ -1142,9 +1269,7 @@ class MainActivity : Activity() {
                 if (isClickable) {
                     setOnClickListener {
                         if (suggestion.isQuery) {
-                            query.setText(suggestion.text)
-                            query.setSelection(query.text.length)
-                            search()
+                            answerFollowUp(suggestion.text, generation)
                         } else {
                             val source = sources.firstOrNull { it.id == sourceId }
                             if (source != null) {
@@ -1160,6 +1285,147 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { marginEnd = dp(7) })
         }
+    }
+
+    /** Runs a chip on the existing result set; it never enters query planning. */
+    private fun answerFollowUp(followUpQuery: String, generation: Long) {
+        if (generation != searchGeneration || followUpInFlight) return
+        val currentResponse = activeSearchResponse ?: return
+        followUpInFlight = true
+        query.isEnabled = false
+        query.alpha = 0.62f
+        followUpPanel.visibility = View.GONE
+        followUpRow.removeAllViews()
+        answer.visibility = View.VISIBLE
+        answer.text = "Answering from the current search results…"
+        appendConversationQuestion(followUpQuery)
+        setModelLoading(true, "${GemmaModelSelection.selected(this).displayName} is selecting fresh answer context from the current results…")
+        galleryIndexer.answerFollowUpAsync(
+            query = followUpQuery,
+            currentResponse = currentResponse,
+            onFinished = { result ->
+                runOnUiThread {
+                    if (generation != searchGeneration) return@runOnUiThread
+                    followUpInFlight = false
+                    setModelLoading(false, "")
+                    result.fold(
+                        onSuccess = {
+                            answer.visibility = View.GONE
+                            appendConversationAnswer(
+                                it.text.ifBlank {
+                                    "I couldn't find enough details in the current results to answer that yet."
+                                },
+                            )
+                            renderAnswerEvidence(it.sources, generation)
+                            sourcePanel.visibility = View.GONE
+                            sourceRow.removeAllViews()
+                            sourceDetails.removeAllViews()
+                            renderFollowUps(emptyList(), emptyList(), generation)
+                            renderTimeStats(it.timings, "Follow-up")
+                        },
+                        onFailure = {
+                            answer.text = "I couldn't answer that from the current search results yet."
+                            answer.visibility = View.VISIBLE
+                            renderFollowUps(emptyList(), emptyList(), generation)
+                        },
+                    )
+                    refreshPreparation()
+                }
+            },
+            onFollowUps = { suggestions ->
+                runOnUiThread {
+                    if (generation == searchGeneration && !followUpInFlight && suggestions.isNotEmpty()) {
+                        renderFollowUpsAfterAnswer(suggestions, generation)
+                    }
+                }
+            },
+        )
+    }
+
+    /** Posts chip rendering after the answer card has been laid out on screen. */
+    private fun renderFollowUpsAfterAnswer(
+        suggestions: List<FollowUpSuggestion>,
+        generation: Long,
+    ) {
+        conversationPanel.post {
+            if (generation == searchGeneration && !followUpInFlight) {
+                renderFollowUps(suggestions, emptyList(), generation)
+            }
+        }
+    }
+
+    private fun appendConversationTurn(question: String, answerText: String) {
+        appendConversationQuestion(question)
+        appendConversationAnswer(answerText)
+    }
+
+    private fun appendConversationQuestion(text: String) = appendConversationBubble(
+        label = "You",
+        text = text,
+        backgroundColor = Color.rgb(10, 132, 255),
+        textColor = Color.WHITE,
+        labelColor = Color.rgb(222, 239, 255),
+        gravity = Gravity.END,
+    )
+
+    private fun appendConversationAnswer(text: String) = appendConversationBubble(
+        label = "Ask Galaxy",
+        text = text,
+        backgroundColor = Color.WHITE,
+        textColor = Color.rgb(28, 28, 30),
+        labelColor = Color.rgb(99, 99, 102),
+        gravity = Gravity.START,
+    )
+
+    private fun appendConversationBubble(
+        label: String,
+        text: String,
+        backgroundColor: Int,
+        textColor: Int,
+        labelColor: Int,
+        gravity: Int,
+    ) {
+        conversationPanel.visibility = View.VISIBLE
+        val row = LinearLayout(this).apply {
+            this.gravity = gravity
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(13), dp(10), dp(13), dp(10))
+            background = roundedBackground(
+                backgroundColor,
+                dp(19).toFloat(),
+                if (gravity == Gravity.START) Color.rgb(229, 229, 234) else null,
+            )
+            if (gravity == Gravity.START) elevation = dp(1).toFloat()
+        }
+        card.addView(TextView(this).apply {
+            this.text = label
+            textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(labelColor)
+            setPadding(0, 0, 0, dp(3))
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        card.addView(TextView(this).apply {
+            this.text = text
+            textSize = 15f
+            setTextColor(textColor)
+            maxWidth = resources.displayMetrics.widthPixels - dp(108)
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        row.addView(card, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        conversationPanel.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { bottomMargin = dp(7) })
     }
 
     private fun showExpandedSource(source: AnswerSource, generation: Long) {
@@ -1247,10 +1513,15 @@ class MainActivity : Activity() {
         else -> arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
     }
 
-    private fun roundedBackground(color: Int, radius: Float): GradientDrawable =
+    private fun roundedBackground(
+        color: Int,
+        radius: Float,
+        strokeColor: Int? = null,
+    ): GradientDrawable =
         GradientDrawable().apply {
             setColor(color)
             cornerRadius = radius
+            strokeColor?.let { setStroke(dp(1), it) }
         }
 
     private fun dp(value: Int): Int =

@@ -25,6 +25,47 @@ data class ModelArtifact(
     fun hasDownloadSource(): Boolean = !downloadUrl.isNullOrBlank()
 }
 
+enum class GemmaModelVariant(
+    val preferenceValue: String,
+    val displayName: String,
+) {
+    E2B("e2b", "Gemma 4 E2B"),
+    E4B("e4b", "Gemma 4 E4B"),
+    ;
+
+    companion object {
+        fun fromPreference(value: String?): GemmaModelVariant =
+            entries.firstOrNull { it.preferenceValue == value } ?: E4B
+    }
+}
+
+/** The selected model is persistent; both downloads are kept independently. */
+object GemmaModelSelection {
+    private const val PREFERENCES = "ask_galaxy_model_selection"
+    private const val VARIANT_KEY = "gemma_variant"
+
+    fun selected(context: Context): GemmaModelVariant = GemmaModelVariant.fromPreference(
+        context.applicationContext
+            .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .getString(VARIANT_KEY, GemmaModelVariant.E4B.preferenceValue),
+    )
+
+    fun select(context: Context, variant: GemmaModelVariant): Boolean {
+        val appContext = context.applicationContext
+        if (selected(appContext) == variant) return false
+        appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(VARIANT_KEY, variant.preferenceValue)
+            .apply()
+        // The resident engine and its KV cache belong to the previous model.
+        // Engine.close() can block while unmapping a multi-GB model, so never
+        // perform it on the Settings UI thread.
+        GemmaRuntime.releaseResidentAsync()
+        GemmaDownloadScheduler.enqueueSelected(appContext, replaceExisting = true)
+        return true
+    }
+}
+
 object ModelCatalog {
     val siglipVision = ModelArtifact(
         name = "SigLIP2 ViT-B/16 224 image encoder",
@@ -84,7 +125,18 @@ object ModelCatalog {
         sourceLabel = "Pinned Apache-2.0 Android FaceNet TFLite artifact",
     )
 
-    val gemma = ModelArtifact(
+    val gemmaE2B = ModelArtifact(
+        name = "Gemma 4 E2B instruction",
+        relativePath = "models/gemma-4-E2B-it.litertlm",
+        runtime = "LiteRT-LM",
+        required = true,
+        downloadUrl = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/9262660a1676eed6d0c477ab1a86344430854664/gemma-4-E2B-it.litertlm?download=true",
+        expectedBytes = 2_588_147_712L,
+        sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
+        sourceLabel = "LiteRT Community pinned model revision",
+    )
+
+    val gemmaE4B = ModelArtifact(
         name = "Gemma 4 E4B instruction",
         relativePath = "models/gemma-4-E4B-it.litertlm",
         runtime = "LiteRT-LM",
@@ -95,19 +147,24 @@ object ModelCatalog {
         sourceLabel = "LiteRT Community pinned model revision",
     )
 
-    val all: List<ModelArtifact> = listOf(
+    fun gemma(context: Context): ModelArtifact = when (GemmaModelSelection.selected(context)) {
+        GemmaModelVariant.E2B -> gemmaE2B
+        GemmaModelVariant.E4B -> gemmaE4B
+    }
+
+    fun all(context: Context): List<ModelArtifact> = listOf(
         siglipVision,
         siglipText,
         siglipTokenizer,
         faceDetector,
         faceEmbedder,
-        gemma,
+        gemma(context),
     )
 
-    fun installedCount(context: Context): Int = all.count { it.isInstalled(context) }
+    fun installedCount(context: Context): Int = all(context).count { it.isInstalled(context) }
 
     fun missingRequired(context: Context): List<ModelArtifact> =
-        all.filter { it.required && !it.isInstalled(context) }
+        all(context).filter { it.required && !it.isInstalled(context) }
 
     fun missingSources(context: Context): List<ModelArtifact> =
         missingRequired(context).filterNot { it.hasDownloadSource() }

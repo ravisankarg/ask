@@ -31,7 +31,7 @@ class ModelInstaller(context: Context) {
     private val appContext = context.applicationContext
 
     fun installAll(onProgress: (ModelInstallProgress) -> Unit): ModelInstallReport {
-        return installArtifacts(ModelCatalog.all.filter { it.required }, onProgress)
+        return installArtifacts(ModelCatalog.all(appContext).filter { it.required }, onProgress)
     }
 
     fun installArtifacts(

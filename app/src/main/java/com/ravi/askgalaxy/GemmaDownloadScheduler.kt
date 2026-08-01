@@ -14,8 +14,12 @@ object GemmaDownloadScheduler {
     const val UNIQUE_WORK_NAME = "ask_galaxy_gemma_download"
 
     fun enqueueIfNeeded(context: Context): Boolean {
+        return enqueueSelected(context, replaceExisting = false)
+    }
+
+    fun enqueueSelected(context: Context, replaceExisting: Boolean): Boolean {
         val appContext = context.applicationContext
-        if (ModelCatalog.gemma.isInstalled(appContext)) return false
+        if (ModelCatalog.gemma(appContext).isInstalled(appContext)) return false
         PreparationNotifier.createChannel(appContext)
         val request = OneTimeWorkRequestBuilder<GemmaDownloadWorker>()
             .setConstraints(
@@ -28,7 +32,7 @@ object GemmaDownloadScheduler {
             .build()
         WorkManager.getInstance(appContext).enqueueUniqueWork(
             UNIQUE_WORK_NAME,
-            ExistingWorkPolicy.KEEP,
+            if (replaceExisting) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
             request,
         )
         return true

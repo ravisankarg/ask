@@ -18,10 +18,12 @@ import com.google.ai.edge.litertlm.SessionConfig
 import java.io.Closeable
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Resident CPU Gemma 4 E4B runtime shared by planning and answer generation.
+ * Resident Gemma 4 runtime shared by planning and answer generation.
  * The model engine is loaded only once per process. Planner and answer turns
  * use separate conversations so planner execution syntax cannot leak into prose;
  * planner and answer system prefixes can be warmed independently, while each
@@ -36,6 +38,8 @@ class GemmaRuntime private constructor(
     data class GenerationProfile(
         val wallMs: Long,
         val prefillMs: Long,
+        /** Stable system-prefix work completed before this user turn. */
+        val startupPrefillMs: Long = 0L,
         val decodeMs: Long,
         val timeToFirstTokenMs: Long,
         val prefillTokens: Int,
@@ -51,6 +55,7 @@ class GemmaRuntime private constructor(
                 return GenerationProfile(
                     wallMs = profiles.sumOf { it.wallMs },
                     prefillMs = profiles.sumOf { it.prefillMs },
+                    startupPrefillMs = profiles.sumOf { it.startupPrefillMs },
                     decodeMs = profiles.sumOf { it.decodeMs },
                     timeToFirstTokenMs = profiles.sumOf { it.timeToFirstTokenMs },
                     prefillTokens = profiles.sumOf { it.prefillTokens },
@@ -121,6 +126,7 @@ class GemmaRuntime private constructor(
                     lastGenerationProfile = GenerationProfile(
                         wallMs = wallMs,
                         prefillMs = queryPrefillMs,
+                        startupPrefillMs = rawStartupPrefillMs,
                         decodeMs = decodeMs,
                         timeToFirstTokenMs = 0L,
                         prefillTokens = 0,
@@ -353,7 +359,6 @@ class GemmaRuntime private constructor(
     }
 
     companion object {
-        private const val MODEL_FILE = "gemma-4-E4B-it.litertlm"
         private const val TAG = "AskGalaxy"
         private const val CPU_THREADS = 4
         // Planner output is a constrained execution expression. Low-temperature
@@ -372,10 +377,15 @@ class GemmaRuntime private constructor(
             temperature = 0.35,
             seed = 29,
         )
-        // The answer path keeps complete selected OCR/metadata. Scenery may
-        // additionally send four bounded images, so retain an 8K
-        // input+output capacity for the joined multimodal prompt.
-        private const val MAX_CONTEXT_TOKENS = 8192
+        // E4B has the proven 8K mobile configuration. E2B's LiteRT-LM
+        // artifact supports a 32K context, which lets document answers carry
+        // the full OCR from the four selected records instead of line packing.
+        private const val E4B_MAX_CONTEXT_TOKENS = 8192
+        // E2B can expose a 32K window, but reserving that KV cache together
+        // with its GPU weights exhausts this phone during answer prewarm.
+        // 8K still accommodates the full OCR from the four answer documents
+        // while keeping the resident engine below the LMK threshold.
+        private const val E2B_MAX_CONTEXT_TOKENS = 8192
         // LiteRT-LM's Gemma 4 graph must still be created with its compiled
         // capacity of eight even though Ask Galaxy sends at most four
         // downscaled scenery images in one answer request.
@@ -384,14 +394,25 @@ class GemmaRuntime private constructor(
         private val prefilledPlannerLock = Any()
         private val prefilledAnswerLock = Any()
         private val preloadExecutor = Executors.newSingleThreadExecutor()
+        // Closing a multi-gigabyte native engine can take several seconds.
+        // Model selection is a Settings UI action, so native teardown must
+        // never run on the main thread.
+        private val lifecycleExecutor = Executors.newSingleThreadExecutor()
         private val preloadRequested = AtomicBoolean(false)
         private val plannerPrefillRequested = AtomicBoolean(false)
         private val answerPrefillRequested = AtomicBoolean(false)
+        /** Invalidates queued/in-flight planner warmups when answer KV is needed. */
+        private val plannerPrefillGeneration = AtomicLong(0L)
+        private val answerPrefillGeneration = AtomicLong(0L)
 
         @Volatile
         private var resident: GemmaRuntime? = null
 
         private val plannerReady = AtomicBoolean(false)
+
+        /** UI observer for a completed planner KV warmup; never used for work scheduling. */
+        @Volatile
+        private var plannerWarmupStateListener: ((Boolean) -> Unit)? = null
 
         @Volatile
         private var backendPlacement = "text CPU/4 threads • vision GPU"
@@ -402,14 +423,27 @@ class GemmaRuntime private constructor(
         @Volatile
         private var prefilledAnswer: ConversationSession? = null
 
-        fun modelFile(context: Context): File =
-            File(context.filesDir, "models/$MODEL_FILE")
+        /** Completion of the one answer-prefix warmup scheduled after QP. */
+        @Volatile
+        private var answerPrefillFuture: Future<*>? = null
 
-        fun isModelInstalled(context: Context): Boolean = modelFile(context).isFile
+        fun modelFile(context: Context): File = ModelCatalog.gemma(context).file(context)
+
+        fun isModelInstalled(context: Context): Boolean = ModelCatalog.gemma(context).isInstalled(context)
 
         fun backendPlacement(): String = backendPlacement
 
         fun isPlannerReady(): Boolean = plannerReady.get()
+
+        fun setPlannerWarmupStateListener(listener: ((Boolean) -> Unit)?) {
+            plannerWarmupStateListener = listener
+            listener?.invoke(plannerReady.get())
+        }
+
+        private fun notifyPlannerWarmupState(ready: Boolean) {
+            runCatching { plannerWarmupStateListener?.invoke(ready) }
+                .onFailure { error -> Log.w(TAG, "Planner warmup UI callback failed", error) }
+        }
 
         /** Returns the one resident CPU Gemma engine for the app process. */
         fun shared(context: Context): GemmaRuntime {
@@ -425,7 +459,7 @@ class GemmaRuntime private constructor(
             if (!isModelInstalled(appContext) || !preloadRequested.compareAndSet(false, true)) return
             preloadExecutor.execute {
                 runCatching { shared(appContext) }
-                    .onSuccess { Log.i(TAG, "Gemma 4 E4B engine warmed") }
+                    .onSuccess { Log.i(TAG, "${GemmaModelSelection.selected(appContext).displayName} engine warmed") }
                     .onFailure { error ->
                         preloadRequested.set(false)
                         Log.e(TAG, "Gemma preload failed", error)
@@ -441,8 +475,10 @@ class GemmaRuntime private constructor(
         fun preloadPlannerAsync(context: Context, plannerSystemInstruction: String) {
             val appContext = context.applicationContext
             if (!isModelInstalled(appContext) ||
+                answerPrefillRequested.get() ||
                 !plannerPrefillRequested.compareAndSet(false, true)
             ) return
+            val requestGeneration = plannerPrefillGeneration.incrementAndGet()
             plannerReady.set(false)
             preloadExecutor.execute {
                 runCatching {
@@ -452,17 +488,33 @@ class GemmaRuntime private constructor(
                         Log.w(TAG, "True planner prefill unavailable; using Conversation fallback", error)
                         shared(appContext).createPlannerConversation(plannerSystemInstruction)
                     }
-                    synchronized(prefilledPlannerLock) {
-                        val old = prefilledPlanner
-                        prefilledPlanner = session
-                        old?.close()
+                    val accepted = synchronized(prefilledPlannerLock) {
+                        if (plannerPrefillGeneration.get() != requestGeneration ||
+                            answerPrefillRequested.get()
+                        ) {
+                            false
+                        } else {
+                            val old = prefilledPlanner
+                            prefilledPlanner = session
+                            old?.close()
+                            true
+                        }
+                    }
+                    if (!accepted) {
+                        session.close()
+                        plannerPrefillRequested.set(false)
+                        plannerReady.set(false)
+                        Log.i(TAG, "Discarded planner KV warmup while answer KV was reserved")
+                        return@runCatching
                     }
                     plannerReady.set(true)
                     Log.i(TAG, "Gemma 4 planner preface explicitly prefetched into reusable KV session")
+                    notifyPlannerWarmupState(true)
                 }.onFailure { error ->
                     plannerPrefillRequested.set(false)
                     plannerReady.set(false)
                     Log.e(TAG, "Gemma 4 planner prefill failed", error)
+                    notifyPlannerWarmupState(false)
                 }
             }
         }
@@ -478,16 +530,48 @@ class GemmaRuntime private constructor(
             }
 
         /**
+         * Answer generation has priority over the next-query planner cache.
+         * Keep only one prefilled KV session resident, and invalidate a queued
+         * planner task so it cannot repopulate the cache behind an answer.
+         */
+        private fun releasePlannerPrefillForAnswer() {
+            plannerPrefillGeneration.incrementAndGet()
+            plannerPrefillRequested.set(false)
+            plannerReady.set(false)
+            val stale = synchronized(prefilledPlannerLock) {
+                prefilledPlanner.also { prefilledPlanner = null }
+            }
+            stale?.close()
+        }
+
+        private fun releaseAnswerPrefillForPlanner() {
+            answerPrefillGeneration.incrementAndGet()
+            answerPrefillRequested.set(false)
+            answerPrefillFuture?.cancel(false)
+            answerPrefillFuture = null
+            val stale = synchronized(prefilledAnswerLock) {
+                prefilledAnswer.also { prefilledAnswer = null }
+            }
+            stale?.close()
+        }
+
+        fun preloadPlannerAfterAnswerAsync(context: Context, plannerSystemInstruction: String) {
+            releaseAnswerPrefillForPlanner()
+            preloadPlannerAsync(context, plannerSystemInstruction)
+        }
+
+        /**
          * Creates a clean answer conversation while retrieval/context assembly
          * is running. Only the stable answer system prefix is warmed; the
          * question, evidence, and images are still sent on the answer turn.
          */
         fun preloadAnswerAsync(context: Context, answerSystemInstruction: String) {
             val appContext = context.applicationContext
-            if (!isModelInstalled(appContext) ||
-                !answerPrefillRequested.compareAndSet(false, true)
-            ) return
-            preloadExecutor.execute {
+            if (!isModelInstalled(appContext)) return
+            releasePlannerPrefillForAnswer()
+            if (!answerPrefillRequested.compareAndSet(false, true)) return
+            val requestGeneration = answerPrefillGeneration.incrementAndGet()
+            answerPrefillFuture = preloadExecutor.submit {
                 runCatching {
                     val session = runCatching {
                         shared(appContext).createPrefilledAnswerSession(answerSystemInstruction)
@@ -496,6 +580,10 @@ class GemmaRuntime private constructor(
                         shared(appContext).createAnswerConversation(answerSystemInstruction)
                     }
                     synchronized(prefilledAnswerLock) {
+                        if (answerPrefillGeneration.get() != requestGeneration) {
+                            session.close()
+                            return@runCatching
+                        }
                         val old = prefilledAnswer
                         prefilledAnswer = session
                         old?.close()
@@ -509,10 +597,20 @@ class GemmaRuntime private constructor(
         }
 
         /** Takes the warmed answer conversation for the next answer turn. */
-        fun takePrefilledAnswerSession(allowTextOnlyRawSession: Boolean = true): ConversationSession? =
-            synchronized(prefilledAnswerLock) {
+        fun takePrefilledAnswerSession(allowTextOnlyRawSession: Boolean = true): ConversationSession? {
+            // QP deliberately switches to the answer system context. Do not
+            // race that load by falling back to an uncached 12K Conversation;
+            // answerAsync is already off the UI thread, so waiting here keeps
+            // the costly work outside the submitted answer latency.
+            val pending = answerPrefillFuture
+            if (pending != null && !pending.isDone) {
+                runCatching { pending.get() }
+                    .onFailure { error -> Log.w(TAG, "Answer-prefix warmup did not complete", error) }
+            }
+            return synchronized(prefilledAnswerLock) {
                 val session = prefilledAnswer
                 prefilledAnswer = null
+                answerPrefillFuture = null
                 answerPrefillRequested.set(false)
                 if (session != null && !allowTextOnlyRawSession && !session.supportsImages) {
                     session.close()
@@ -521,6 +619,7 @@ class GemmaRuntime private constructor(
                     session
                 }
             }
+        }
 
         /** Releases the engine and any unused planner KV session. */
         fun releaseResident() {
@@ -534,6 +633,8 @@ class GemmaRuntime private constructor(
                 prefilledAnswer = null
                 answerPrefillRequested.set(false)
             }
+            answerPrefillFuture?.cancel(false)
+            answerPrefillFuture = null
             synchronized(residentLock) {
                 resident?.close()
                 resident = null
@@ -542,30 +643,37 @@ class GemmaRuntime private constructor(
             plannerReady.set(false)
         }
 
+        fun releaseResidentAsync() {
+            lifecycleExecutor.execute {
+                runCatching { releaseResident() }
+                    .onFailure { error -> Log.w(TAG, "Gemma background release failed", error) }
+            }
+        }
+
         private fun open(context: Context): GemmaRuntime {
             val model = modelFile(context)
             check(model.isFile) {
                 "Gemma model is not installed: ${model.absolutePath}"
             }
-            // Keep language generation on CPU so the frozen QP retains its
-            // verified numerical path. Move only the image encoder/adapter to
-            // GPU: Gemma 4's CPU vision graph otherwise pushes this Samsung
-            // above its per-process memory guard before answer decoding begins.
-            // LiteRT-LM 0.14 supports the split backend directly.
-            val backend = Backend.CPU(CPU_THREADS)
-            val visionBackend = Backend.GPU()
+            val selectedModel = GemmaModelSelection.selected(context)
             val cacheDir = File(context.filesDir, "models/cache").apply {
                 check(mkdirs() || isDirectory) {
                     "Could not create Gemma cache directory: $absolutePath"
                 }
             }
-            fun initialize(vision: Backend): GemmaRuntime {
+            fun initialize(
+                language: Backend,
+                vision: Backend,
+                maxContextTokens: Int,
+            ): GemmaRuntime {
                 val config = EngineConfig(
                     model.absolutePath,
-                    backend,
+                    language,
                     vision,
-                    backend,
-                    MAX_CONTEXT_TOKENS,
+                    // No audio is accepted or requested by Ask Galaxy. Passing
+                    // null avoids allocating an audio backend for every engine.
+                    null,
+                    maxContextTokens,
                     MAX_IMAGES,
                     cacheDir.absolutePath,
                 )
@@ -578,17 +686,42 @@ class GemmaRuntime private constructor(
                     throw error
                 }
             }
-            return try {
-                backendPlacement = "text CPU/4 threads • vision GPU"
-                initialize(visionBackend)
-            } catch (gpuError: RuntimeException) {
-                Log.w(
-                    TAG,
-                    "Gemma GPU vision initialization failed; using CPU vision fallback",
-                    gpuError,
-                )
-                backendPlacement = "text CPU/4 threads • vision CPU fallback"
-                initialize(Backend.CPU(CPU_THREADS))
+            return if (selectedModel == GemmaModelVariant.E2B) {
+                try {
+                    backendPlacement = "E2B full GPU"
+                    initialize(
+                        language = Backend.GPU(),
+                        vision = Backend.GPU(),
+                        maxContextTokens = E2B_MAX_CONTEXT_TOKENS,
+                    )
+                } catch (gpuError: RuntimeException) {
+                    Log.w(TAG, "E2B full-GPU initialization failed; using CPU text fallback", gpuError)
+                    backendPlacement = "E2B text CPU/4 fallback • vision GPU"
+                    initialize(
+                        language = Backend.CPU(CPU_THREADS),
+                        vision = Backend.GPU(),
+                        maxContextTokens = E2B_MAX_CONTEXT_TOKENS,
+                    )
+                }
+            } else {
+                // Keep E4B on its proven split backend and compact prompt
+                // budget; it has a materially higher native-memory footprint.
+                try {
+                    backendPlacement = "E4B text CPU/4 threads • vision GPU"
+                    initialize(
+                        language = Backend.CPU(CPU_THREADS),
+                        vision = Backend.GPU(),
+                        maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
+                    )
+                } catch (gpuError: RuntimeException) {
+                    Log.w(TAG, "E4B GPU vision initialization failed; using CPU vision fallback", gpuError)
+                    backendPlacement = "E4B text CPU/4 threads • vision CPU fallback"
+                    initialize(
+                        language = Backend.CPU(CPU_THREADS),
+                        vision = Backend.CPU(CPU_THREADS),
+                        maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
+                    )
+                }
             }
         }
     }

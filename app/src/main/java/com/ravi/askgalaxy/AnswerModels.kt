@@ -46,6 +46,8 @@ data class SearchResponse(
     val queryCategory: QueryCategory = QueryCategory.SCENARY,
     val needsAnswer: Boolean = true,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
+    /** OCR conjunction that grounded the original answer; follow-ups inherit it for "it". */
+    val answerOcrKeywords: List<String> = emptyList(),
     val timings: PhaseTimings = PhaseTimings(),
 )
 

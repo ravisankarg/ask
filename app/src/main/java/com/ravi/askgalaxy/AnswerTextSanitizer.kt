@@ -50,6 +50,17 @@ internal object AnswerTextSanitizer {
                 Regex("(?i)^(?:based on|according to)\\s+(?:the )?(?:photos(?: and details)?)(?: you provided)?\\s*[,;:]?\\s*"),
                 "",
             )
+            // A direct field answer is sufficient. Drop a separate generic
+            // provenance sentence rather than surfacing an explanation such
+            // as "This information was found in a document...".
+            .replace(
+                Regex(
+                    "(?i)\\s*(?:this|that) (?:information|answer|detail) " +
+                        "(?:was|is) (?:found|shown|taken) (?:in|from) " +
+                        "(?:a|the) (?:document|photo|image|record)[^.?!]*[.?!]?",
+                ),
+                "",
+            )
             // G/C/E/F labels are prompt-local join keys, never user-facing
             // citations. Remove both bracketed lists and an occasional bare
             // model reference before constraining answer length.

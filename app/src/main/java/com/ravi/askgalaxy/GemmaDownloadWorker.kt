@@ -13,6 +13,7 @@ class GemmaDownloadWorker(
     workerParams: WorkerParameters,
 ) : CoroutineWorker(appContext, workerParams) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        val gemma = ModelCatalog.gemma(applicationContext)
         val progressStore = IndexProgressStore(applicationContext)
         try {
             var lastSnapshot = PreparationSnapshot(
@@ -22,7 +23,7 @@ class GemmaDownloadWorker(
                 modelTotal = 1L,
             )
             setForeground(PreparationNotifier.foregroundInfo(applicationContext, lastSnapshot))
-            ModelInstaller(applicationContext).installArtifacts(listOf(ModelCatalog.gemma)) { progress ->
+            ModelInstaller(applicationContext).installArtifacts(listOf(gemma)) { progress ->
                 progressStore.update(
                     stage = IndexProgressStage.MODELS,
                     current = progress.bytesDownloaded,
@@ -49,16 +50,16 @@ class GemmaDownloadWorker(
             }
             progressStore.update(
                 IndexProgressStage.MODELS,
-                ModelCatalog.gemma.expectedBytes,
-                ModelCatalog.gemma.expectedBytes,
+                gemma.expectedBytes,
+                gemma.expectedBytes,
                 completed = true,
             )
             Result.success()
         } catch (error: IOException) {
             progressStore.update(
                 IndexProgressStage.MODELS,
-                ModelCatalog.gemma.partFile(applicationContext).length(),
-                ModelCatalog.gemma.expectedBytes,
+                gemma.partFile(applicationContext).length(),
+                gemma.expectedBytes,
                 error = error.message.orEmpty(),
             )
             setProgressAsync(
@@ -71,8 +72,8 @@ class GemmaDownloadWorker(
         } catch (error: Throwable) {
             progressStore.update(
                 IndexProgressStage.MODELS,
-                ModelCatalog.gemma.partFile(applicationContext).length(),
-                ModelCatalog.gemma.expectedBytes,
+                gemma.partFile(applicationContext).length(),
+                gemma.expectedBytes,
                 error = error.message.orEmpty(),
             )
             setProgressAsync(

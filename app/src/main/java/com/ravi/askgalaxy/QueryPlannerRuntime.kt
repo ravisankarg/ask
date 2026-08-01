@@ -5,7 +5,7 @@ import android.util.Log
 import java.time.LocalDate
 
 /**
- * Gemma 4 E4B is the sole query planner. Planning runs on GalleryIndexer's
+ * The selected Gemma 4 model is the sole query planner. Planning runs on GalleryIndexer's
  * background executor and must produce one validated canonical execution spec.
  *
  * The planner conversation is released before retrieval. Answer generation
@@ -18,7 +18,6 @@ object QueryPlannerRuntime {
     private const val MAX_OUTPUT_CHARS = 900
     private const val MAX_REPAIR_ERROR_CHARS = 180
     private const val MAX_REPAIR_ATTEMPTS = 2
-
     private val semanticForbiddenWords = setOf(
         "when", "where", "who", "whom", "whose", "which", "what", "why", "how",
         "show", "find", "search", "tell", "display",
@@ -32,6 +31,15 @@ object QueryPlannerRuntime {
     private val isoDateToken = Regex("\\b\\d{4}(?:-\\d{2}(?:-\\d{2})?)?\\b")
     private val explicitOcrAndSyntax = Regex(
         "(?i)\\[ocr\\s*==\\s*\\{[^{}\\]]+\\}\\s*&&\\s*\\{[^{}\\]]+\\}",
+    )
+    private val missingEnvelopeBracket = Regex(
+        "(?i)\\[(answer_needed|query_category)\\s*==\\s*" +
+            "(true|false|doc|scenary|person|location|time)\\s*&&",
+    )
+    private val collapsedRoutingEnvelope = Regex(
+        "(?is)^\\[answer_needed\\s*==\\s*(true|false)\\s*&&\\s*" +
+            "query_category\\s*==\\s*(doc|scenary|person|location|time)\\s*&&\\s*" +
+            "(\\[.*])\\]\\s*$",
     )
 
     data class PlannedQuery(
@@ -61,7 +69,7 @@ object QueryPlannerRuntime {
     }
 
     /**
-     * Every query is compiled by Gemma 4 E4B. A malformed response gets one
+     * Every query is compiled by the selected Gemma 4 model. A malformed response gets one
      * repair turn in the same session; there is no deterministic QP fallback.
      */
     fun planWithSession(
@@ -72,7 +80,7 @@ object QueryPlannerRuntime {
     ): PlannedQuery {
         val appContext = context.applicationContext
         check(isModelInstalled(appContext)) {
-            "Gemma 4 E4B is required for query planning"
+            "A selected Gemma 4 model is required for query planning"
         }
 
         var session: GemmaRuntime.ConversationSession? = null
@@ -120,8 +128,6 @@ object QueryPlannerRuntime {
                     candidateRaw = session.generate(
                         plannerRepairPrompt(
                             query = query,
-                            knownPersonLabels = knownPersonLabels,
-                            selfPersonLabel = selfPersonLabel,
                             invalidOutput = candidateRaw,
                             error = validationError,
                             repairAttempt = repairAttempt,
@@ -151,7 +157,7 @@ object QueryPlannerRuntime {
         } catch (error: Throwable) {
             session?.close()
             Log.e(TAG, "Gemma-only query planning failed", error)
-            throw IllegalStateException("Gemma 4 E4B could not compile this query", error)
+            throw IllegalStateException("Gemma 4 could not compile this query", error)
         }
     }
 
@@ -161,9 +167,50 @@ object QueryPlannerRuntime {
     /** Canonical C-like spec for the post-resolution plan enforced by retrieval. */
     fun effectivePlanJson(plan: QueryPlan): String = canonicalExecutionSpec(plan)
 
+    private val COMPACT_PLANNER_SYSTEM_INSTRUCTION = """
+        You are Ask Galaxy's private query compiler. For PLANNER_TASK return ONLY one balanced execution expression: no prose, Markdown, JSON, labels, or explanation.
+
+        Every response starts exactly with one routing header:
+        [answer_needed == true|false] && [query_category == CATEGORY] &&
+        CATEGORY is exactly doc, scenary, person, location, or time.
+
+        Category: doc/OCR always includes insurance, tax/property tax, receipt, bill, invoice, sale deed, government ID/identification, coupon, ticket, marks/mark sheet, certificate, passport, licence, screenshot, card, code, password, total, amount, number, DOB, or expiry. Never classify these documents as scenary. person answers who/whose/which people. location answers where/which place. time answers when/which date/day/time. scenary always includes visible actions or things such as dancing, sleeping, running, playing, hiking, mountains, animals, vehicles, and ordinary objects. A date printed on a document is doc, not time.
+        answer_needed is true for a requested fact or answer; false when the requested result is only photos/videos.
+
+        Use only: people_only, person, mime type, from_date, to_date, location, semantic, ocr. The field is person, never people. Each ordinary bracket is exactly [field == value]. Operators join complete brackets only: && intersection, + document hybrid, - subtraction, comma union. The only exception is document OCR: [ocr == {word1} && {word2}].
+
+        Use [mime type == photos] for explicit photos/images/pictures and videos for explicit videos/clips. Use [person == ExactKnownName] only for a named person's presence; Known people correct spelling only. For self presence, use self_person. Never use a face/person predicate for document ownership; put the owner name in OCR. For only/alone, add people_only with the complete allowed set. Keep one explicit place in location. Use ISO dates only when requested. Use SORT_DATE for time/latest/earliest and SORT_LOC for plural places or north-to-south.
+
+        semantic is one compact visual/document phrase. Every doc plan has exactly one fused hybrid: [[semantic == document phrase] + [ocr == {essential} && {words}]]. OCR is doc-only, has 2-6 co-occurring words, and never uses self/me/my/owner aliases. Complete subtraction before a final sort. Maximum eight retrieval predicates.
+
+        Valid examples (all follow the required header):
+        beach photos => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [semantic == beach]]
+        photos of Ravi only => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ravi] && [people_only == Ravi]]
+        Ramani only photos last week => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ramani] && [people_only == Ramani] && [from_date == 2026-07-20] && [to_date == 2026-07-26]]
+        how many places Ramani visited last year => [answer_needed == true] && [query_category == location] && [[person == Ramani] && [from_date == 2025-01-01] && [to_date == 2025-12-31]] SORT_LOC
+        when is Ramani birthday => [answer_needed == true] && [query_category == time] && [[person == Ramani] && [semantic == birthday]] SORT_DATE
+        Ramani dancing => [answer_needed == false] && [query_category == scenary] && [[person == Ramani] && [semantic == dancing]]
+        Ravi and Ramani => [answer_needed == false] && [query_category == scenary] && [[person == Ravi] && [person == Ramani]]
+        Ravi and Ramani in 2015 => [answer_needed == false] && [query_category == scenary] && [[person == Ravi] && [person == Ramani] && [from_date == 2015-01-01] && [to_date == 2015-12-31]]
+        Ravi and Ramani alone at the beach => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ravi] && [person == Ramani] && [people_only == "Ravi, Ramani"] && [semantic == beach]]
+        who is in these beach photos => [answer_needed == true] && [query_category == person] && [[mime type == photos] && [semantic == beach]]
+        where was the lighthouse photo taken => [answer_needed == true] && [query_category == location] && [[mime type == photos] && [semantic == lighthouse]]
+        when did I visit Goa => [answer_needed == true] && [query_category == time] && [location == Goa] SORT_DATE
+        who was with me at dinner on 5 October 2025 => [answer_needed == true] && [query_category == person] && [[person == Ravi] && [from_date == 2025-10-05] && [to_date == 2025-10-05] && [semantic == dinner]]
+        Ravi passport number => [answer_needed == true] && [query_category == doc] && [[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]
+        how much is Odyssey movie => [answer_needed == true] && [query_category == doc] && [[semantic == Odyssey movie ticket] + [ocr == {Odyssey} && {ticket}]]
+        what date is printed on my Odyssey movie ticket => [answer_needed == true] && [query_category == doc] && [[semantic == Odyssey movie ticket printed date] + [ocr == {Odyssey} && {ticket}]]
+        how much did I spend last month => [answer_needed == true] && [query_category == doc] && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END] && [[semantic == purchase receipts] + [ocr == {total} && {amount}]]]
+        what bike did I have => [answer_needed == true] && [query_category == scenary] && [semantic == motorcycle bike]
+        show the clearest national park photo excluding selfies => [answer_needed == false] && [query_category == scenary] && [[[mime type == photos] && [semantic == clear national park landscape]] - [semantic == selfie]]
+    """.trimIndent()
+
     /** Stable preface placed in the conversation KV cache before a query arrives. */
-    fun plannerSystemInstruction(): String = """
-        You are Ask Galaxy's private on-device query compiler. Gemma 4 E4B is the only plan author.
+    fun plannerSystemInstruction(): String = COMPACT_PLANNER_SYSTEM_INSTRUCTION
+
+    /* Previous long prompt retained temporarily for source-history context; it is not sent to either model.
+    fun obsoletePlannerSystemInstruction(): String = """
+        You are Ask Galaxy's private on-device query compiler. The selected Gemma 4 model is the only plan author.
         For PLANNER_TASK output ONLY one C-like expression: no reasoning, markdown, JSON, labels, or prose.
 
         Start exactly:
@@ -183,7 +230,7 @@ object QueryPlannerRuntime {
         Each ordinary predicate contains exactly ONE `field == value`. NEVER put `+`, `-`, `&&`, comma, or another `==` inside an ordinary predicate value. The only exception is the required OCR keyword syntax [ocr == {word1} && {word2}], where each braced word is required in the same OCR text.
 
         Structured fields:
-        - Preserve every explicitly named Known person as a person predicate when the query asks about that person's presence in photos, scenes, places, times, or events. Correct only a close misspelling to the exact Known people label. A negated person must be subtracted.
+        - Known people is correction vocabulary, never a result list. Use a person predicate only for a person explicitly named in the query when it asks about presence in photos, scenes, places, times, or events. Correct only a close misspelling to the exact Known people label. A negated person must be subtracted.
         - PEOPLE-ONLY: when the query says only, alone, by themselves, or no other human/person, emit people_only with the complete allowed set. `me only` means `[person == Self] && [people_only == Self]`; `me with Ramani alone` means both positive person predicates plus `[people_only == Self, Ramani]`. This is a hard exact-face-set constraint: an untagged or additional face must make the photo fail.
         - SELF PERSON: the task may provide one `Self person` label. For presence/identity uses of I, me, my, mine, or myself, emit that exact label as a person predicate; examples include photos of me, who was with me, where I went, when I visited, what I wore, and my birthday photos. Do not create a person predicate for grammatical ownership/agency in doc queries such as my passport, my password, my receipt, or how much I spent. For a self identity-document query, place only the actual Self person name word(s) plus essential document word(s) in OCR. Never emit literal OCR keywords such as person, people, self, me, my, mine, myself, or owner. If Self person is `not set`, never invent one.
         - DOC PERSON NAMES: when a doc query names the document owner or subject, keep that name inside the ocr keywords; do not add a face/person predicate merely because the name is known. A passport, ID, mark sheet, bill, or account screenshot may contain the printed name without containing a tagged face.
@@ -235,6 +282,8 @@ object QueryPlannerRuntime {
         what are Ravi exam marks => [query_category == doc] && [[semantic == exam mark sheet report card] + [ocr == {Ravi} && {marks}]]
         what is the Wi-Fi password => [query_category == doc] && [[semantic == Wi-Fi credential card] + [ocr == {wifi} && {password}]]
         how much did I spend on the odyssy movie ticket => [query_category == doc] && [[semantic == Odyssey movie ticket price] + [ocr == {Odyssey} && {ticket}]]
+        what date is printed on my Odyssey movie ticket => [answer_needed == true] && [query_category == doc] && [[semantic == Odyssey movie ticket printed date] + [ocr == {Odyssey} && {ticket}]]
+        what bike did I have => [answer_needed == true] && [query_category == scenary] && [semantic == motorcycle bike]
         how much did I spend last month => [query_category == doc] && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END] && [[semantic == purchase receipts bills invoices payment confirmations] + [ocr == {total} && {amount}]]]
         photos that make great phone backgrounds => [query_category == scenary] && [[mime type == photos] && [semantic == beautiful phone wallpaper background]]
         clearest national park photo excluding selfies => [query_category == scenary] && [[[mime type == photos] && [semantic == clear national park landscape]] - [semantic == selfie]]
@@ -249,38 +298,22 @@ object QueryPlannerRuntime {
         [answer_needed == true|false] && [query_category == CATEGORY] &&
         and MUST contain exactly one answer_needed predicate. Missing or duplicate answer_needed is invalid.
 
-        For ANSWER_TASK ignore this execution grammar and answer only from supplied gallery context. Never repeat the execution expression as the answer.
     """.trimIndent()
+    */
 
     private fun plannerUserPrompt(
         query: String,
         knownPersonLabels: List<String>,
         selfPersonLabel: String?,
     ): String =
-        "PLANNER_TASK: Today=${LocalDate.now()}. Known people: ${knownPeopleText(knownPersonLabels)}. " +
-            "Self person: ${selfPersonText(selfPersonLabel)}. " +
-            "First classify by the requested answer: written document, who, where, when, or visual scene. " +
-            "Every output MUST begin with exactly one [answer_needed == true|false] followed by [query_category == CATEGORY]. " +
-            "Preserve every explicit person-presence constraint, single place, media type, date range, and negation " +
-            "as structured fields. In doc queries keep an owner/subject name in the OCR keywords instead of " +
-            "creating a face/person predicate. " +
-            "Use only people actually named in the Query, except map a presence/identity use of I/me/my/mine/myself " +
-            "to the exact Self person label. Known people is correction vocabulary, not a result list. " +
-            "Never write person/people/place/places/location or without/excluding inside semantic; " +
-            "exclusion always uses subtraction. " +
-            "Do not add semantic to metadata-only co-occurrence or plural place/city-list queries. " +
-            "Time answers require SORT_DATE; plural place answers require SORT_LOC. " +
-            "Each ordinary bracket has one field == value and contains no operator. Every doc query requires one " +
-            "conceptual semantic predicate plus [ocr == {word1} && {word2}] joined by outer + inside one group. " +
-            "Every braced OCR word is required in the same photo; a complete match ranks before semantic-only. " +
-            "For self documents use only the exact Self person name and document words, never person/self/me/my aliases. " +
-            "Spending/expenses/documents are not useful OCR keywords. " +
-            "Return only the expression. Query: ${cleanQuery(query)}"
+        "PLANNER_TASK\n" +
+            "today=${LocalDate.now()}\n" +
+            "known_people=${knownPeopleText(knownPersonLabels)}\n" +
+            "self_person=${selfPersonText(selfPersonLabel)}\n" +
+            "query=${cleanQuery(query)}"
 
     private fun plannerRepairPrompt(
         query: String,
-        knownPersonLabels: List<String>,
-        selfPersonLabel: String?,
         invalidOutput: String,
         error: Throwable,
         repairAttempt: Int,
@@ -291,34 +324,17 @@ object QueryPlannerRuntime {
         val safeOutput = invalidOutput
             .replace(Regex("[\\r\\n]+"), " ")
             .take(MAX_OUTPUT_CHARS)
-        val retryDirective = if (repairAttempt > 1) {
-            "The previous repair also failed. Do not copy its invalid semantic text or operator grouping. "
-        } else {
-            ""
-        }
-        return "PLANNER_TASK REPAIR: Today=${LocalDate.now()}. " +
-            "Known people: ${knownPeopleText(knownPersonLabels)}. " +
-            "Self person: ${selfPersonText(selfPersonLabel)}. " +
-            retryDirective +
-            "The validator error is authoritative: $safeError. Fix that exact error and recompile the original query. " +
-            "If the error names forbidden semantic words, remove those exact words from semantic; do not repeat them. " +
-            "Do not reuse malformed syntax. Start [answer_needed == true|false] && [query_category == CATEGORY] &&. " +
-            "Each ordinary predicate must be exactly [field == plain value]; an operator can appear only BETWEEN " +
-            "complete predicates or groups. OCR is the only exception and must be [ocr == {word1} && {word2}], " +
-            "where every word is required in the same OCR text. Put every negative constraint completely on the right side of subtraction, as " +
-            "[query_category == CATEGORY] && [[[POSITIVE predicates]] - [[NEGATIVE predicates]]]. " +
-            "Never append a negative predicate with && after the subtraction. Finish every subtraction before " +
-            "appending a final SORT_DATE or SORT_LOC. " +
-            "For every doc query emit one conceptual semantic predicate + one 2-6 word OCR conjunction in one " +
-            "fused group. Use only essential co-occurring words. For my identity document, use the exact Self " +
-            "person name plus the document word; never person, self, me, my, mine, myself, or owner. " +
-            "Never use spending, expenses, finances, paperwork, " +
-            "or documents alone as OCR keywords. Preserve explicit people, one place, photos/videos, " +
-            "and map I/me/my/mine/myself to Self person only when they refer to that person's presence or identity, " +
-            "not ordinary document ownership or spending grammar. " +
-            "the exact full date range, negation, and required sort. Use at most eight predicates and balance all " +
-            "brackets. Return only the corrected expression. Original query: ${cleanQuery(query)}. " +
-            "Previous invalid expression: $safeOutput"
+        return """
+            PLANNER_TASK_REPAIR
+            attempt=$repairAttempt
+            original_query=${cleanQuery(query)}
+            validator_error=$safeError
+            invalid_expression=$safeOutput
+            Return only a new balanced expression. Do not copy the invalid expression.
+            Required header exactly:
+            [answer_needed == ${AnswerIntentPolicy.expected(query)}] && [query_category == ${QueryCategoryConstraintPolicy.expectedCategory(query).wireName}] &&
+            Ordinary brackets contain one field == value; operators appear only between complete brackets. Use person, never people. OCR alone may use [ocr == {word1} && {word2}]. A doc plan needs [[semantic == phrase] + [ocr == {word1} && {word2}]]. Keep the concrete visible object/action in scenary semantic.
+        """.trimIndent()
     }
 
     private fun knownPeopleText(knownPersonLabels: List<String>): String =
@@ -327,7 +343,7 @@ object QueryPlannerRuntime {
             .filter(String::isNotBlank)
             .distinctBy { it.lowercase() }
             .take(64)
-            .joinToString(" | ")
+            .joinToString("|")
             .ifBlank { "none" }
 
     private fun selfPersonText(selfPersonLabel: String?): String =
@@ -362,10 +378,251 @@ object QueryPlannerRuntime {
             .joinToString(" ")
             .removePrefix("EXECUTION_SPEC:")
             .trim()
-        validatePlannerOcrSyntax(candidate)
-        val plan = ExecutionSpecCompiler.compile(QueryExecutionSpec.parse(candidate))
+        val repairedEnvelope = repairUnambiguousEnvelopeBracket(candidate)
+        if (repairedEnvelope != candidate) {
+            Log.w(TAG, "Recovered one missing planner envelope bracket: ${singleLineForLog(candidate)}")
+        }
+        val modelSpec = QueryExecutionSpec.parse(repairedEnvelope)
+        val normalizedSpec = normalizeFiniteConstraints(
+            modelSpec,
+            query,
+            knownPersonLabels,
+            selfPersonLabel,
+        )
+        validatePlannerOcrSyntax(normalizedSpec.render())
+        val plan = ExecutionSpecCompiler.compile(normalizedSpec)
         validateCompiledPlan(query, knownPersonLabels, plan, selfPersonLabel)
         return plan
+    }
+
+    /**
+     * Gemma authors retrieval intent, but a handful of planner fields are not
+     * open-ended language decisions: the answer route, known face names,
+     * explicit date window, media type, and requested sort all have one
+     * canonical value derived directly from the user's words. Preserve the
+     * model's semantic/OCR/grouping intent while replacing only those finite
+     * constraints. This prevents a repair turn from throwing away an otherwise
+     * useful plan because it chose `person` instead of `scenary`, omitted a
+     * named face predicate, or used a relative-date shorthand.
+     */
+    internal fun normalizeFiniteConstraints(
+        modelSpec: QueryExecutionSpec,
+        query: String,
+        knownPersonLabels: List<String>,
+        selfPersonLabel: String? = null,
+    ): QueryExecutionSpec {
+        val expectedCategory = QueryCategoryConstraintPolicy.expectedCategory(query)
+        val mentionedKnownPeople = knownPersonLabels.asSequence()
+            .filter(String::isNotBlank)
+            .distinctBy(String::lowercase)
+            .filter { label ->
+                containsPhrase(query, label) || QuerySpellingMatcher.isPlausibleCorrection(query, label)
+            }
+            .toList()
+            .toMutableList()
+        // A printed name identifies a document through OCR; it is not a face
+        // constraint. Keep that distinction before adding scene/person fields.
+        val namedPeople = if (expectedCategory == QueryCategory.DOC) {
+            mutableListOf()
+        } else {
+            mentionedKnownPeople
+        }
+        if (
+            SelfPersonQueryPolicy.referencesSelfAsPerson(query) &&
+            !selfPersonLabel.isNullOrBlank() &&
+            namedPeople.none { it.equals(selfPersonLabel, ignoreCase = true) }
+        ) {
+            namedPeople += selfPersonLabel
+        }
+        val expectedMedia = QueryStructuredIntentPolicy.expectedMediaType(query)
+        val dateBounds = QueryScopeParser.explicitDateBoundsFromQuery(query)
+        val metadataOnly = QueryStructuredIntentPolicy.isMetadataOnlyIntent(query)
+        val isDocumentQuery = expectedCategory == QueryCategory.DOC
+        var retainedExpectedMedia = false
+
+        fun firstPositiveValue(field: ExecutionField): String? {
+            fun visit(node: ExecutionNode, subtract: Boolean = false): String? = when (node) {
+                is ExecutionNode.Predicate ->
+                    node.value.takeIf { !subtract && node.field == field }
+                is ExecutionNode.Sorted -> visit(node.value, subtract)
+                is ExecutionNode.Binary ->
+                    visit(node.left, subtract) ?: visit(
+                        node.right,
+                        subtract || node.operator == ExecutionBinaryOperator.SUBTRACT,
+                    )
+            }
+            return visit(modelSpec.root)
+        }
+
+        val modelDocumentSemantic = firstPositiveValue(ExecutionField.SEMANTIC).orEmpty()
+        val modelDocumentOcr = firstPositiveValue(ExecutionField.OCR).orEmpty()
+        val documentGenericWords = setOf(
+            "a", "an", "the", "how", "much", "what", "is", "are", "was", "were",
+            "my", "current", "printed", "print", "cost", "amount", "price", "total",
+            "number", "date", "time", "expiry", "expiration", "document",
+        )
+        val documentTypeWords = setOf(
+            "ticket", "receipt", "receipts", "bill", "invoice", "passport", "licence",
+            "license", "card", "voucher", "coupon", "screenshot", "statement", "booking",
+            "boarding", "menu",
+        )
+        fun documentTokens(value: String): List<String> = value
+            .split(Regex("[^\\p{L}\\p{N}]+"))
+            .map(String::trim)
+            .filter { it.length >= 2 }
+            .distinctBy(String::lowercase)
+        val documentSemanticTokens = documentTokens(modelDocumentSemantic.ifBlank { query })
+        val documentSemantic = documentSemanticTokens
+            .filter { it.lowercase() !in documentGenericWords }
+            .joinToString(" ")
+            .ifBlank { "document" }
+        fun canonicalDocumentOcr(): String {
+            val queryTokens = documentTokens(query)
+            val usable = documentTokens(documentSemantic)
+            val type = usable.firstOrNull { it.lowercase() in documentTypeWords }
+            val anchors = usable.filter { token ->
+                val lower = token.lowercase()
+                lower !in documentTypeWords && lower !in setOf("movie", "identity") &&
+                    queryTokens.any { queryToken ->
+                        queryToken.equals(token, ignoreCase = true) ||
+                            QuerySpellingMatcher.areClosePhrases(queryToken, token)
+                    }
+            }
+            val chosen = when {
+                mentionedKnownPeople.isNotEmpty() ->
+                    listOf(mentionedKnownPeople.first()) + listOfNotNull(type ?: anchors.firstOrNull())
+                anchors.isNotEmpty() && type != null -> listOf(anchors.first(), type)
+                anchors.size >= 2 -> anchors.take(2)
+                else -> OcrKeywordPolicy.keywords(modelDocumentOcr).take(2)
+            }.toMutableList()
+            if (chosen.size == 1) {
+                chosen += when {
+                    type != null && !chosen.first().equals(type, ignoreCase = true) -> type
+                    else -> "amount"
+                }
+            }
+            if (chosen.isEmpty()) chosen += listOf("total", "amount")
+            return chosen.distinctBy(String::lowercase).take(6).joinToString(" ")
+        }
+        val documentOcr = canonicalDocumentOcr()
+
+        fun stripNamedPeople(value: String): String {
+            var cleaned = value
+            namedPeople.forEach { label ->
+                cleaned = cleaned.replace(
+                    Regex("(?i)(?<![\\p{L}\\p{N}])${Regex.escape(label)}(?![\\p{L}\\p{N}])"),
+                    " ",
+                )
+            }
+            cleaned = cleaned
+                .replace(Regex("(?i)\\b(?:and|with|by|of|at|in)\\b"), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            return cleaned.takeIf { it.isNotBlank() } ?: ""
+        }
+
+        fun retain(node: ExecutionNode): ExecutionNode? = when (node) {
+            is ExecutionNode.Predicate -> when (node.field) {
+                ExecutionField.ANSWER_NEEDED,
+                ExecutionField.QUERY_CATEGORY,
+                ExecutionField.FROM_DATE,
+                ExecutionField.TO_DATE,
+                ExecutionField.PEOPLE_ONLY,
+                -> null
+                ExecutionField.PERSON -> if (namedPeople.isNotEmpty()) null else node
+                ExecutionField.MIME_TYPE -> {
+                    if (expectedMedia == null || node.value == expectedMedia.label()) {
+                        retainedExpectedMedia = expectedMedia != null
+                        node
+                    } else {
+                        null
+                    }
+                }
+                ExecutionField.SEMANTIC -> {
+                    if (isDocumentQuery || metadataOnly) null else {
+                        stripNamedPeople(node.value).takeIf(String::isNotBlank)?.let {
+                            node.copy(value = it)
+                        }
+                    }
+                }
+                ExecutionField.OCR -> if (isDocumentQuery) null else node
+                else -> node
+            }
+            is ExecutionNode.Sorted -> retain(node.value)
+            is ExecutionNode.Binary -> {
+                val left = retain(node.left)
+                val right = retain(node.right)
+                when {
+                    left != null && right != null -> ExecutionNode.Binary(left, node.operator, right)
+                    left != null -> left
+                    else -> right
+                }
+            }
+        }
+
+        fun intersect(left: ExecutionNode?, right: ExecutionNode): ExecutionNode =
+            left?.let { ExecutionNode.Binary(it, ExecutionBinaryOperator.INTERSECT, right) } ?: right
+
+        var root: ExecutionNode? = retain(modelSpec.root)
+        if (isDocumentQuery) {
+            val fusedDocumentEvidence = ExecutionNode.Binary(
+                ExecutionNode.Predicate(ExecutionField.SEMANTIC, documentSemantic),
+                ExecutionBinaryOperator.ADD,
+                ExecutionNode.Predicate(ExecutionField.OCR, documentOcr),
+            )
+            root = intersect(root, fusedDocumentEvidence)
+        }
+        namedPeople.forEach { label ->
+            root = intersect(root, ExecutionNode.Predicate(ExecutionField.PERSON, label))
+        }
+        if (QueryStructuredIntentPolicy.requiresExclusivePeople(query)) {
+            namedPeople.forEach { label ->
+                root = intersect(root, ExecutionNode.Predicate(ExecutionField.PEOPLE_ONLY, label))
+            }
+        }
+        if (expectedMedia != null && !retainedExpectedMedia) {
+            root = intersect(root, ExecutionNode.Predicate(ExecutionField.MIME_TYPE, expectedMedia.label()))
+        }
+        dateBounds?.let { (from, to) ->
+            if (from.isNotBlank()) root = intersect(root, ExecutionNode.Predicate(ExecutionField.FROM_DATE, from))
+            if (to.isNotBlank()) root = intersect(root, ExecutionNode.Predicate(ExecutionField.TO_DATE, to))
+        }
+        root = intersect(
+            root,
+            ExecutionNode.Predicate(ExecutionField.QUERY_CATEGORY, expectedCategory.wireName),
+        )
+        root = ExecutionNode.Binary(
+            ExecutionNode.Predicate(ExecutionField.ANSWER_NEEDED, AnswerIntentPolicy.expected(query).toString()),
+            ExecutionBinaryOperator.INTERSECT,
+            root,
+        )
+        if (QuerySortConstraintPolicy.requiresDateSort(query, expectedCategory)) {
+            root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
+        } else if (QuerySortConstraintPolicy.requiresLocationSort(query)) {
+            root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)
+        }
+        return QueryExecutionSpec(root)
+    }
+
+    /**
+     * E2B occasionally omits the closing bracket immediately before the top-level
+     * `&&` in a routing predicate, for example `[query_category == doc && ...`.
+     * This changes no query term or operator: only the two fixed envelope fields
+     * and their finite allowed values are eligible. The normal parser and every
+     * production validator still run after this recovery.
+     */
+    internal fun repairUnambiguousEnvelopeBracket(candidate: String): String {
+        // E2B can collapse both fixed routing predicates into a single
+        // opening bracket: `[answer_needed == false && query_category ==
+        // person && [people_only == Ravi]]`. Recover only that finite grammar
+        // shell, retaining the model-authored retrieval predicate untouched.
+        collapsedRoutingEnvelope.matchEntire(candidate)?.let { match ->
+            return "[answer_needed == ${match.groupValues[1]}] && " +
+                "[query_category == ${match.groupValues[2]}] && ${match.groupValues[3]}"
+        }
+        return missingEnvelopeBracket.replace(candidate) { match ->
+            "[${match.groupValues[1]} == ${match.groupValues[2]}] &&"
+        }
     }
 
     internal fun validatePlannerOcrSyntax(candidate: String) {
@@ -506,7 +763,7 @@ internal object QueryCategoryConstraintPolicy {
         }
         if (
             Regex(
-                "^(?:where|what\\s+(?:place|places|location|locations)|" +
+                "^(?:where|what\\s+(?:place|places|location|locations)|how\\s+many\\s+(?:places|locations|cities)|" +
                     "which\\s+(?:place|places|location|locations|city|cities|national\\s+parks?))\\b",
             ).containsMatchIn(normalized) ||
             Regex("^which\\s+(?:photos?|pictures?|images?)\\b.*\\b(?:in|at|from)\\b")
@@ -528,6 +785,20 @@ internal object QueryCategoryConstraintPolicy {
     }
 
     private fun isWrittenDocumentAnswer(query: String): Boolean {
+        // These are document/OCR searches even when the user does not phrase
+        // the request as a specific printed field (for example, "insurance"
+        // or "property tax"). They must never fall into visual scenery.
+        if (
+            Regex(
+                "\\b(?:insurance|tax|property\\s+tax|receipts?|recipts?|bills?|invoices?|" +
+                    "sale\\s+deeds?|government\\s+(?:id|ids|identification)|govt\\.?\\s*(?:id|ids)|" +
+                    "identification(?:\\s+(?:doc|docs|document|documents))?|coupons?|tickets?|" +
+                    "marks?|mark\\s*sheet|report\\s*card|transcript|certificates?|cerficiates?|" +
+                    "passport|licen[cs]e|identity\\s+card|id\\s+card|aadhaa?r(?:d)?|pan\\s+card)\\b",
+            ).containsMatchIn(query)
+        ) {
+            return true
+        }
         if (
             Regex("\\bhow\\s+much\\b|\\b(?:spend|spent|paid|payment|cost|price|total|amount)\\b")
                 .containsMatchIn(query)
@@ -736,7 +1007,7 @@ internal object QueryStructuredIntentPolicy {
         }
     }
 
-    private fun requiresExclusivePeople(query: String): Boolean = Regex(
+    internal fun requiresExclusivePeople(query: String): Boolean = Regex(
         "(?i)\\b(?:only|alone|by\\s+themselves|no\\s+other\\s+(?:human|person|people))\\b",
     ).containsMatchIn(query)
 
@@ -830,7 +1101,7 @@ internal object QueryStructuredIntentPolicy {
             "^(?:who|when)\\b.*\\b(?:appear|appears|appeared|was|were)\\b.*\\bwith\\b",
         ).containsMatchIn(normalized)
         val placeList = Regex(
-            "^(?:what|which)\\s+(?:places|locations|cities)\\b.*\\bvisit(?:ed)?\\b",
+            "^(?:what|which|how\\s+many)\\s+(?:places|locations|cities)\\b.*\\bvisit(?:ed)?\\b",
         ).containsMatchIn(normalized)
         return coOccurrence || placeList
     }
@@ -942,20 +1213,21 @@ internal object SelfPersonQueryPolicy {
 
 /** Validates result-order operators that are explicit in the query contract. */
 internal object QuerySortConstraintPolicy {
-    fun validate(query: String, plan: QueryPlan) {
-        val normalized = query.lowercase().replace(Regex("\\s+"), " ")
-        val requiresDateSort = plan.queryCategory == QueryCategory.TIME ||
+    internal fun requiresDateSort(query: String, category: QueryCategory): Boolean =
+        category == QueryCategory.TIME ||
             Regex("\\b(?:latest|newest|earliest|most\\s+recent|last\\s+time)\\b")
-                .containsMatchIn(normalized)
-        if (requiresDateSort) {
+                .containsMatchIn(query.lowercase().replace(Regex("\\s+"), " "))
+
+    internal fun requiresLocationSort(query: String): Boolean = Regex(
+        "^(?:what|which|how\\s+many)\\s+(?:places|locations|cities|national\\s+parks?)\\b|" +
+            "\\b(?:north\\s+to\\s+south|south\\s+to\\s+north)\\b",
+    ).containsMatchIn(query.lowercase().replace(Regex("\\s+"), " "))
+
+    fun validate(query: String, plan: QueryPlan) {
+        if (requiresDateSort(query, plan.queryCategory)) {
             require(plan.recentFirst) { "This query requires SORT_DATE" }
         }
-        val requiresLocationSort =
-            Regex(
-                "^(?:what|which)\\s+(?:places|locations|cities|national\\s+parks?)\\b|" +
-                    "\\b(?:north\\s+to\\s+south|south\\s+to\\s+north)\\b",
-            ).containsMatchIn(normalized)
-        if (requiresLocationSort) {
+        if (requiresLocationSort(query)) {
             require(plan.sortByLocation) { "This query requires SORT_LOC" }
         } else {
             require(!plan.sortByLocation) {

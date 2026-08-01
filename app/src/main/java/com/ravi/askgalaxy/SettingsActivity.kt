@@ -15,6 +15,8 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
@@ -31,10 +33,12 @@ class SettingsActivity : Activity() {
     private lateinit var locationPermissionButton: Button
     private lateinit var personalContextStatus: TextView
     private lateinit var personalContextToggle: Switch
+    private lateinit var gemmaModelChoice: RadioGroup
     private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
     private val handler = Handler(Looper.getMainLooper())
     private val contextExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var updatingContextToggle = false
+    private var updatingGemmaModelChoice = false
     private var personalContextBaseStatus = ""
     private val refresh = object : Runnable {
         override fun run() {
@@ -111,6 +115,39 @@ class SettingsActivity : Activity() {
             textSize = 20f
             setTypeface(typeface, Typeface.BOLD)
             setPadding(0, 12, 0, 12)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Gemma model"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, 4)
+        }, wrap())
+        gemmaModelChoice = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(gemmaOption(GemmaModelVariant.E2B, "E2B • faster, smaller download"))
+            addView(gemmaOption(GemmaModelVariant.E4B, "E4B • stronger, larger download"))
+            setOnCheckedChangeListener { _, checkedId ->
+                if (updatingGemmaModelChoice) return@setOnCheckedChangeListener
+                val selected = when (checkedId) {
+                    GemmaModelVariant.E2B.ordinal -> GemmaModelVariant.E2B
+                    else -> GemmaModelVariant.E4B
+                }
+                if (GemmaModelSelection.select(this@SettingsActivity, selected)) {
+                    Toast.makeText(
+                        this@SettingsActivity,
+                        "${selected.displayName} selected. It will download in the background if needed.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    refreshState()
+                }
+            }
+        }
+        root.addView(gemmaModelChoice, wrap())
+        root.addView(TextView(this).apply {
+            text = "Switching never touches your gallery, OCR, or SigLIP index. Downloaded model files are kept so you can switch back later."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 0, 0, 12)
         }, wrap())
         models = TextView(this).apply {
             textSize = 14f
@@ -412,7 +449,11 @@ class SettingsActivity : Activity() {
         val snapshot = PreparationStore(this).read()
         summary.text = snapshot.message
         progress.progress = snapshot.percent
-        models.text = ModelCatalog.all.joinToString("\n") { artifact ->
+        val selectedGemma = ModelCatalog.gemma(this)
+        updatingGemmaModelChoice = true
+        gemmaModelChoice.check(GemmaModelSelection.selected(this).ordinal)
+        updatingGemmaModelChoice = false
+        models.text = ModelCatalog.all(this).joinToString("\n") { artifact ->
             val state = when {
                 artifact.isInstalled(this) -> "Installed"
                 !artifact.required -> "Optional / not installed"
@@ -444,11 +485,11 @@ class SettingsActivity : Activity() {
                 }
             }.getOrDefault(-1 to -1)
             val progressStore = IndexProgressStore(this)
-            if (ModelCatalog.gemma.isInstalled(this)) {
+            if (selectedGemma.isInstalled(this)) {
                 progressStore.update(
                     IndexProgressStage.MODELS,
-                    ModelCatalog.gemma.expectedBytes,
-                    ModelCatalog.gemma.expectedBytes,
+                    selectedGemma.expectedBytes,
+                    selectedGemma.expectedBytes,
                     completed = true,
                 )
             }
@@ -485,6 +526,14 @@ class SettingsActivity : Activity() {
                 }
             }
         }
+    }
+
+    private fun gemmaOption(variant: GemmaModelVariant, label: String): RadioButton = RadioButton(this).apply {
+        id = variant.ordinal
+        text = label
+        textSize = 14f
+        setTextColor(Color.rgb(50, 52, 60))
+        setPadding(0, 0, 0, 2)
     }
 
     private fun updateStageProgress(progress: Map<IndexProgressStage, StageProgress>) {

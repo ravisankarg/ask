@@ -1,6 +1,7 @@
 package com.ravi.askgalaxy
 
 import java.time.LocalDate
+import java.time.ZoneId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -8,6 +9,156 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class QueryAndDiversityContractTest {
+    @Test
+    fun answer_output_guard_rejects_query_protocol_and_repeated_question() {
+        assertTrue(
+            AnswerOutputGuard.needsRetry(
+                "QUERY: What is Ramani's location in the captured photos?",
+                "What is Ramani's location in the captured photos?",
+            ),
+        )
+        assertTrue(
+            AnswerOutputGuard.needsRetry(
+                "What is Ramani's location in the captured photos?",
+                "What is Ramani's location in the captured photos?",
+            ),
+        )
+        assertFalse(
+            AnswerOutputGuard.needsRetry(
+                "The matching photos were taken in Bengaluru.",
+                "Where were the photos taken?",
+            ),
+        )
+    }
+
+    @Test
+    fun event_photo_date_grounding_answers_from_matched_capture_days() {
+        val eventDay = LocalDate.of(2025, 4, 3)
+            .atStartOfDay(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+        val answer = EventPhotoDateGrounding.constrainAnswer(
+            "when is Ramani birthday?",
+            "I could not confirm it.",
+            listOf(media(1).copy(dateTakenMs = eventDay), media(2).copy(dateTakenMs = eventDay)),
+        )
+
+        assertEquals("The matching event photos were taken on 3 April 2025.", answer)
+        assertFalse(EventPhotoDateGrounding.applies("what is Ramani passport number"))
+    }
+
+    @Test
+    fun planner_recovers_only_the_unambiguous_missing_envelope_bracket() {
+        val emitted =
+            "[answer_needed == true] && [query_category == doc && " +
+                "[[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]"
+
+        val repaired = QueryPlannerRuntime.repairUnambiguousEnvelopeBracket(emitted)
+
+        assertEquals(
+            "[answer_needed == true] && [query_category == doc] && " +
+                "[[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]",
+            repaired,
+        )
+        assertEquals(QueryCategory.DOC, QueryExecutionSpec.parse(repaired).requiredQueryCategory())
+        assertEquals(repaired, QueryPlannerRuntime.repairUnambiguousEnvelopeBracket(repaired))
+    }
+
+    @Test
+    fun planner_recovers_the_collapsed_two_field_routing_envelope() {
+        val emitted = "[answer_needed == true && query_category == scenary && [semantic == motorcycle bike]]"
+
+        val repaired = QueryPlannerRuntime.repairUnambiguousEnvelopeBracket(emitted)
+
+        assertEquals(
+            "[answer_needed == true] && [query_category == scenary] && [semantic == motorcycle bike]",
+            repaired,
+        )
+        assertEquals(QueryCategory.SCENARY, QueryExecutionSpec.parse(repaired).requiredQueryCategory())
+    }
+
+    @Test
+    fun planner_normalizes_explicit_person_only_date_and_answer_routing_constraints() {
+        val known = listOf("Ravi", "Ramani")
+        fun normalized(query: String, emitted: String): QueryPlan {
+            val spec = QueryPlannerRuntime.normalizeFiniteConstraints(
+                QueryExecutionSpec.parse(emitted),
+                query,
+                known,
+            )
+            return ExecutionSpecCompiler.compile(spec)
+        }
+
+        val onlyLastWeek = normalized(
+            "Ramani only photos last week",
+            "[answer_needed == true] && [query_category == person] && " +
+                "[[mime type == photos] && [person == Ramani]]",
+        )
+        assertFalse(onlyLastWeek.needsAnswer)
+        assertEquals(QueryCategory.SCENARY, onlyLastWeek.queryCategory)
+        assertEquals(listOf("Ramani"), onlyLastWeek.personNames)
+        assertEquals(listOf("Ramani"), onlyLastWeek.onlyPersonNames)
+        assertEquals(QueryMediaType.PHOTOS, onlyLastWeek.mediaType)
+        assertEquals(QueryScopeParser.explicitDateBoundsFromQuery("last week")!!.first, onlyLastWeek.fromDate)
+        assertEquals(QueryScopeParser.explicitDateBoundsFromQuery("last week")!!.second, onlyLastWeek.toDate)
+
+        val places = normalized(
+            "how many places Ramani visited last year",
+            "[answer_needed == true] && [query_category == person] && " +
+                "[[semantic == places visited by Ramani]]",
+        )
+        assertTrue(places.needsAnswer)
+        assertEquals(QueryCategory.LOCATION, places.queryCategory)
+        assertEquals(listOf("Ramani"), places.personNames)
+        assertTrue(places.sortByLocation)
+        assertTrue(places.semanticQueries.isEmpty())
+
+        val birthday = normalized(
+            "when is Ramani birthday",
+            "[answer_needed == true] && [query_category == person] && " +
+                "[[person == Ramani] && [semantic == birthday]]",
+        )
+        assertEquals(QueryCategory.TIME, birthday.queryCategory)
+        assertTrue(birthday.recentFirst)
+
+        val dancing = normalized(
+            "Ramani dancing",
+            "[answer_needed == false] && [query_category == person] && " +
+                "[[mime type == photos] && [semantic == Ramani dancing]]",
+        )
+        assertEquals(QueryCategory.SCENARY, dancing.queryCategory)
+        assertEquals(listOf("Ramani"), dancing.personNames)
+        assertEquals(listOf("dancing"), dancing.semanticQueries)
+
+        val pair = normalized(
+            "Ravi and Ramani in 2015",
+            "[answer_needed == true] && [query_category == person] && " +
+                "[[semantic == Ravi and Ramani]]",
+        )
+        assertFalse(pair.needsAnswer)
+        assertEquals(QueryCategory.SCENARY, pair.queryCategory)
+        assertEquals(listOf("Ravi", "Ramani"), pair.personNames)
+        assertEquals("2015-01-01", pair.fromDate)
+        assertEquals("2015-12-31", pair.toDate)
+
+        val odyssey = normalized(
+            "how much is odyssy movie",
+            "[answer_needed == true] && [query_category == doc] && " +
+                "[[semantic == Odyssey movie ticket cost] + [ocr == {cost} && {amount}]]",
+        )
+        assertEquals(QueryCategory.DOC, odyssey.queryCategory)
+        assertEquals(listOf("Odyssey movie ticket"), odyssey.semanticQueries)
+        assertEquals(listOf("Odyssey ticket"), odyssey.ocrTerms)
+
+        val namedPassport = normalized(
+            "what is Ravi passport number",
+            "[answer_needed == true] && [query_category == doc] && " +
+                "[[semantic == passport identity document] + [ocr == {passport} && {number}]]",
+        )
+        assertTrue(namedPassport.personNames.isEmpty())
+        assertEquals(listOf("Ravi passport"), namedPassport.ocrTerms)
+    }
+
     @Test
     fun formal_execution_spec_round_trips_requested_person_subtraction() {
         val raw =
@@ -91,6 +242,14 @@ class QueryAndDiversityContractTest {
         assertFalse(QueryCategory.TIME.answerEvidenceScope().needsVisual)
         assertEquals(4, QueryCategoryContextPolicy.answerImageLimit(QueryCategory.SCENARY))
         assertEquals(0, QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC))
+        assertEquals(
+            4,
+            QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC, GemmaModelVariant.E2B),
+        )
+        assertEquals(
+            0,
+            QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC, GemmaModelVariant.E4B),
+        )
         assertEquals(512, QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_MAX_DIMENSION)
     }
 
@@ -130,29 +289,24 @@ class QueryAndDiversityContractTest {
     fun planner_prompt_requires_gemma_category_and_searchable_semantics() {
         val prompt = QueryPlannerRuntime.plannerSystemInstruction()
 
-        assertTrue(prompt.contains("Gemma 4 E4B is the only plan author"))
+        assertTrue(prompt.contains("private query compiler"))
         assertTrue(prompt.contains("[query_category == CATEGORY]"))
         assertTrue(prompt.contains("doc, scenary, person, location, or time"))
-        assertTrue(prompt.contains("Explicit photo/picture/image wording requires"))
-        assertTrue(prompt.contains("semantic is one compact conceptual phrase"))
-        assertTrue(prompt.contains("OCR HYBRID FOR EVERY DOC QUERY"))
-        assertTrue(prompt.contains("BROAD DOCUMENT EXPANSION"))
-        assertTrue(prompt.contains("Never use spending, expenses"))
-        assertTrue(prompt.contains("SELF PERSON"))
-        assertTrue(prompt.contains("DOC PERSON NAMES"))
-        assertTrue(prompt.contains("NEVER put `+`, `-`, `&&`"))
-        assertTrue(prompt.contains("Never infer today"))
+        assertTrue(prompt.contains("Each ordinary bracket is exactly [field == value]"))
+        assertTrue(prompt.contains("Every doc plan has exactly one fused hybrid"))
         assertTrue(prompt.contains("who is in these beach photos"))
         assertTrue(prompt.contains("where was the lighthouse photo taken"))
         assertTrue(prompt.contains("when did I visit Goa"))
-        assertTrue(prompt.contains("odyssy movie ticket"))
+        assertTrue(prompt.contains("Odyssey movie ticket"))
         assertTrue(prompt.contains("how much did I spend last month"))
-        assertTrue(prompt.contains("what is Ravi passport number"))
-        assertTrue(prompt.contains("what is Ravi Aadhaar number"))
-        assertTrue(prompt.contains("what is the Wi-Fi password"))
-        assertTrue(prompt.contains("when does my driving licence expire"))
+        assertTrue(prompt.contains("Ravi passport number"))
+        assertTrue(prompt.contains("photos of Ravi only"))
+        assertTrue(prompt.contains("The field is person, never people"))
         assertTrue(prompt.contains("[ocr == {Ravi} && {passport}]"))
-        assertTrue(prompt.contains("never person/self/me/my/owner aliases"))
+        assertTrue(prompt.length < 6_000)
+        val examples = prompt.lineSequence().filter { " => " in it }.toList()
+        assertTrue(examples.isNotEmpty())
+        assertTrue(examples.all { "[answer_needed ==" in it && "[query_category ==" in it })
     }
 
     @Test
@@ -364,6 +518,12 @@ class QueryAndDiversityContractTest {
             "What is Ravi DOB?",
             "What is Ravi age?",
             "What are Ravi exam marks?",
+            "show insurance documents",
+            "property tax",
+            "sale deed",
+            "government identification docs",
+            "coupons and tickets",
+            "certificates",
         ).forEach { query ->
             assertEquals(
                 "Expected doc for '$query'",
@@ -377,6 +537,14 @@ class QueryAndDiversityContractTest {
                 "What did I eat on my trip to Barcelona?",
             ),
         )
+        listOf("Ramani dancing", "sleeping photos", "running", "playing cricket", "mountain hike", "dog")
+            .forEach { query ->
+                assertEquals(
+                    "Expected scenary for '$query'",
+                    QueryCategory.SCENARY,
+                    QueryCategoryConstraintPolicy.expectedCategory(query),
+                )
+            }
     }
 
     @Test
@@ -631,50 +799,14 @@ class QueryAndDiversityContractTest {
     fun planner_prompt_covers_residual_who_where_and_exact_day_contracts() {
         val prompt = QueryPlannerRuntime.plannerSystemInstruction()
 
-        assertTrue(prompt.contains("who else was with Meghana at the team outing"))
-        assertTrue(
-            prompt.contains(
-                "who appears most often with Ramani => " +
-                    "[query_category == person] && [person == Ramani]",
-            ),
-        )
-        assertTrue(
-            prompt.contains(
-                "which people joined both the Goa trip and the mountain trek => " +
-                    "[query_category == person] && " +
-                    "[[location == Goa] && [semantic == mountain trek]]",
-            ),
-        )
-        assertTrue(
-            prompt.contains(
-                "[[from_date == 2025-10-05] && [to_date == 2025-10-05] && " +
-                    "[semantic == dinner]]",
-            ),
-        )
-        assertTrue(
-            prompt.contains(
-                "where did we camp during the latest mountain trip => " +
-                    "[query_category == location] && [semantic == mountain campsite] SORT_DATE",
-            ),
-        )
-        assertTrue(
-            prompt.contains(
-                "where did my Bengaluru-to-Goa road trip stop for lunch => " +
-                    "[query_category == location] && " +
-                    "[semantic == lunch stop on Bengaluru-to-Goa road trip]",
-            ),
-        )
-        assertTrue(
-            prompt.contains(
-                "excluding restaurant screenshots => [query_category == person] && " +
-                    "[[[person == Ravi] && [semantic == birthday celebration]] - " +
-                    "[semantic == restaurant screenshot]]",
-            ),
-        )
+        assertTrue(prompt.contains("[person == Ravi] && [from_date == 2025-10-05]"))
+        assertTrue(prompt.contains("when did I visit Goa"))
+        assertTrue(prompt.contains("SORT_DATE"))
+        assertTrue(prompt.contains("Complete subtraction before a final sort"))
 
         val groupedExclusion = ExecutionSpecCompiler.compile(
             QueryExecutionSpec.parse(
-                "[query_category == person] && " +
+                "[answer_needed == true] && [query_category == person] && " +
                     "[[[person == Ravi] && [semantic == birthday celebration]] - " +
                     "[semantic == restaurant screenshot]]",
             ),
@@ -1051,6 +1183,191 @@ class QueryAndDiversityContractTest {
         assertEquals(2L, context.records.first().mediaStoreId)
         assertFalse(context.includeVisuals)
         assertEquals(0, embeddingDiversityCalls)
+    }
+
+    @Test
+    fun document_context_uses_local_ocr_evidence_over_incidental_document_mentions() {
+        val incidentalTicket = media(1).copy(
+            ocrText = "Ravi Kumar\nBooking reference number ZX91\nLocalization: passport",
+            contentClass = MediaContentClass.DOC,
+        )
+        val incidentalInsurance = media(2).copy(
+            ocrText = "Ravi Kumar\nPolicy number AB22\nClassification: passport document",
+            contentClass = MediaContentClass.DOC,
+        )
+        val oldPassport = media(3).copy(
+            ocrText = "REPUBLIC OF INDIA\nRavi Kumar\nPassport No. OLD1234",
+            contentClass = MediaContentClass.DOC,
+        )
+        val newPassport = media(4).copy(
+            ocrText = "REPUBLIC OF INDIA\nRavi Kumar\nPassport No. NEW5678",
+            contentClass = MediaContentClass.DOC,
+        )
+        val picker = AnswerContextPicker { values, maxCount -> values.take(maxCount) }
+
+        val context = picker.pick(
+            query = "Ravi passport number",
+            rankedCandidates = listOf(incidentalTicket, incidentalInsurance, oldPassport, newPassport),
+            evidenceGroups = emptyList(),
+            evidenceScope = QueryCategory.DOC.answerEvidenceScope(),
+            queryCategory = QueryCategory.DOC,
+            ocrKeywords = listOf("ravi", "passport"),
+            maxRecords = 2,
+        )
+
+        assertEquals(listOf(3L, 4L), context.records.map { it.mediaStoreId })
+    }
+
+    @Test
+    fun document_context_never_fills_top_four_with_semantic_only_records() {
+        val odysseyOne = media(1).copy(
+            ocrText = "ODYSSEY\nMovie ticket\nTotal Amount ₹354",
+            contentClass = MediaContentClass.DOC,
+        )
+        val flightTicket = media(2).copy(
+            ocrText = "Flight ticket\nTotal Amount ₹3400",
+            contentClass = MediaContentClass.DOC,
+        )
+        val odysseyTwo = media(3).copy(
+            ocrText = "ODYSSEY\nTicket booking\nGrand Total ₹354",
+            contentClass = MediaContentClass.DOC,
+        )
+        val picker = AnswerContextPicker { values, maxCount -> values.take(maxCount) }
+
+        val context = picker.pick(
+            query = "How much was the Odyssey movie ticket?",
+            rankedCandidates = listOf(odysseyOne, flightTicket, odysseyTwo),
+            evidenceGroups = emptyList(),
+            evidenceScope = QueryCategory.DOC.answerEvidenceScope(),
+            queryCategory = QueryCategory.DOC,
+            ocrKeywords = listOf("odyssey", "ticket"),
+            maxRecords = 4,
+        )
+
+        assertEquals(listOf(1L, 3L), context.records.map { it.mediaStoreId })
+        assertEquals(2, context.eligibleCandidateCount)
+    }
+
+    @Test
+    fun document_follow_up_keeps_original_ocr_anchor_when_its_new_word_is_not_printed() {
+        val odysseyTicket = media(1).copy(
+            ocrText = "ODYSSEY\nMovie ticket\n12 May 2026\nTotal Amount ₹354",
+            contentClass = MediaContentClass.DOC,
+        )
+        val unrelatedTicket = media(2).copy(
+            ocrText = "Flight ticket\n12 May 2026\nTotal Amount ₹3400",
+            contentClass = MediaContentClass.DOC,
+        )
+        val picker = AnswerContextPicker { values, maxCount -> values.take(maxCount) }
+
+        val context = picker.pick(
+            query = "What date is on it?",
+            rankedCandidates = listOf(odysseyTicket, unrelatedTicket),
+            evidenceGroups = emptyList(),
+            evidenceScope = AnswerEvidenceScope.all(),
+            queryCategory = QueryCategory.DOC,
+            // The original Odyssey search, not the follow-up text, provides
+            // this pronoun's document anchor.
+            ocrKeywords = listOf("odyssey", "ticket"),
+            maxRecords = 4,
+        )
+
+        assertEquals(listOf(1L), context.records.map { it.mediaStoreId })
+    }
+
+    @Test
+    fun ocr_packer_matches_no_abbreviation_to_a_number_query() {
+        val packed = OcrAnswerContextPacker.pack(
+            query = "Ravi passport number",
+            ocrText = """
+                P<INDRAVI<<SANKAR
+                15/03/2022
+                INDIAN NEW5678
+                Nationality
+                Passport No.
+            """.trimIndent(),
+        )
+
+        assertTrue(packed.proofLines.contains("INDIAN NEW5678"))
+        assertTrue(packed.proofLines.contains("Passport No."))
+    }
+
+    @Test
+    fun document_amount_grounding_rejects_an_unrelated_plausible_total() {
+        val odysseyTicket = media(1).copy(
+            ocrText = """
+                ODYSSEY
+                Movie Ticket
+                Base Price: ₹ 300
+                GST: ₹ 54
+                Total Amount: ₹ 354
+            """.trimIndent(),
+            contentClass = MediaContentClass.DOC,
+        )
+        val unrelatedReceipt = media(2).copy(
+            ocrText = """
+                Flight booking
+                Total Amount: ₹ 3400
+            """.trimIndent(),
+            contentClass = MediaContentClass.DOC,
+        )
+        val query = "How much did I spend on the Odyssey movie ticket?"
+
+        val decision = DocumentAmountGrounding.analyse(query, listOf(odysseyTicket, unrelatedReceipt))
+
+        assertEquals("₹ 354", decision.selected?.value)
+        assertEquals(
+            "The amount is ₹ 354.",
+            DocumentAmountGrounding.constrainAnswer(
+                query,
+                "The Odyssey movie ticket cost ₹ 3400.",
+                listOf(odysseyTicket, unrelatedReceipt),
+            ),
+        )
+    }
+
+    @Test
+    fun document_amount_grounding_leaves_equally_credible_distinct_totals_for_review() {
+        val first = media(1).copy(ocrText = "ODYSSEY\nTotal Amount: ₹ 354")
+        val second = media(2).copy(ocrText = "ODYSSEY\nTotal Amount: ₹ 400")
+        val query = "What was the Odyssey ticket total?"
+
+        assertEquals(
+            null,
+            DocumentAmountGrounding.analyse(query, listOf(first, second)).selected,
+        )
+    }
+
+    @Test
+    fun answer_review_gate_skips_routine_scene_answers_but_reviews_direct_fields_and_ocr_conflicts() {
+        val ordinaryScene = media(1).copy(ocrText = "")
+        assertEquals(
+            null,
+            AnswerReviewGate.reason(
+                query = "What is happening at the beach?",
+                draft = "People are walking beside the sea.",
+                records = listOf(ordinaryScene),
+            ),
+        )
+        assertEquals(
+            AnswerReviewGate.Reason.DIRECT_FIELD,
+            AnswerReviewGate.reason(
+                query = "What is the passport number?",
+                draft = "The passport number is A1234567.",
+                records = listOf(ordinaryScene.copy(ocrText = "Passport No. A1234567")),
+            ),
+        )
+        assertEquals(
+            AnswerReviewGate.Reason.CONFLICTING_OCR,
+            AnswerReviewGate.reason(
+                query = "Which date is shown?",
+                draft = "The date is 12/03/2025.",
+                records = listOf(
+                    ordinaryScene.copy(ocrText = "Date 12/03/2025"),
+                    media(2).copy(ocrText = "Date 14/03/2025"),
+                ),
+            ),
+        )
     }
 
     @Test

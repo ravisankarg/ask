@@ -197,6 +197,11 @@ class QueryPlannerOnlyAuditTest {
         if (requiresSemantic) {
             check(plan.semanticQueries.isNotEmpty()) { "missing positive semantic retrieval phrase" }
         }
+        requiredSemanticTerms.forEach { expected ->
+            check(plan.semanticQueries.any { it.contains(expected, ignoreCase = true) }) {
+                "missing semantic term '$expected' in ${plan.semanticQueries}"
+            }
+        }
         if (forbidsSemantic) {
             check(plan.semanticQueries.isEmpty()) {
                 "metadata-only query gained positive semantic filter '${plan.semanticQueries.joinToString()}'"
@@ -249,6 +254,7 @@ class QueryPlannerOnlyAuditTest {
         val expectedAnswerNeeded: Boolean = expectedCategory != QueryCategory.SCENARY,
         val expectedOnlyPeople: Set<String> = emptySet(),
         val requiresSemantic: Boolean = true,
+        val requiredSemanticTerms: Set<String> = emptySet(),
         val forbidsSemantic: Boolean = false,
         val requiresNegativeSemantic: Boolean = false,
         val requiresDateSort: Boolean = false,
@@ -295,7 +301,7 @@ class QueryPlannerOnlyAuditTest {
     }
 
     private companion object {
-        const val TAG = "QP_ONLY_57"
+        const val TAG = "QP_ONLY_60"
         val KNOWN_PEOPLE = listOf("Ravi", "Meghana", "Ramani")
         const val SELF_PERSON = "Ravi"
 
@@ -352,6 +358,16 @@ class QueryPlannerOnlyAuditTest {
             AuditCase(
                 "D11", QueryCategory.DOC, "simple", "clear",
                 "Ravi passport number",
+            ),
+            AuditCase(
+                "D12", QueryCategory.DOC, "medium", "clear",
+                "What are both passport numbers in my passport photos?",
+                expectedMedia = QueryMediaType.PHOTOS,
+            ),
+            AuditCase(
+                "D13", QueryCategory.DOC, "medium", "clear",
+                "What date is printed on my Odyssey movie ticket?",
+                requiredSemanticTerms = setOf("date"),
             ),
 
             AuditCase(
@@ -431,6 +447,12 @@ class QueryPlannerOnlyAuditTest {
                 requiredPeople = setOf("Ravi", "Ramani"),
                 expectedOnlyPeople = setOf("Ravi", "Ramani"),
                 expectedAnswerNeeded = false,
+            ),
+            AuditCase(
+                "S14", QueryCategory.SCENARY, "simple", "clear",
+                "What bike did I have?",
+                expectedAnswerNeeded = true,
+                requiredSemanticTerms = setOf("bike"),
             ),
 
             AuditCase(

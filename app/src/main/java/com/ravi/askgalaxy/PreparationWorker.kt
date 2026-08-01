@@ -60,7 +60,9 @@ class PreparationWorker(
         store.write(snapshot)
         setForeground(PreparationNotifier.foregroundInfo(applicationContext, snapshot))
 
-        val indexingModels = ModelCatalog.all.filter { it.required && it != ModelCatalog.gemma }
+        val selectedGemma = ModelCatalog.gemma(applicationContext)
+        val indexingModels = ModelCatalog.all(applicationContext)
+            .filter { it.required && it != selectedGemma }
         val installer = ModelInstaller(applicationContext)
         val report = installer.installArtifacts(indexingModels) { progress ->
             snapshot = snapshot.copy(

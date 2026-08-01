@@ -14,9 +14,9 @@
 
     <application
         android:allowBackup="false"
-        android:icon="@drawable/ask_galaxy_icon"
+        android:icon="@drawable/ask_galaxy_icon_ai"
         android:label="@string/app_name"
-        android:roundIcon="@drawable/ask_galaxy_icon"
+        android:roundIcon="@drawable/ask_galaxy_icon_ai"
         android:supportsRtl="true"
         android:theme="@style/Theme.AskGalaxy">
         <!-- LiteRT-LM vision runs on the device GPU while the frozen QP and
