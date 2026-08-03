@@ -38,7 +38,7 @@ class GalleryIndexer(context: Context) {
     private val semanticIndexer = GallerySemanticIndexer(appContext, database)
     private val metadataReader = GalleryMetadataReader(appContext)
     private val structuredSearchExecutor =
-        StructuredSearchExecutor(database, semanticIndexer, metadataReader)
+        StructuredSearchExecutor(database, semanticIndexer, metadataReader, appContext)
     private val evidenceBuilder = EvidenceBuilder(database)
     private val answerContextPicker = AnswerContextPicker(semanticIndexer)
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -174,6 +174,7 @@ class GalleryIndexer(context: Context) {
                         evidenceScope = searchExecution.answerEvidenceScope,
                         queryCategory = searchExecution.queryCategory,
                         ocrKeywords = searchExecution.ocrKeywords,
+                        useKvIndex = KvIndexPreferences.isEnabled(appContext),
                         maxRecords = MAX_ANSWER_RECORDS,
                     )
                     Log.i(
@@ -497,7 +498,8 @@ class GalleryIndexer(context: Context) {
                 val output = reviewGroundedAnswer(
                     gemma = gemma,
                     query = query,
-                    draft = DocumentAmountGrounding.constrainAnswer(query, generatedOutput, attachedResults),
+                    draft = if (KvIndexPreferences.isEnabled(appContext)) generatedOutput else
+                        DocumentAmountGrounding.constrainAnswer(query, generatedOutput, attachedResults),
                     results = attachedResults,
                     images = imageBytes,
                 )
@@ -600,7 +602,23 @@ class GalleryIndexer(context: Context) {
                 // persisted SigLIP image similarity with exact OCR evidence.
                 // The Context Picker then applies its normal top-four visual
                 // diversity policy to this fresh hybrid order.
-                val semanticScores = semanticIndexer.searchNearestScoredBlocking(
+                val useKvIndex = KvIndexPreferences.isEnabled(appContext) &&
+                    currentResponse.queryCategory == QueryCategory.DOC
+                val semanticScores = if (useKvIndex) {
+                    runCatching {
+                        KvDocumentVectorIndex.open(appContext).use { index ->
+                            val embedding = SigLipTextEncoder.shared(appContext).encode(query)
+                            val result = index.search(
+                                embedding,
+                                currentResults.size.coerceAtLeast(1),
+                                currentResults.map { it.mediaStoreId }.toLongArray(),
+                            )
+                            result.ids.mapIndexed { position, id ->
+                                id to result.scores.getOrElse(position) { 0f }
+                            }.toMap()
+                        }
+                    }.getOrDefault(emptyMap())
+                } else semanticIndexer.searchNearestScoredBlocking(
                     queries = listOf(query),
                     limit = currentResults.size.coerceAtLeast(1),
                     allowlist = currentResults.map { it.mediaStoreId }.toLongArray(),
@@ -608,7 +626,7 @@ class GalleryIndexer(context: Context) {
                 val minSemantic = semanticScores.values.minOrNull() ?: 0f
                 val maxSemantic = semanticScores.values.maxOrNull() ?: 0f
                 val ocrScores = currentResults.associate { media ->
-                    media.mediaStoreId to followUpOcrLineMatchScore(query, media)
+                    media.mediaStoreId to if (useKvIndex) 0 else followUpOcrLineMatchScore(query, media)
                 }
                 val maxOcr = ocrScores.values.maxOrNull()?.coerceAtLeast(1) ?: 1
                 fun semanticScore(media: GalleryMedia): Float {
@@ -633,7 +651,7 @@ class GalleryIndexer(context: Context) {
                 // reranks only those existing grounded records. Falling back
                 // to the current top context is safe because it was already
                 // admitted by that same original conjunction.
-                val inheritedOcrKeywords = currentResponse.answerOcrKeywords
+                val inheritedOcrKeywords = if (useKvIndex) emptyList() else currentResponse.answerOcrKeywords
                     .ifEmpty { followUpOcrKeywords(query) }
                 val pickedFollowUpContext = answerContextPicker.pick(
                     query = query,
@@ -642,6 +660,7 @@ class GalleryIndexer(context: Context) {
                     evidenceScope = followUpScope,
                     queryCategory = followUpCategory,
                     ocrKeywords = inheritedOcrKeywords,
+                    useKvIndex = useKvIndex,
                     maxRecords = MAX_ANSWER_RECORDS,
                 )
                 val followUpContext = if (
@@ -789,7 +808,7 @@ class GalleryIndexer(context: Context) {
                     needsAnswer = effectivePlan.needsAnswer,
                     plannerProfile = plannedQuery.generationProfile,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
-                    ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                    ocrKeywords = if (KvIndexPreferences.isEnabled(appContext)) emptyList() else effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
@@ -809,7 +828,7 @@ class GalleryIndexer(context: Context) {
                 needsAnswer = effectivePlan.needsAnswer,
                 plannerProfile = plannedQuery.generationProfile,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
-                ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                ocrKeywords = if (KvIndexPreferences.isEnabled(appContext)) emptyList() else effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
             )
         }
     }
@@ -824,6 +843,7 @@ class GalleryIndexer(context: Context) {
         evidenceGroups: List<EvidenceGroup> = emptyList(),
     ): String {
         val includeImages = imageReferences.isNotEmpty()
+        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
         val useFullDocumentOcr = GemmaModelSelection.selected(appContext) == GemmaModelVariant.E2B
         val documentMaps = ArrayList<String>(results.size)
         var rawOcrChars = 0
@@ -870,20 +890,33 @@ class GalleryIndexer(context: Context) {
                 // still receive pixels, people, time, and location without
                 // spending prompt budget on unrelated text.
                 if (evidenceScope.needsOcr) {
-                    val packed = OcrAnswerContextPacker.pack(query, media.ocrText)
-                    rawOcrChars += packed.sourceChars
-                    val ocrForAnswer = if (useFullDocumentOcr) {
-                        media.ocrText.trim().ifBlank { "none" }
+                    val proofForAnswer: String
+                    val proofLabel: String
+                    if (useKvIndex) {
+                        // KV mode deliberately bypasses query-word OCR packing.
+                        // Retrieval and answer grounding both consume only the
+                        // model-produced document facts.
+                        proofForAnswer = media.kvText.trim().ifBlank { "none" }
+                        proofLabel = "document_facts"
+                        rawOcrChars += proofForAnswer.length
+                        documentMaps += "$label fields: $proofForAnswer"
                     } else {
-                        packed.proofLines
+                        val packed = OcrAnswerContextPacker.pack(query, media.ocrText)
+                        rawOcrChars += packed.sourceChars
+                        proofForAnswer = if (useFullDocumentOcr) {
+                            media.ocrText.trim().ifBlank { "none" }
+                        } else {
+                            packed.proofLines
+                        }
+                        proofLabel = "document_facts"
+                        documentMaps += "$label headings: ${packed.documentMap}"
                     }
-                    packedOcrChars += ocrForAnswer.length
-                    documentMaps += "$label headings: ${packed.documentMap}"
-                    val ocr = ocrForAnswer
+                    packedOcrChars += proofForAnswer.length
+                    val proof = proofForAnswer
                         .replace('"', '\'')
                         .ifBlank { "none" }
-                    append("\n  ocr_proof:\n")
-                    append(ocr.prependIndent("  "))
+                    append("\n  $proofLabel:\n")
+                    append(proof.prependIndent("  "))
                 }
             }
             label to fields
@@ -917,7 +950,11 @@ class GalleryIndexer(context: Context) {
                 "location=$location"
         }
         val answerDirective = answerDirective(query, includeImages)
-        val amountEvidence = DocumentAmountGrounding.promptEvidence(query, results)
+        val amountEvidence = if (useKvIndex) {
+            "none (KV index mode)"
+        } else {
+            DocumentAmountGrounding.promptEvidence(query, results)
+        }
         val contextEvidence = if (contextMatches.isEmpty()) {
             "none"
         } else {
@@ -931,8 +968,8 @@ class GalleryIndexer(context: Context) {
             includeImages ->
                 "IMAGE INPUTS: the four-or-fewer downscaled images map in order to " +
                     imageReferences.joinToString(", ") + ". For document questions, use each " +
-                    "image with that record's OCR_PROOF to distinguish documents and confirm label/value " +
-                    "layout; OCR remains primary for exact text."
+                    "image with that record's DOCUMENT_FACTS to distinguish documents and confirm label/value " +
+                    "layout; document facts remain primary for exact text."
             evidenceScope.needsVisual ->
                 "IMAGE INPUTS: unavailable. Do not make scene/activity claims."
             else ->
@@ -971,7 +1008,7 @@ class GalleryIndexer(context: Context) {
             RECORDS:
             $evidence
             $documentMapBlock$contextBlock$episodeBlock
-            Return only a direct, natural answer in at most $MAX_ANSWER_GENERATED_TOKENS generated tokens. For a direct document-field question, output exactly one concise sentence and stop. First compare the requested field across every supplied OCR_PROOF record and its matching visual tile: if one distinct supported value exists, state it; if two or more distinct supported values exist, state every distinct value rather than silently choosing one. For an amount question, a VERIFIED_AMOUNT_CANDIDATE is an exact OCR-backed value: copy only such a value, never calculate, infer, or substitute a plausible amount. Pair a value with an issue/expiry date only when that date is clearly adjacent in the same OCR proof; otherwise call them values from separate documents. Do not count duplicate scans of the same value twice. Do not reproduce OCR/evidence lines, but never suppress another direct supported value merely because the question is singular. Do not include a follow-up question, suggestion, question mark, source, provenance, or explanation of how the answer was found. Use a calibrated caveat only for a missing exact fact.
+            Return only a direct, natural answer in at most $MAX_ANSWER_GENERATED_TOKENS generated tokens. For a direct document-field question, output exactly one concise sentence and stop. First compare the requested field across every supplied DOCUMENT_FACTS record and its matching visual tile: if one distinct supported value exists, state it; if two or more distinct supported values exist, state every distinct value rather than silently choosing one. When supplied, a VERIFIED_AMOUNT_CANDIDATE is an exact document-backed value: copy only such a value, never calculate, infer, or substitute a plausible amount. Pair a value with an issue/expiry date only when that date is clearly associated in the same document facts; otherwise call them values from separate documents. Do not count duplicate scans of the same value twice. Do not reproduce document-fact/evidence lines, but never suppress another direct supported value merely because the question is singular. Do not include a follow-up question, suggestion, question mark, source, provenance, or explanation of how the answer was found. Use a calibrated caveat only for a missing exact fact.
             ANSWER:
         """.trimIndent()
         Log.i(
@@ -989,7 +1026,11 @@ class GalleryIndexer(context: Context) {
     private fun buildFollowUpEvidence(results: List<GalleryMedia>): String = results
         .take(MAX_ANSWER_RECORDS)
         .mapIndexed { index, media ->
-            val fields = OcrAnswerContextPacker.pack("", media.ocrText).documentMap
+            val fields = if (KvIndexPreferences.isEnabled(appContext)) {
+                media.kvText.trim().ifBlank { "none" }
+            } else {
+                OcrAnswerContextPacker.pack("", media.ocrText).documentMap
+            }
             buildString {
                 append("G${index + 1}: fields=$fields")
                 media.personLabel?.trim()?.takeIf(String::isNotBlank)?.let { append("; person=$it") }
@@ -1155,7 +1196,8 @@ class GalleryIndexer(context: Context) {
         results: List<GalleryMedia>,
         images: List<ByteArray>,
     ): String {
-        val gate = AnswerReviewGate.reason(query, draft, results)
+        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
+        val gate = AnswerReviewGate.reason(query, draft, results, useKvIndex)
         if (gate == null) {
             Log.i(TAG, "Answer evidence review skipped: routine grounded answer")
             return draft
@@ -1172,7 +1214,8 @@ class GalleryIndexer(context: Context) {
                 Log.i(TAG, "Answer evidence review kept draft on pass ${attempt + 1}")
                 return current
             }
-            val constrained = DocumentAmountGrounding.constrainAnswer(query, replacement, results)
+            val constrained = if (useKvIndex) replacement else
+                DocumentAmountGrounding.constrainAnswer(query, replacement, results)
             if (AnswerTextSanitizer.clean(constrained) == AnswerTextSanitizer.clean(current)) {
                 Log.i(TAG, "Answer evidence review converged on pass ${attempt + 1}")
                 return current
@@ -1201,23 +1244,26 @@ class GalleryIndexer(context: Context) {
         draft: String,
         results: List<GalleryMedia>,
     ): String {
+        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
         val records = results.mapIndexed { index, media ->
-            val proof = if (GemmaModelSelection.selected(appContext) == GemmaModelVariant.E2B) {
+            val proof = if (useKvIndex) {
+                media.kvText.trim().ifBlank { "none" }
+            } else if (GemmaModelSelection.selected(appContext) == GemmaModelVariant.E2B) {
                 media.ocrText.trim().ifBlank { "none" }
             } else {
                 OcrAnswerContextPacker.pack(query, media.ocrText).proofLines
             }
-            "G${index + 1} OCR_PROOF:\n${proof.prependIndent("  ")}"
+            "G${index + 1} DOCUMENT_FACTS:\n${proof.prependIndent("  ")}"
         }.joinToString("\n")
         return """
             REVIEW_TASK:
             QUESTION: $query
             DRAFT_ANSWER: $draft
             VERIFIED_AMOUNT_CANDIDATES:
-            ${DocumentAmountGrounding.promptEvidence(query, results)}
+            ${if (useKvIndex) "none (KV index mode)" else DocumentAmountGrounding.promptEvidence(query, results)}
             TOP_GROUNDING_RECORDS:
             $records
-            Inspect the supplied OCR and paired images. If the draft is fully supported and directly answers the question, return exactly KEEP. Otherwise return exactly one line: ANSWER: <corrected concise answer>. Never explain the review, identify records, calculate an amount, or invent a value.
+            Inspect the supplied document facts and paired images. If the draft is fully supported and directly answers the question, return exactly KEEP. Otherwise return exactly one line: ANSWER: <corrected concise answer>. Never explain the review, identify records, calculate an amount, or invent a value.
         """.trimIndent()
     }
 
@@ -1504,9 +1550,10 @@ class GalleryIndexer(context: Context) {
                         append("\nDuration: ")
                         append(formatDuration(media.durationMs))
                     }
-                    if (media.ocrText.isNotBlank()) {
-                        append("\nOCR: ")
-                        append(compactPromptText(media.ocrText))
+                    val documentFacts = if (KvIndexPreferences.isEnabled(appContext)) media.kvText else media.ocrText
+                    if (documentFacts.isNotBlank()) {
+                        append(if (KvIndexPreferences.isEnabled(appContext)) "\nDocument facts: " else "\nOCR: ")
+                        append(compactPromptText(documentFacts))
                     }
                     media.personLabel?.takeIf { it.isNotBlank() }?.let {
                         append("\nPerson: ")
@@ -1696,10 +1743,10 @@ class GalleryIndexer(context: Context) {
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z")
         private val FOLLOW_UP_DATE_FORMAT = DateTimeFormatter.ofPattern("d MMMM yyyy")
         private val ANSWER_SYSTEM_INSTRUCTION = """
-            You write Ask Galaxy's grounded gallery answer. Use only the latest task's joined text records and its attached downscaled image inputs. A visual=tile record supports visible details; for a document task pair it only with the same record's OCR_PROOF to distinguish scans and confirm label/value layout. Text-only fields support only their named person, time, place, or OCR facts. Local person tags are authoritative. For any document question, answer the exact field requested by the user only from OCR_PROOF lines. OCR line breaks preserve each label/value relationship: compare a value with its nearby labels and surrounding lines, rather than choosing a merely plausible number elsewhere in the document. The document map is for natural follow-up ideas only, never answer evidence. A conventional field label may be missing or imperfect: compare the OCR proof values and prefer the value that directly answers the question. Do not call a document fact absent merely because its usual label is absent; use a missing-fact caveat only after the supplied OCR proof has no credible answer. For a direct document-field question, inspect every supplied OCR_PROOF record before answering. If one supported distinct field value exists, output it in one concise sentence. If multiple distinct supported values exist across separate records, output every distinct value in one concise sentence; never silently choose one because the question uses a singular noun. Do not repeat values from duplicate scans, and attach a date only if that date is clearly associated with the same proof record. For every other task, lead with the useful conclusion in 2-3 natural sentences, explicitly naming a relevant place when one is supplied. Return only that answer: state the requested supported value plainly, but do not reproduce OCR/evidence lines or explain how the answer was found. Never mention evidence, records, prompts, models, reasoning, or private G/C/E/F IDs. Never output JSON, code, routing keys, a query plan, or a follow-up question, and never invent an identity, date, place, count, price, or visible activity.
+            You write Ask Galaxy's grounded gallery answer. Use only the latest task's joined text records and its attached downscaled image inputs. A visual=tile record supports visible details; for a document task pair it only with the same record's DOCUMENT_FACTS to distinguish scans and confirm label/value layout. Text-only fields support only their named person, time, place, or document facts. Local person tags are authoritative. For any document question, answer the exact field requested by the user only from DOCUMENT_FACTS lines. Each document-fact line preserves its key/value relationship: compare a value with its key, rather than choosing a merely plausible number elsewhere in the document. The document map is for natural follow-up ideas only, never answer evidence. A conventional field label may be missing or imperfect: compare the document facts and prefer the value that directly answers the question. Do not call a document fact absent merely because its usual label is absent; use a missing-fact caveat only after the supplied document facts have no credible answer. For a direct document-field question, inspect every supplied DOCUMENT_FACTS record before answering. If one supported distinct field value exists, output it in one concise sentence. If multiple distinct supported values exist across separate records, output every distinct value in one concise sentence; never silently choose one because the question uses a singular noun. Do not repeat values from duplicate scans, and attach a date only if that date is clearly associated with the same document facts record. For every other task, lead with the useful conclusion in 2-3 natural sentences, explicitly naming a relevant place when one is supplied. Return only that answer: state the requested supported value plainly, but do not reproduce document-fact/evidence lines or explain how the answer was found. Never mention evidence, records, prompts, models, reasoning, or private G/C/E/F IDs. Never output JSON, code, routing keys, a query plan, or a follow-up question, and never invent an identity, date, place, count, price, or visible activity.
         """.trimIndent()
         private val ANSWER_REVIEW_SYSTEM_INSTRUCTION = """
-            You are Ask Galaxy's strict grounding reviewer. You receive one question, a draft answer, the exact top grounding records, and the same paired images used for the draft. Do not use outside knowledge. A number is valid only when it is copied from a supplied OCR value or a matching visible image label. Never calculate or infer prices. Reply exactly KEEP when the draft is supported, otherwise reply exactly ANSWER: followed by the corrected direct answer. Do not reveal evidence, reasoning, records, prompts, models, or IDs.
+            You are Ask Galaxy's strict grounding reviewer. You receive one question, a draft answer, the exact top grounding records, and the same paired images used for the draft. Do not use outside knowledge. A number is valid only when it is copied from supplied document facts or a matching visible image label. Never calculate or infer prices. Reply exactly KEEP when the draft is supported, otherwise reply exactly ANSWER: followed by the corrected direct answer. Do not reveal evidence, reasoning, records, prompts, models, or IDs.
         """.trimIndent()
         private val FOLLOW_UP_SYSTEM_INSTRUCTION = """
             Generate exactly two surprisingly useful natural next gallery-search queries. Base them only on the previous question, its answer, and the TOP 4 ANSWER RECORDS. Each query must be a natural extension of what the user just asked, specific to the same person, document, event, or place when that is known. Choose a different useful angle for each query, and only ask about a field or fact suggested by the top-four records. Never repeat the prior question or answer, include a private value such as a document number, use source labels, or make vague suggestions such as "tell me more", "what else", "nearby", or "details". For a passport-number answer, an expiry or nationality question is good only when those fields are present in the records. Output exactly two lines and nothing else, each in the form QUERY: <question>.

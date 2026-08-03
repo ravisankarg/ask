@@ -93,6 +93,7 @@ class AnswerContextPicker(
         evidenceScope: AnswerEvidenceScope,
         queryCategory: QueryCategory,
         ocrKeywords: List<String> = emptyList(),
+        useKvIndex: Boolean = false,
         maxRecords: Int = MAX_RECORDS,
     ): AnswerContextBundle {
         val inputCandidates = rankedCandidates.distinctBy { it.mediaStoreId }
@@ -117,6 +118,30 @@ class AnswerContextPicker(
         }.toMap()
         val queryText = query.lowercase(Locale.ROOT)
         if (queryCategory == QueryCategory.DOC) {
+            if (useKvIndex) {
+                val chosen = eligibleCandidates.take(safeMax).map { media ->
+                    AnswerContextItem(
+                        media,
+                        setOf(AnswerCoverageFacet.CATEGORY_MATCH, AnswerCoverageFacet.RELEVANCE, AnswerCoverageFacet.OCR),
+                    )
+                }
+                val metadataFields = buildSet {
+                    addAll(evidenceScope.metadataFields)
+                    if (chosen.any { !it.media.personLabel.isNullOrBlank() }) add(AnswerMetadataField.PEOPLE)
+                    if (chosen.any { !it.media.locationName.isNullOrBlank() || !it.media.location.isNullOrBlank() }) {
+                        add(AnswerMetadataField.LOCATION)
+                    }
+                }
+                return AnswerContextBundle(
+                    items = chosen,
+                    metadataFields = metadataFields,
+                    includeOcr = true,
+                    queryCategory = queryCategory,
+                    includeVisuals = false,
+                    inputCandidateCount = inputCandidates.size,
+                    eligibleCandidateCount = eligibleCandidates.size,
+                )
+            }
             val normalizedKeywords = ocrKeywords
                 .map(String::lowercase)
                 .distinct()

@@ -47,6 +47,7 @@ data class GalleryMedia(
     val location: String? = null,
     val locationName: String? = null,
     val locationEnrichmentState: Int = GalleryDatabase.LOCATION_PENDING,
+    val kvText: String = "",
 )
 
 data class MetadataMatch(
@@ -80,6 +81,9 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 content_class TEXT NOT NULL DEFAULT 'scenary',
                 ocr_indexed INTEGER NOT NULL DEFAULT 0,
                 ocr_signature TEXT NOT NULL DEFAULT '',
+                kv_text TEXT NOT NULL DEFAULT '',
+                kv_indexed INTEGER NOT NULL DEFAULT 0,
+                kv_signature TEXT NOT NULL DEFAULT '',
                 person_cluster_id TEXT,
                 image_embedding_indexed INTEGER NOT NULL DEFAULT 0,
                 face_embedding_indexed INTEGER NOT NULL DEFAULT 0,
@@ -208,6 +212,11 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 "ALTER TABLE face_clusters ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0",
             )
         }
+        if (oldVersion < 14) {
+            db.execSQL("ALTER TABLE media_items ADD COLUMN kv_text TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE media_items ADD COLUMN kv_indexed INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE media_items ADD COLUMN kv_signature TEXT NOT NULL DEFAULT ''")
+        }
     }
 
     fun upsert(media: GalleryMedia) {
@@ -241,6 +250,9 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 put("content_class", MediaContentClass.SCENARY.wireName)
                 put("ocr_indexed", 1)
                 put("ocr_signature", OcrIndexContract.SIGNATURE)
+                put("kv_text", "")
+                put("kv_indexed", 1)
+                put("kv_signature", KvIndexContract.SIGNATURE)
             }
             if (previousSignature != null && previousSignature != signature) {
                 put("image_embedding_indexed", 0)
@@ -249,6 +261,9 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                     put("ocr_signature", "")
                     put("ocr_text", "")
                     put("content_class", MediaContentClass.SCENARY.wireName)
+                    put("kv_text", "")
+                    put("kv_indexed", 0)
+                    put("kv_signature", "")
                 }
                 put("face_embedding_indexed", 0)
                 putNull("date_taken_ms")
@@ -555,6 +570,10 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             )
             put("ocr_indexed", 1)
             put("ocr_signature", signature)
+            // OCR changes invalidate only the derived KV document facts.
+            put("kv_text", "")
+            put("kv_indexed", 0)
+            put("kv_signature", "")
         }
         writableDatabase.update(
             TABLE_MEDIA,
@@ -572,6 +591,8 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         val values = ContentValues().apply {
             put("ocr_indexed", 0)
             put("ocr_signature", "")
+            put("kv_indexed", 0)
+            put("kv_signature", "")
         }
         return writableDatabase.update(
             TABLE_MEDIA,
@@ -580,6 +601,44 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             null,
         )
     }
+
+    fun pendingKvDocuments(
+        signature: String = KvIndexContract.SIGNATURE,
+    ): List<GalleryMedia> = queryMedia(
+        selection = "mime_type LIKE 'image/%' AND TRIM(ocr_text) <> '' AND (kv_indexed = 0 OR kv_signature <> ?)",
+        selectionArgs = arrayOf(signature),
+        orderBy = "date_modified_seconds DESC",
+        projection = INDEXING_PROJECTION,
+    )
+
+    fun pendingKvDocumentCount(signature: String = KvIndexContract.SIGNATURE): Int = readableDatabase.rawQuery(
+        "SELECT COUNT(*) FROM $TABLE_MEDIA WHERE mime_type LIKE 'image/%' AND TRIM(ocr_text) <> '' AND (kv_indexed = 0 OR kv_signature <> ?)",
+        arrayOf(signature),
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+
+    fun replaceKvDocument(mediaStoreId: Long, text: String, signature: String = KvIndexContract.SIGNATURE) {
+        val values = ContentValues().apply {
+            put("kv_text", text.trim())
+            put("kv_indexed", 1)
+            put("kv_signature", signature)
+        }
+        writableDatabase.update(TABLE_MEDIA, values, "media_store_id = ?", arrayOf(mediaStoreId.toString()))
+    }
+
+    fun mediaStoreIdsWithKvDocuments(): Set<Long> = LinkedHashSet<Long>().also { ids ->
+        readableDatabase.rawQuery(
+            "SELECT media_store_id FROM $TABLE_MEDIA WHERE kv_indexed = 1 AND TRIM(kv_text) <> ''",
+            null,
+        ).use { cursor -> while (cursor.moveToNext()) ids += cursor.getLong(0) }
+    }
+
+    /** All committed document facts, used only after LFM has been released. */
+    fun indexedKvDocuments(signature: String = KvIndexContract.SIGNATURE): List<GalleryMedia> = queryMedia(
+        selection = "mime_type LIKE 'image/%' AND kv_indexed = 1 AND kv_signature = ? AND TRIM(kv_text) <> ''",
+        selectionArgs = arrayOf(signature),
+        orderBy = "date_modified_seconds DESC",
+        projection = INDEXING_PROJECTION,
+    )
 
     fun markFaceEmbeddingIndexed(mediaStoreId: Long) {
         val values = ContentValues().apply { put("face_embedding_indexed", 1) }
@@ -1475,6 +1534,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         personClusterId = getStringOrNull("person_cluster_id"),
         personLabel = getStringOrNull("person_label"),
         ocrText = getString(getColumnIndexOrThrow("ocr_text")).orEmpty(),
+        kvText = getString(getColumnIndexOrThrow("kv_text")).orEmpty(),
         contentClass = MediaContentClass.fromWireName(
             getString(getColumnIndexOrThrow("content_class")),
         ),
@@ -1583,7 +1643,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     companion object {
         private const val DATABASE_NAME = "gallery.db"
-        private const val DATABASE_VERSION = 13
+        private const val DATABASE_VERSION = 14
         private const val SQLITE_ID_CHUNK = 900
         private const val TABLE_MEDIA = "media_items"
         private const val TABLE_FACE_EMBEDDINGS = "face_embeddings"
@@ -1608,6 +1668,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "duration_ms",
             "person_cluster_id",
             "ocr_text",
+            "kv_text",
             "content_class",
             "date_taken_ms",
             "location_raw",
@@ -1632,6 +1693,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "duration_ms",
             "person_cluster_id",
             "ocr_text",
+            "kv_text",
             "content_class",
             "date_taken_ms",
             "location_raw",

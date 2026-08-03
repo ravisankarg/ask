@@ -13,6 +13,8 @@ val rustProject = rootProject.file("native/askgalaxy-native")
 val rustTargetDir = rootProject.file(".native-target")
 val generatedJniDir = layout.buildDirectory.dir("generated/rust/jniLibs")
 val cargoHome = rootProject.file(".cargo-home")
+val lfmNativeProject = rootProject.file("native/lfm")
+val lfmNativeBuildDir = layout.buildDirectory.dir("native/lfm")
 
 android {
     namespace = "com.ravi.askgalaxy"
@@ -110,4 +112,38 @@ val buildRustNative = tasks.register<Exec>("buildRustNative") {
 
 tasks.named("preBuild") {
     dependsOn(buildRustNative)
+}
+
+val buildLfmNative = tasks.register<Exec>("buildLfmNative") {
+    group = "native"
+    description = "Build the local llama.cpp LFM2.5-VL JNI runtime."
+    val cmakeBin = System.getenv("CMAKE_BIN") ?: "cmake"
+    val buildDir = lfmNativeBuildDir.get().asFile
+    commandLine(
+        cmakeBin,
+        "-S", lfmNativeProject.absolutePath,
+        "-B", buildDir.absolutePath,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DANDROID_ABI=arm64-v8a",
+        "-DANDROID_PLATFORM=android-26",
+        "-DCMAKE_TOOLCHAIN_FILE=${androidNdk.absolutePath}/build/cmake/android.toolchain.cmake",
+    )
+    doLast {
+        exec {
+            commandLine(cmakeBin, "--build", buildDir.absolutePath, "--target", "askgalaxy_lfm", "-j1")
+        }
+        delete(generatedJniDir.get().file("arm64-v8a/libggml-vulkan.so"))
+        copy {
+            from(buildDir.resolve("libaskgalaxy_lfm.so"))
+            from(buildDir.resolve("bin")) {
+                include("*.so")
+                exclude("libggml-vulkan.so")
+            }
+            into(generatedJniDir.get().dir("arm64-v8a"))
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(buildLfmNative)
 }

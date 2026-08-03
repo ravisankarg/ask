@@ -1,5 +1,6 @@
 package com.ravi.askgalaxy
 
+import android.content.Context
 import android.util.Log
 
 /**
@@ -11,11 +12,15 @@ class StructuredSearchExecutor(
     private val database: GalleryDatabase,
     private val semanticIndexer: GallerySemanticIndexer,
     private val metadataReader: GalleryMetadataReader,
+    private val appContext: Context? = null,
 ) {
+    private var activeQueryCategory: QueryCategory = QueryCategory.SCENARY
+
     fun execute(
         spec: QueryExecutionSpec,
     ): List<GalleryMedia> {
         val queryCategory = spec.requiredQueryCategory()
+        activeQueryCategory = queryCategory
         val categoryAllowlist = database.mediaStoreIdsForQueryCategory(queryCategory)
         if (categoryAllowlist.isEmpty()) return emptyList()
         val evaluated = evaluate(spec.root, categoryAllowlist)
@@ -227,6 +232,7 @@ class StructuredSearchExecutor(
                 predicate.value,
                 categoryAllowlist,
                 allowSemanticFallback,
+                queryCategory = activeQueryCategory,
             )
             ExecutionField.OCR -> evaluateOcrKeywords(
                 predicate.value,
@@ -254,7 +260,11 @@ class StructuredSearchExecutor(
         value: String,
         categoryAllowlist: Set<Long>,
         allowSemanticFallback: Boolean,
+        queryCategory: QueryCategory,
     ): EvaluatedSet {
+        if (appContext != null && KvIndexPreferences.isEnabled(appContext) && queryCategory == QueryCategory.DOC) {
+            return evaluateKvSemantic(value, categoryAllowlist, allowSemanticFallback)
+        }
         if (categoryAllowlist.isEmpty()) return EvaluatedSet()
         val nearest = runCatching {
             semanticIndexer.searchNearestScoredBlocking(
@@ -307,6 +317,9 @@ class StructuredSearchExecutor(
         value: String,
         categoryAllowlist: Set<Long>,
     ): EvaluatedSet {
+        if (appContext != null && KvIndexPreferences.isEnabled(appContext)) {
+            return evaluateKvSemantic(value, categoryAllowlist, allowSemanticFallback = true)
+        }
         if (categoryAllowlist.isEmpty()) return EvaluatedSet()
         val keywords = OcrKeywordPolicy.keywords(value)
         if (keywords.isEmpty()) return EvaluatedSet()
@@ -321,6 +334,39 @@ class StructuredSearchExecutor(
             }
         }
         return EvaluatedSet(scores)
+    }
+
+    /** KV mode never reads OCR text or SQLite OCR/metadata term matches. */
+    private fun evaluateKvSemantic(
+        value: String,
+        categoryAllowlist: Set<Long>,
+        allowSemanticFallback: Boolean,
+    ): EvaluatedSet {
+        val context = appContext ?: return EvaluatedSet()
+        val active = categoryAllowlist.intersect(database.mediaStoreIdsWithKvDocuments())
+        if (active.isEmpty()) return EvaluatedSet()
+        val nearest = runCatching {
+            KvDocumentVectorIndex.open(context).use { index ->
+                if (index.size == 0L) emptyList() else {
+                    val query = SigLipTextEncoder.shared(context).encode(value)
+                    val found = index.search(query, SEMANTIC_CANDIDATE_LIMIT, active.toLongArray())
+                    found.ids.mapIndexed { position, id ->
+                        SemanticMatch(id, found.scores.getOrElse(position) { 0f })
+                    }
+                }
+            }
+        }.getOrDefault(emptyList())
+        val strict = nearest.filter { GallerySemanticIndexer.isAcceptedSemanticScore(it.score) }
+        val selected = SemanticFallbackPolicy.select(
+            strictMatches = strict,
+            nearestMatches = nearest,
+            hasMetadataMatches = false,
+            allowFallback = allowSemanticFallback,
+            limit = SEMANTIC_FALLBACK_LIMIT,
+        )
+        return EvaluatedSet(selected.associate { match ->
+            match.mediaStoreId to (match.score.takeUnless { it == HARD_SCOPE_SCORE } ?: FALLBACK_ZERO_SCORE)
+        })
     }
 
     private fun hardSet(ids: Set<Long>): EvaluatedSet =

@@ -33,6 +33,9 @@ class SettingsActivity : Activity() {
     private lateinit var locationPermissionButton: Button
     private lateinit var personalContextStatus: TextView
     private lateinit var personalContextToggle: Switch
+    private lateinit var kvIndexToggle: Switch
+    private lateinit var kvProgressLabel: TextView
+    private lateinit var kvProgressBar: ProgressBar
     private lateinit var gemmaModelChoice: RadioGroup
     private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
     private val handler = Handler(Looper.getMainLooper())
@@ -155,6 +158,58 @@ class SettingsActivity : Activity() {
             setLineSpacing(5f, 1f)
         }
         root.addView(models, wrap())
+
+        root.addView(TextView(this).apply {
+            text = "KV index (optional)"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "For photos with OCR text, download LiquidAI LFM2.5-VL-450M locally and turn each document into key-value facts. Search then uses only semantic matches against those facts, never OCR word matching."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        kvIndexToggle = Switch(this).apply {
+            text = "Use KV index for document search"
+            textSize = 15f
+            setTextColor(Color.rgb(32, 34, 42))
+            setPadding(0, 12, 0, 4)
+            isChecked = KvIndexPreferences.isEnabled(this@SettingsActivity)
+            setOnCheckedChangeListener { _, enabled ->
+                KvIndexPreferences.setEnabled(this@SettingsActivity, enabled)
+                if (enabled) {
+                    KvIndexScheduler.enqueue(this@SettingsActivity, replaceExisting = false)
+                    Toast.makeText(
+                        this@SettingsActivity,
+                        "KV model download and document indexing started in the background.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    KvIndexScheduler.cancel(this@SettingsActivity)
+                    Toast.makeText(
+                        this@SettingsActivity,
+                        "KV index paused. Existing OCR search is active again.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                refreshState()
+            }
+        }
+        root.addView(kvIndexToggle, wrap())
+        kvProgressLabel = TextView(this).apply {
+            text = "Document KV index  ·  Waiting"
+            textSize = 13f
+            setTextColor(Color.rgb(60, 63, 72))
+            setPadding(0, 4, 0, 2)
+        }
+        kvProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            setPadding(0, 0, 0, 2)
+        }
+        root.addView(kvProgressLabel, wrap())
+        root.addView(kvProgressBar, wrap())
 
         root.addView(TextView(this).apply {
             text = "Preparation progress"
@@ -462,7 +517,12 @@ class SettingsActivity : Activity() {
                 else -> "Waiting for model package"
             }
             "${artifact.name}  ·  $state"
-        }
+        } + if (KvIndexPreferences.isEnabled(this)) {
+            "\n" + ModelCatalog.lfmKvArtifacts().joinToString("\n") { artifact ->
+                "${artifact.name}  ·  ${if (artifact.isInstalled(this)) "Installed" else "Queued for KV index"}"
+            }
+        } else ""
+        kvIndexToggle.isChecked = KvIndexPreferences.isEnabled(this)
         val access = PersonalContextAccess.isNotificationListenerEnabled(this)
         updatingContextToggle = true
         personalContextToggle.isChecked = PersonalContextSettings.isEnabled(this)
@@ -540,11 +600,33 @@ class SettingsActivity : Activity() {
         val now = System.currentTimeMillis()
         stageProgressViews.forEach { (stage, views) ->
             val state = progress[stage] ?: StageProgress()
-            views.bar.isIndeterminate = state.updatedAtMs > 0L &&
-                !state.completed && state.total <= 0L
-            views.bar.progress = state.percent
-            views.label.text = "${stage.label}  ·  ${formatStageProgress(stage, state, now)}"
+            bindProgressView(views.label, views.bar, stage, state, now)
         }
+        bindProgressView(
+            kvProgressLabel,
+            kvProgressBar,
+            IndexProgressStage.KV,
+            progress[IndexProgressStage.KV] ?: StageProgress(),
+            now,
+        )
+    }
+
+    private fun bindProgressView(
+        label: TextView,
+        bar: ProgressBar,
+        stage: IndexProgressStage,
+        state: StageProgress,
+        now: Long,
+    ) {
+        if (stage == IndexProgressStage.KV && !KvIndexPreferences.isEnabled(this)) {
+            bar.isIndeterminate = false
+            bar.progress = 0
+            label.text = "${stage.label}  ·  Off"
+            return
+        }
+        bar.isIndeterminate = state.updatedAtMs > 0L && !state.completed && state.total <= 0L
+        bar.progress = state.percent
+        label.text = "${stage.label}  ·  ${formatStageProgress(stage, state, now)}"
     }
 
     private fun formatStageProgress(
@@ -554,10 +636,16 @@ class SettingsActivity : Activity() {
     ): String {
         if (progress.completed) return "Complete"
         if (progress.updatedAtMs == 0L) return "Waiting"
-        val counts = if (stage == IndexProgressStage.MODELS) {
-            "${formatBytes(progress.current)} / ${formatBytes(progress.total)}"
-        } else {
-            "${progress.current} / ${progress.total}"
+        val counts = when {
+            stage == IndexProgressStage.MODELS ->
+                "${formatBytes(progress.current)} / ${formatBytes(progress.total)}"
+            stage == IndexProgressStage.KV && progress.phase == "vectors" ->
+                "Creating vectors ${progress.current} / ${progress.total}"
+            stage == IndexProgressStage.KV && progress.total >= KV_DOWNLOAD_BYTE_THRESHOLD ->
+                "Downloading ${formatBytes(progress.current)} / ${formatBytes(progress.total)}"
+            stage == IndexProgressStage.KV ->
+                "Extracting facts on CPU (4 threads) ${progress.current} / ${progress.total}"
+            else -> "${progress.current} / ${progress.total}"
         }
         val eta = progress.etaMs(nowMs)?.let { " • ETA ${formatDuration(it)}" }.orEmpty()
         return "$counts (${progress.percent}%)$eta"
@@ -643,5 +731,6 @@ class SettingsActivity : Activity() {
 
     private companion object {
         const val LOCATION_PERMISSION_REQUEST = 2001
+        const val KV_DOWNLOAD_BYTE_THRESHOLD = 16L * 1024L * 1024L
     }
 }
