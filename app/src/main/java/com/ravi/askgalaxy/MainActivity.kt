@@ -113,6 +113,7 @@ class MainActivity : Activity() {
 
     private fun startBackgroundMaintenance() {
         GemmaDownloadScheduler.enqueueIfNeeded(this)
+        KvIndexScheduler.resumeIncompleteIndex(this)
         val preparation = PreparationStore(this).read()
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
         val visualWorkerStale =
@@ -612,6 +613,7 @@ class MainActivity : Activity() {
         searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
         if (ready) {
             val plannerReady = GemmaRuntime.isPlannerReady()
+            val kvIndexing = KvIndexPreferences.isIndexing(this)
             val hasReusableFollowUpContext = activeSearchResponse != null && !followUpInFlight
             // A submitted query must consume the prewarmed QP system KV.
             // An uncached Conversation re-prefills the 12K system context and
@@ -623,6 +625,8 @@ class MainActivity : Activity() {
             gemmaWarmupIndicator.visibility = if (showWarmup) View.VISIBLE else View.GONE
             gemmaWarmupStatus.text = if (plannerReady) {
                 "${GemmaModelSelection.selected(this).displayName} ready • local ${GemmaRuntime.backendPlacement()}"
+            } else if (kvIndexing) {
+                "KV indexing is using CPU (4 threads) • Gemma 4 warm-up is paused"
             } else if (hasReusableFollowUpContext) {
                 "Follow-up answers are ready from the current results"
             } else {
@@ -651,7 +655,7 @@ class MainActivity : Activity() {
             // planner warmups are scheduled after the answer session closes.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
-            if (pendingOcr == 0) {
+            if (pendingOcr == 0 && !KvIndexPreferences.isIndexing(this)) {
                 launchPlannerWarmupRequested = true
                 GemmaRuntime.preloadPlannerAsync(
                     this,

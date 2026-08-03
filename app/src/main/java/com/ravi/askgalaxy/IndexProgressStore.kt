@@ -6,6 +6,7 @@ enum class IndexProgressStage(val wire: String, val label: String) {
     MODELS("models", "Model downloads"),
     VISUAL("visual", "SigLIP visual index"),
     OCR("ocr", "OCR text index"),
+    KV("kv", "Document KV index"),
     LOCATION("location", "Photo locations"),
     FACE("face", "Face index"),
     EPISODE("episode", "Photo episodes"),
@@ -18,6 +19,7 @@ data class StageProgress(
     val updatedAtMs: Long = 0L,
     val completed: Boolean = false,
     val error: String = "",
+    val phase: String = "",
 ) {
     val percent: Int
         get() = if (total <= 0L) 0 else ((current * 100L) / total).toInt().coerceIn(0, 100)
@@ -46,6 +48,7 @@ class IndexProgressStore(context: Context) {
             updatedAtMs = preferences.getLong(key(stage, "updated"), 0L),
             completed = preferences.getBoolean(key(stage, "completed"), false),
             error = preferences.getString(key(stage, "error"), null).orEmpty(),
+            phase = preferences.getString(key(stage, "phase"), null).orEmpty(),
         )
     }
 
@@ -58,6 +61,7 @@ class IndexProgressStore(context: Context) {
         total: Long,
         completed: Boolean = total > 0L && current >= total,
         error: String = "",
+        phase: String = "",
     ) {
         synchronized(preferences) {
             val previousStarted = preferences.getLong(key(stage, "started"), 0L)
@@ -71,6 +75,7 @@ class IndexProgressStore(context: Context) {
                 .putLong(key(stage, "updated"), now)
                 .putBoolean(key(stage, "completed"), completed)
                 .putString(key(stage, "error"), error)
+                .putString(key(stage, "phase"), phase)
                 .apply()
         }
     }

@@ -456,8 +456,17 @@ class GemmaRuntime private constructor(
         /** Starts only engine/model loading without blocking the UI. */
         fun preloadAsync(context: Context) {
             val appContext = context.applicationContext
+            if (KvIndexPreferences.isIndexing(appContext)) {
+                Log.i(TAG, "Gemma preload deferred while KV indexing uses CPU")
+                return
+            }
             if (!isModelInstalled(appContext) || !preloadRequested.compareAndSet(false, true)) return
             preloadExecutor.execute {
+                if (KvIndexPreferences.isIndexing(appContext)) {
+                    preloadRequested.set(false)
+                    Log.i(TAG, "Gemma preload cancelled for KV indexing")
+                    return@execute
+                }
                 runCatching { shared(appContext) }
                     .onSuccess { Log.i(TAG, "${GemmaModelSelection.selected(appContext).displayName} engine warmed") }
                     .onFailure { error ->
@@ -474,6 +483,10 @@ class GemmaRuntime private constructor(
          */
         fun preloadPlannerAsync(context: Context, plannerSystemInstruction: String) {
             val appContext = context.applicationContext
+            if (KvIndexPreferences.isIndexing(appContext)) {
+                Log.i(TAG, "Gemma planner warmup deferred while KV indexing uses CPU")
+                return
+            }
             if (!isModelInstalled(appContext) ||
                 answerPrefillRequested.get() ||
                 !plannerPrefillRequested.compareAndSet(false, true)
@@ -482,6 +495,11 @@ class GemmaRuntime private constructor(
             plannerReady.set(false)
             preloadExecutor.execute {
                 runCatching {
+                    if (KvIndexPreferences.isIndexing(appContext)) {
+                        plannerPrefillRequested.set(false)
+                        Log.i(TAG, "Gemma planner warmup cancelled for KV indexing")
+                        return@runCatching
+                    }
                     val session = runCatching {
                         shared(appContext).createPrefilledPlannerSession(plannerSystemInstruction)
                     }.getOrElse { error ->
@@ -556,6 +574,10 @@ class GemmaRuntime private constructor(
         }
 
         fun preloadPlannerAfterAnswerAsync(context: Context, plannerSystemInstruction: String) {
+            if (KvIndexPreferences.isIndexing(context.applicationContext)) {
+                Log.i(TAG, "Gemma planner warmup deferred while KV indexing uses CPU")
+                return
+            }
             releaseAnswerPrefillForPlanner()
             preloadPlannerAsync(context, plannerSystemInstruction)
         }
@@ -567,12 +589,21 @@ class GemmaRuntime private constructor(
          */
         fun preloadAnswerAsync(context: Context, answerSystemInstruction: String) {
             val appContext = context.applicationContext
+            if (KvIndexPreferences.isIndexing(appContext)) {
+                Log.i(TAG, "Gemma answer warmup deferred while KV indexing uses CPU")
+                return
+            }
             if (!isModelInstalled(appContext)) return
             releasePlannerPrefillForAnswer()
             if (!answerPrefillRequested.compareAndSet(false, true)) return
             val requestGeneration = answerPrefillGeneration.incrementAndGet()
             answerPrefillFuture = preloadExecutor.submit {
                 runCatching {
+                    if (KvIndexPreferences.isIndexing(appContext)) {
+                        answerPrefillRequested.set(false)
+                        Log.i(TAG, "Gemma answer warmup cancelled for KV indexing")
+                        return@runCatching
+                    }
                     val session = runCatching {
                         shared(appContext).createPrefilledAnswerSession(answerSystemInstruction)
                     }.getOrElse { error ->
@@ -594,6 +625,17 @@ class GemmaRuntime private constructor(
                     Log.e(TAG, "Gemma 4 answer prefill failed", error)
                 }
             }
+        }
+
+        /**
+         * Stops speculative planner/answer prefill as soon as the KV worker
+         * starts. A foreground query is deliberately not interrupted.
+         */
+        fun cancelWarmupsForKvIndex() {
+            releasePlannerPrefillForAnswer()
+            releaseAnswerPrefillForPlanner()
+            preloadRequested.set(false)
+            Log.i(TAG, "Gemma 4 warmups paused for KV indexing")
         }
 
         /** Takes the warmed answer conversation for the next answer turn. */

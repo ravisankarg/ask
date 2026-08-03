@@ -147,6 +147,32 @@ object ModelCatalog {
         sourceLabel = "LiteRT Community pinned model revision",
     )
 
+    // The public GGUF release is consumed by the embedded llama.cpp runtime.
+    // Keep it optional: enabling KV index never blocks the normal gallery path.
+    val lfmKvModel = ModelArtifact(
+        name = "LiquidAI LFM2.5-VL-450M KV model",
+        relativePath = "models/lfm2.5-vl/LFM2.5-VL-450M-Q4_K_M.gguf",
+        runtime = "llama.cpp GGUF Q4_K_M",
+        required = false,
+        downloadUrl = "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/6f15859c2de1583b6180a9bc56338342592b589a/LFM2.5-VL-450M-Q4_K_M.gguf?download=true",
+        expectedBytes = 229_313_568L,
+        sourceLabel = "LiquidAI public pinned GGUF release",
+    )
+
+    val lfmKvVisionProjector = ModelArtifact(
+        name = "LiquidAI LFM2.5-VL-450M vision projector",
+        relativePath = "models/lfm2.5-vl/mmproj-LFM2.5-VL-450m-Q8_0.gguf",
+        runtime = "llama.cpp multimodal projector",
+        required = false,
+        downloadUrl = "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/6f15859c2de1583b6180a9bc56338342592b589a/mmproj-LFM2.5-VL-450m-Q8_0.gguf?download=true",
+        expectedBytes = 102_815_168L,
+        sourceLabel = "LiquidAI public pinned GGUF release",
+    )
+
+    fun lfmKvArtifacts(): List<ModelArtifact> = listOf(lfmKvModel, lfmKvVisionProjector)
+
+    fun lfmKvInstalled(context: Context): Boolean = lfmKvArtifacts().all { it.isInstalled(context) }
+
     fun gemma(context: Context): ModelArtifact = when (GemmaModelSelection.selected(context)) {
         GemmaModelVariant.E2B -> gemmaE2B
         GemmaModelVariant.E4B -> gemmaE4B

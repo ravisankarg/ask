@@ -13,18 +13,19 @@ object AnswerReviewGate {
         query: String,
         draft: String,
         records: List<GalleryMedia>,
+        useKvIndex: Boolean = false,
     ): Reason? {
         if (DIRECT_FIELD_INTENT.containsMatchIn(query.lowercase(Locale.ROOT))) {
             return Reason.DIRECT_FIELD
         }
         val draftValues = valueTokens(draft)
         if (draftValues.isEmpty()) return null
-        val ocrValues = records.asSequence()
-            .flatMap { valueTokens(it.ocrText).asSequence() }
+        val documentValues = records.asSequence()
+            .flatMap { valueTokens(if (useKvIndex) it.kvText else it.ocrText).asSequence() }
             .map(::normalise)
             .filter(String::isNotBlank)
             .toSet()
-        return if (ocrValues.size >= 2 && draftValues.any { normalise(it) in ocrValues }) {
+        return if (documentValues.size >= 2 && draftValues.any { normalise(it) in documentValues }) {
             Reason.CONFLICTING_OCR
         } else {
             null
