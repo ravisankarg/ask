@@ -3,8 +3,11 @@ package com.ravi.askgalaxy
 import android.content.ContentResolver
 import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.provider.MediaStore
+import android.provider.CalendarContract
 import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.time.Instant
@@ -317,6 +320,7 @@ class GalleryIndexer(context: Context) {
         response: SearchResponse,
         onFinished: (Result<AnswerResult>) -> Unit,
         onFollowUps: (List<FollowUpSuggestion>) -> Unit = {},
+        onNextBriefs: (List<NextBriefSuggestion>) -> Unit = {},
         warmPlannerAfterAnswer: Boolean = true,
         warmAnswerAfterAnswer: Boolean = false,
     ) {
@@ -501,22 +505,22 @@ class GalleryIndexer(context: Context) {
                     .distinctBy { it.text.lowercase() }
                     .take(MAX_FOLLOW_UPS)
                 val followUpMs = elapsedMs(followUpStarted, System.nanoTime())
-                val followUpEvidence = buildFollowUpEvidence(attachedResults)
                 deferredFollowUps = {
                     val generatedStarted = System.nanoTime()
                     runCatching {
-                        generateFollowUps(
+                        generateSuggestions(
                             gemma = gemma,
                             query = query,
                             answer = parsed.text,
-                            topFourEvidence = followUpEvidence,
+                            answerRecords = attachedResults,
                         )
                     }.onSuccess { generated ->
-                        onFollowUps(if (generated.isNotEmpty()) generated else followUps)
+                        onFollowUps(if (generated.followUps.isNotEmpty()) generated.followUps else followUps)
+                        onNextBriefs(generated.nextBriefs)
                         Log.i(
                             TAG,
                             "Async follow-up generation: ${elapsedMs(generatedStarted, System.nanoTime())}ms, " +
-                                "count=${generated.size}",
+                                "queries=${generated.followUps.size}, nextBriefs=${generated.nextBriefs.size}",
                         )
                     }.onFailure { error ->
                         Log.w(TAG, "Async follow-up generation failed; using fallback chips", error)
@@ -572,6 +576,7 @@ class GalleryIndexer(context: Context) {
         currentResponse: SearchResponse,
         onFinished: (Result<AnswerResult>) -> Unit,
         onFollowUps: (List<FollowUpSuggestion>) -> Unit = {},
+        onNextBriefs: (List<NextBriefSuggestion>) -> Unit = {},
     ) {
         answerExecutor.execute {
             runCatching {
@@ -661,6 +666,7 @@ class GalleryIndexer(context: Context) {
                     response = followUpResponse,
                     onFinished = onFinished,
                     onFollowUps = onFollowUps,
+                    onNextBriefs = onNextBriefs,
                     warmPlannerAfterAnswer = false,
                     warmAnswerAfterAnswer = true,
                 )
@@ -954,55 +960,187 @@ class GalleryIndexer(context: Context) {
         return prompt
     }
 
-    /** A value-redacted inventory of every selected answer record. */
-    private fun buildFollowUpEvidence(results: List<GalleryMedia>): String = results
+    /** Grounded context passed to the combined Try next / Next Brief call. */
+    private fun buildNextBriefEvidence(results: List<GalleryMedia>): String = results
         .take(MAX_ANSWER_RECORDS)
         .mapIndexed { index, media ->
-            val fields = OcrAnswerContextPacker.pack("", media.ocrText).documentMap
             buildString {
-                append("G${index + 1}: fields=$fields")
+                append("G${index + 1}: ")
+                media.ocrText
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+                    .take(MAX_NEXT_BRIEF_OCR_CHARS)
+                    .takeIf(String::isNotBlank)
+                    ?.let { append("ocr=$it; ") }
                 media.personLabel?.trim()?.takeIf(String::isNotBlank)?.let { append("; person=$it") }
                 media.locationName?.trim()?.takeIf(String::isNotBlank)?.let { append("; place=$it") }
+                media.location?.trim()?.takeIf(String::isNotBlank)?.let { append("; location=$it") }
                 media.dateTakenMs?.let { append("; captured=${formatDate(it).substringBefore(' ')}") }
             }
         }
         .joinToString("\n")
-        .take(MAX_FOLLOW_UP_EVIDENCE_CHARS)
+        .take(MAX_NEXT_BRIEF_CONTEXT_CHARS)
         .ifBlank { "none" }
 
-    private fun generateFollowUps(
+    private fun generateSuggestions(
         gemma: GemmaRuntime,
         query: String,
         answer: String,
-        topFourEvidence: String,
-    ): List<FollowUpSuggestion> {
-        val session = gemma.createAnswerConversation(FOLLOW_UP_SYSTEM_INSTRUCTION)
+        answerRecords: List<GalleryMedia>,
+    ): GeneratedSuggestions {
+        val session = gemma.createAnswerConversation(SUGGESTIONS_SYSTEM_INSTRUCTION)
         return try {
+            val groundedContext = buildNextBriefEvidence(answerRecords)
+            val capabilities = discoverNextBriefCapabilities()
             val output = session.generate(
                 """
                 ORIGINAL QUESTION: $query
                 ANSWER ALREADY GIVEN: $answer
-                TOP 4 ANSWER RECORDS:
-                $topFourEvidence
+                GROUNDED ANSWER RECORDS:
+                $groundedContext
+                AVAILABLE PHONE CAPABILITIES:
+                ${capabilities.joinToString("\n") { "${it.id}: ${it.label} (handlers=${it.handlers})" }}
                 """.trimIndent(),
             )
-            output.lineSequence()
-                .map(String::trim)
-                .mapNotNull { line ->
-                    line.indexOf("QUERY:", ignoreCase = true)
-                        .takeIf { it >= 0 }
-                        ?.let { line.substring(it + "QUERY:".length) }
-                        ?.let(::sanitizeFollowUpQuery)
-                        ?.takeIf { isUsefulFollowUp(it, query, answer) }
-                        ?.takeIf(String::isNotBlank)
-                        ?.let { FollowUpSuggestion(it) }
+            val followUps = ArrayList<FollowUpSuggestion>()
+            val nextBriefs = ArrayList<NextBriefSuggestion>()
+            output.lineSequence().map(String::trim).forEach { line ->
+                when {
+                    line.startsWith("QUERY:", ignoreCase = true) -> {
+                        line.substringAfter(':')
+                            .let(::sanitizeFollowUpQuery)
+                            .takeIf { isUsefulFollowUp(it, query, answer) }
+                            ?.takeIf(String::isNotBlank)
+                            ?.let { followUps += FollowUpSuggestion(it) }
+                    }
+                    line.startsWith("ACTION:", ignoreCase = true) -> {
+                        val fields = line.substringAfter(':').split('|', limit = 4)
+                        if (fields.size >= 4) {
+                            val action = runCatching {
+                                NextBriefActionType.valueOf(fields[0].trim().uppercase())
+                            }.getOrNull()
+                            val label = fields[1].trim().take(MAX_NEXT_BRIEF_LABEL_CHARS)
+                            val sourceId = fields[2].trim().uppercase()
+                            val payload = fields.getOrNull(3).orEmpty()
+                                .trim()
+                                .replace(Regex("\\s+"), " ")
+                                .take(MAX_NEXT_BRIEF_PAYLOAD_CHARS)
+                            if (action != null && label.isNotBlank() &&
+                                capabilities.any { it.id == action.name.lowercase() } &&
+                                isGroundedNextBriefAction(action, sourceId, answerRecords, payload, capabilities)
+                            ) {
+                                nextBriefs += NextBriefSuggestion(action, label, sourceId, payload)
+                            }
+                        }
+                    }
                 }
-                .distinctBy { it.text.lowercase() }
-                .take(MAX_FOLLOW_UPS)
-                .toList()
+            }
+            GeneratedSuggestions(
+                followUps = followUps.distinctBy { it.text.lowercase() }.take(MAX_FOLLOW_UPS),
+                nextBriefs = nextBriefs.distinctBy { it.action to it.sourceId }.take(MAX_NEXT_BRIEFS),
+            )
         } finally {
             session.close()
         }
+    }
+
+    private fun isGroundedNextBriefAction(
+        action: NextBriefActionType,
+        sourceId: String,
+        records: List<GalleryMedia>,
+        payload: String,
+        capabilities: List<NextBriefCapability>,
+    ): Boolean {
+        val index = sourceId.removePrefix("G").toIntOrNull()?.minus(1) ?: return false
+        val media = records.getOrNull(index) ?: return false
+        if (payload.length < 3) return false
+        return when (action) {
+            NextBriefActionType.SHARE_MEDIA -> {
+                val hasPerson = !media.personLabel.isNullOrBlank()
+                val hasContact = extractContactTargets(media).isNotEmpty()
+                val hasMessagingApp = capabilities
+                    .filter { it.id == NextBriefActionType.SEND_MESSAGE.name.lowercase() }
+                    .any { handlers ->
+                        handlers.handlers.lowercase().let { names ->
+                            names.contains("whatsapp") || names.contains("messag") || names.contains("chat")
+                        }
+                    }
+                hasPerson && (hasContact || hasMessagingApp)
+            }
+            NextBriefActionType.CALENDAR_REMINDER -> true
+            NextBriefActionType.MAPS_SEARCH ->
+                !media.locationName.isNullOrBlank() || !media.location.isNullOrBlank()
+            NextBriefActionType.CONTACT -> extractContactTargets(media).isNotEmpty()
+            NextBriefActionType.WEB_SEARCH,
+            NextBriefActionType.SEND_MESSAGE,
+            -> payload.length >= 3
+        }
+    }
+
+    /** Discover standard phone actions and the installed apps that can receive them. */
+    private fun discoverNextBriefCapabilities(): List<NextBriefCapability> {
+        val packageManager = appContext.packageManager
+        fun capability(id: String, label: String, intent: Intent): NextBriefCapability? {
+            val handlers = runCatching {
+                packageManager.queryIntentActivities(
+                    intent,
+                    android.content.pm.PackageManager.MATCH_DEFAULT_ONLY,
+                )
+            }.getOrDefault(emptyList())
+            if (handlers.isEmpty()) return null
+            val names = handlers.asSequence()
+                .mapNotNull { info -> info.loadLabel(packageManager)?.toString()?.trim() }
+                .filter(String::isNotBlank)
+                .distinct()
+                .take(MAX_CAPABILITY_HANDLERS)
+                .joinToString(", ")
+            return NextBriefCapability(id, label, names.ifBlank { "available" })
+        }
+
+        return listOfNotNull(
+            capability(
+                NextBriefActionType.SHARE_MEDIA.name.lowercase(),
+                "share selected gallery media",
+                Intent(Intent.ACTION_SEND).setType("image/*"),
+            ),
+            capability(
+                NextBriefActionType.MAPS_SEARCH.name.lowercase(),
+                "open a place in maps",
+                Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=Ask+Galaxy")),
+            ),
+            capability(
+                NextBriefActionType.CALENDAR_REMINDER.name.lowercase(),
+                "create a calendar reminder",
+                Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI),
+            ),
+            capability(
+                NextBriefActionType.WEB_SEARCH.name.lowercase(),
+                "search the web for the next task",
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=Ask+Galaxy")),
+            ),
+            capability(
+                NextBriefActionType.CONTACT.name.lowercase(),
+                "call or email a detected contact",
+                Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:")),
+            ),
+            capability(
+                NextBriefActionType.SEND_MESSAGE.name.lowercase(),
+                "send a message or share text",
+                Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:")),
+            ),
+        )
+    }
+
+    private fun extractContactTargets(media: GalleryMedia): List<String> {
+        val text = media.ocrText
+        val emails = Regex("[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", RegexOption.IGNORE_CASE)
+            .findAll(text)
+            .map { it.value }
+        val phones = Regex("(?<!\\d)\\+?[0-9][0-9 ()-]{6,}[0-9](?!\\d)")
+            .findAll(text)
+            .map { it.value.trim() }
+            .filter { it.count(Char::isDigit) >= 7 }
+        return (emails + phones).distinct().take(MAX_CONTACT_TARGETS).toList()
     }
 
     private fun isUsefulFollowUp(value: String, previousQuery: String, previousAnswer: String): Boolean {
@@ -1624,7 +1762,13 @@ class GalleryIndexer(context: Context) {
         private const val UI_RESULT_LIMIT = 30
         private const val MAX_EVIDENCE_LOG_CHARS = 600
         private const val MAX_FOLLOW_UPS = 2
-        private const val MAX_FOLLOW_UP_EVIDENCE_CHARS = 1_400
+        private const val MAX_NEXT_BRIEFS = 2
+        private const val MAX_NEXT_BRIEF_LABEL_CHARS = 42
+        private const val MAX_NEXT_BRIEF_PAYLOAD_CHARS = 96
+        private const val MAX_NEXT_BRIEF_OCR_CHARS = 1_600
+        private const val MAX_NEXT_BRIEF_CONTEXT_CHARS = 6_000
+        private const val MAX_CAPABILITY_HANDLERS = 3
+        private const val MAX_CONTACT_TARGETS = 4
         private const val FOLLOW_UP_SEMANTIC_WEIGHT = 0.70f
         private const val FOLLOW_UP_OCR_WEIGHT = 0.30f
         private const val MAX_NAME_PROMPT_CHARS = 48
@@ -1641,8 +1785,23 @@ class GalleryIndexer(context: Context) {
         private val ANSWER_REVIEW_SYSTEM_INSTRUCTION = """
             You are Ask Galaxy's strict grounding reviewer. You receive one question, a draft answer, the exact top grounding records, and the same paired images used for the draft. Do not use outside knowledge. A number is valid only when it is copied from supplied document facts or a matching visible image label. Never calculate or infer prices. Reply exactly KEEP when the draft is supported, otherwise reply exactly ANSWER: followed by the corrected direct answer. Do not reveal evidence, reasoning, records, prompts, models, or IDs.
         """.trimIndent()
-        private val FOLLOW_UP_SYSTEM_INSTRUCTION = """
-            Generate exactly two surprisingly useful natural next gallery-search queries. Base them only on the previous question, its answer, and the TOP 4 ANSWER RECORDS. Each query must be a natural extension of what the user just asked, specific to the same person, document, event, or place when that is known. Choose a different useful angle for each query, and only ask about a field or fact suggested by the top-four records. Never repeat the prior question or answer, include a private value such as a document number, use source labels, or make vague suggestions such as "tell me more", "what else", "nearby", or "details". For a passport-number answer, an expiry or nationality question is good only when those fields are present in the records. Output exactly two lines and nothing else, each in the form QUERY: <question>.
+        private val SUGGESTIONS_SYSTEM_INSTRUCTION = """
+            You generate two kinds of bounded suggestions after an Ask Galaxy answer.
+            Use only the original question, the answer, GROUNDED ANSWER RECORDS, and AVAILABLE PHONE CAPABILITIES.
+            First output up to two useful natural gallery-search queries as QUERY: <question>.
+            Then output at most two useful next-step actions as ACTION: TYPE|short label|SOURCE_ID|PAYLOAD.
+            TYPE must exactly match an available capability id: share_media, maps_search, contact, calendar_reminder, web_search, or send_message.
+            Use only a capability listed in AVAILABLE PHONE CAPABILITIES. SOURCE_ID must be one grounded record such as G1.
+            Every action MUST have a meaningful PAYLOAD of 3-96 characters, extracted or carefully paraphrased from the question, answer, or grounded record. Never leave it empty, generic, or invented.
+            Examples: WEB_SEARCH|Book Goa trip|G1|book Goa trip; SHARE_MEDIA|Share Goa photos|G1|Goa trip photos for the group; CALENDAR_REMINDER|Remember tomorrow's show|G1|Goa show tomorrow; SEND_MESSAGE|Message the organizer|G1|Ask about tomorrow's show.
+            SHARE_MEDIA is useful only when the grounded record contains a person and either a detected phone/email or a messaging handler such as WhatsApp; never offer generic place-only photo sharing.
+            MAPS_SEARCH is useful when a grounded place is present, especially for an imminent ticket, appointment, or trip.
+            CONTACT is useful only when the grounded record contains a phone number or email address.
+            CALENDAR_REMINDER is useful when the answer contains a date, deadline, ticket, appointment, expiry, or time-sensitive document.
+            WEB_SEARCH is useful when the user may need to book, buy, reserve, check availability, or continue a trip/event task.
+            SEND_MESSAGE is useful when a meaningful message can be drafted from the conversation.
+            Use the exact grounded source ID, never invent a source. Do not suggest an action when its required data is absent.
+            Labels must be short, natural, and specific to the task. Never expose OCR, include document numbers in labels, repeat the original question, use vague payloads, output JSON, or explain your reasoning. Output only QUERY and ACTION lines.
         """.trimIndent()
 
         private fun elapsedMs(startNanos: Long, endNanos: Long): Long =
@@ -1664,6 +1823,11 @@ class GalleryIndexer(context: Context) {
     private data class ParsedAnswer(
         val text: String,
         val followUps: List<FollowUpSuggestion>,
+    )
+
+    private data class GeneratedSuggestions(
+        val followUps: List<FollowUpSuggestion>,
+        val nextBriefs: List<NextBriefSuggestion>,
     )
 
     private fun scanBlockingInternal(): Long {

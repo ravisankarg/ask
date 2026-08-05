@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.res.ColorStateList
 import android.content.Intent
+import android.content.ClipData
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -12,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.net.Uri
+import android.provider.CalendarContract
 import android.util.LruCache
 import android.text.InputType
 import android.view.Gravity
@@ -28,6 +31,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.work.WorkManager
 import android.graphics.drawable.GradientDrawable
 
@@ -49,6 +53,8 @@ class MainActivity : Activity() {
     private lateinit var conversationPanel: LinearLayout
     private lateinit var followUpPanel: LinearLayout
     private lateinit var followUpRow: LinearLayout
+    private lateinit var nextBriefPanel: LinearLayout
+    private lateinit var nextBriefRow: LinearLayout
     private lateinit var sourcePanel: LinearLayout
     private lateinit var sourceRow: LinearLayout
     private lateinit var sourceDetails: LinearLayout
@@ -205,7 +211,7 @@ class MainActivity : Activity() {
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(30), dp(24), dp(30))
+            setPadding(dp(20), dp(18), dp(20), dp(20))
             setBackgroundColor(Color.rgb(247, 247, 249))
         }
         conversationScroll.addView(root, ViewGroup.LayoutParams(
@@ -229,7 +235,7 @@ class MainActivity : Activity() {
         }
         titleGroup.addView(title, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
-            dp(56),
+            dp(52),
         ))
         titleGroup.addView(TextView(this).apply {
             text = "v${BuildConfig.VERSION_NAME}"
@@ -244,7 +250,7 @@ class MainActivity : Activity() {
         ).apply {
             leftMargin = dp(9)
         })
-        header.addView(titleGroup, LinearLayout.LayoutParams(0, dp(56), 1f))
+        header.addView(titleGroup, LinearLayout.LayoutParams(0, dp(52), 1f))
         header.addView(TextView(this).apply {
             text = "⋯"
             textSize = 28f
@@ -260,12 +266,12 @@ class MainActivity : Activity() {
             setOnClickListener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
             }
-        }, LinearLayout.LayoutParams(dp(52), dp(52)))
+        }, LinearLayout.LayoutParams(dp(48), dp(48)))
         root.addView(header, matchWrap())
 
         preparationPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(28), 0, 0)
+            setPadding(0, dp(16), 0, 0)
         }
         preparationStatus = TextView(this).apply {
             text = "Preparing your private gallery…"
@@ -279,20 +285,20 @@ class MainActivity : Activity() {
             android.R.attr.progressBarStyleHorizontal,
         ).apply {
             max = 100
-            setPadding(0, dp(18), 0, dp(12))
+            setPadding(0, dp(12), 0, dp(8))
         }
         preparationPanel.addView(preparationProgress, matchWrap())
         preparationPanel.addView(TextView(this).apply {
             text = "You can leave Ask Galaxy. Model installation and indexing continue securely in the background."
             textSize = 13f
             setTextColor(Color.GRAY)
-            setPadding(0, 0, 0, dp(20))
+            setPadding(0, 0, 0, dp(12))
         }, matchWrap())
         root.addView(preparationPanel, matchWrap())
 
         facePromptPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(18), dp(18), dp(18))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             background = roundedBackground(Color.rgb(239, 242, 255), dp(22).toFloat())
             visibility = View.GONE
         }
@@ -306,7 +312,7 @@ class MainActivity : Activity() {
             text = "Give each private face group a name before searching your gallery."
             textSize = 13f
             setTextColor(Color.rgb(73, 78, 111))
-            setPadding(0, dp(6), 0, dp(12))
+            setPadding(0, dp(5), 0, dp(8))
         }, matchWrap())
         facePromptPreview = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -322,24 +328,24 @@ class MainActivity : Activity() {
                 startActivity(Intent(this@MainActivity, FaceClustersActivity::class.java))
             }
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46)).apply {
-            topMargin = dp(14)
+            topMargin = dp(10)
         })
         val facePromptParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         )
-        facePromptParams.topMargin = dp(22)
+        facePromptParams.topMargin = dp(14)
         root.addView(facePromptPanel, facePromptParams)
 
         searchPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(0, dp(30), 0, 0)
+            setPadding(0, dp(18), 0, 0)
         }
         val searchCard = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(18), 0, dp(12), 0)
+            setPadding(dp(14), 0, dp(10), 0)
             background = roundedBackground(
                 Color.WHITE,
                 dp(22).toFloat(),
@@ -352,7 +358,7 @@ class MainActivity : Activity() {
             textSize = 28f
             setTextColor(Color.rgb(142, 142, 147))
             gravity = Gravity.CENTER
-        }, LinearLayout.LayoutParams(dp(36), dp(60)))
+        }, LinearLayout.LayoutParams(dp(32), dp(52)))
         query = EditText(this).apply {
             hint = "Ask about photos, trips, or receipts"
             textSize = 16f
@@ -372,12 +378,12 @@ class MainActivity : Activity() {
                 }
             }
         }
-        searchCard.addView(query, LinearLayout.LayoutParams(0, dp(60), 1f))
+        searchCard.addView(query, LinearLayout.LayoutParams(0, dp(52), 1f))
         searchPanel.addView(searchCard, matchWrap())
         gemmaWarmupPanel = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(7), dp(12), 0)
+            setPadding(dp(10), dp(4), dp(10), 0)
             visibility = View.GONE
         }
         gemmaWarmupIndicator = ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
@@ -404,7 +410,7 @@ class MainActivity : Activity() {
         timeStatsPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(12), dp(10), dp(12), dp(11))
+            setPadding(dp(10), dp(8), dp(10), dp(8))
             background = roundedBackground(Color.rgb(246, 247, 252), dp(16).toFloat())
         }
         val queryTelemetryHeader = LinearLayout(this).apply {
@@ -424,7 +430,7 @@ class MainActivity : Activity() {
         timeStatsDetails = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(4), dp(9), dp(4), 0)
+            setPadding(dp(4), dp(6), dp(4), 0)
         }
         timeStatsButton = TextView(this).apply {
             text = "◷  Timing…"
@@ -444,7 +450,7 @@ class MainActivity : Activity() {
         }
         queryTelemetryHeader.addView(
             timeStatsButton,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30)),
         )
         timeStatsPanel.addView(queryTelemetryHeader, matchWrap())
         qpOutputText = TextView(this).apply {
@@ -453,7 +459,7 @@ class MainActivity : Activity() {
             typeface = Typeface.MONOSPACE
             setTextColor(Color.rgb(43, 48, 78))
             setTextIsSelectable(true)
-            setPadding(0, dp(7), 0, 0)
+            setPadding(0, dp(5), 0, 0)
         }
         timeStatsPanel.addView(qpOutputText, matchWrap())
         timeStatsPanel.addView(timeStatsDetails, matchWrap())
@@ -461,37 +467,37 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
         ).apply {
-            topMargin = dp(8)
+            topMargin = dp(6)
         })
 
         resultPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(0), dp(24), dp(0), dp(12))
+            setPadding(dp(0), dp(12), dp(0), dp(8))
         }
         answer = TextView(this).apply {
             textSize = 15f
             setTextColor(Color.rgb(42, 44, 52))
-            setPadding(dp(6), 0, dp(6), dp(14))
+            setPadding(dp(6), 0, dp(6), dp(8))
         }
         resultPanel.addView(answer, matchWrap())
         conversationPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(6), 0, dp(6), dp(10))
+            setPadding(dp(6), 0, dp(6), dp(6))
         }
         resultPanel.addView(conversationPanel, matchWrap())
         followUpPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(6), 0, dp(6), dp(14))
+            setPadding(dp(6), 0, dp(6), dp(8))
         }
         followUpPanel.addView(TextView(this).apply {
             text = "Try next"
             textSize = 13f
             setTextColor(Color.rgb(91, 95, 110))
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, 0, 0, dp(7))
+            setPadding(0, 0, 0, dp(4))
         }, matchWrap())
         val followUpScroll = android.widget.HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -505,17 +511,41 @@ class MainActivity : Activity() {
         ))
         followUpPanel.addView(followUpScroll, matchWrap())
         resultPanel.addView(followUpPanel, matchWrap())
+        nextBriefPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(6), 0, dp(6), dp(8))
+        }
+        nextBriefPanel.addView(TextView(this).apply {
+            text = "Next Brief"
+            textSize = 13f
+            setTextColor(Color.rgb(91, 95, 110))
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, dp(4))
+        }, matchWrap())
+        val nextBriefScroll = android.widget.HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+        }
+        nextBriefRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        nextBriefScroll.addView(nextBriefRow, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        nextBriefPanel.addView(nextBriefScroll, matchWrap())
+        resultPanel.addView(nextBriefPanel, matchWrap())
         sourcePanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
-            setPadding(dp(6), 0, dp(6), dp(14))
+            setPadding(dp(6), 0, dp(6), dp(8))
         }
         sourcePanel.addView(TextView(this).apply {
             text = "Answer context • selected from the search results"
             textSize = 13f
             setTextColor(Color.rgb(91, 95, 110))
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, 0, 0, dp(7))
+            setPadding(0, 0, 0, dp(4))
         }, matchWrap())
         val sourceScroll = android.widget.HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -548,7 +578,7 @@ class MainActivity : Activity() {
         modelStatus = TextView(this).apply {
             textSize = 13f
             setTextColor(Color.rgb(91, 95, 110))
-            setPadding(dp(6), dp(8), dp(6), dp(8))
+            setPadding(dp(6), dp(4), dp(6), dp(4))
             visibility = View.GONE
         }
         resultPanel.addView(modelStatus, matchWrap())
@@ -556,23 +586,23 @@ class MainActivity : Activity() {
             textSize = 14f
             setTextColor(Color.rgb(63, 66, 78))
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(6), dp(8), dp(6), dp(4))
+            setPadding(dp(6), dp(4), dp(6), dp(2))
             visibility = View.GONE
         }
         resultPanel.addView(resultCount, matchWrap())
         resultGrid = GridView(this).apply {
             numColumns = 2
             horizontalSpacing = dp(8)
-            verticalSpacing = dp(8)
+            verticalSpacing = dp(6)
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
             isVerticalScrollBarEnabled = true
             overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            setPadding(0, dp(4), 0, dp(4))
+            setPadding(0, dp(2), 0, dp(2))
             clipToPadding = false
         }
         resultPanel.addView(
             resultGrid,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(520)),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(456)),
         )
         // Keep the full search browser ahead of the bounded answer context.
         // The 4 records selected for Gemma must never look like a replacement
@@ -747,6 +777,8 @@ class MainActivity : Activity() {
         sourceDetails.removeAllViews()
         followUpPanel.visibility = View.GONE
         followUpRow.removeAllViews()
+        nextBriefPanel.visibility = View.GONE
+        nextBriefRow.removeAllViews()
         showQueryPlanningTelemetry()
         expandedSourceId = null
         setModelLoading(true, "Blending image, OCR, and metadata matches…")
@@ -822,6 +854,8 @@ class MainActivity : Activity() {
                     setModelLoading(false, "")
                     followUpPanel.visibility = View.GONE
                     followUpRow.removeAllViews()
+                    nextBriefPanel.visibility = View.GONE
+                    nextBriefRow.removeAllViews()
                     sourcePanel.visibility = View.GONE
                     warmPlannerForNextSearch()
                     return@runOnUiThread
@@ -872,6 +906,7 @@ class MainActivity : Activity() {
                                     sourceRow.removeAllViews()
                                     sourceDetails.removeAllViews()
                                     renderFollowUps(emptyList(), emptyList(), generation)
+                                    renderNextBriefs(emptyList(), generation)
                                     renderQpOutput(it.effectivePlanJson)
                                     renderTimeStats(it.timings, "Total")
                                     refreshPreparation()
@@ -879,6 +914,8 @@ class MainActivity : Activity() {
                                 onFailure = {
                                     followUpPanel.visibility = View.GONE
                                     followUpRow.removeAllViews()
+                                    nextBriefPanel.visibility = View.GONE
+                                    nextBriefRow.removeAllViews()
                                     sourcePanel.visibility = View.GONE
                                     renderTimeStats(response.timings, "Search")
                                     answer.visibility = View.VISIBLE
@@ -891,6 +928,13 @@ class MainActivity : Activity() {
                         runOnUiThread {
                             if (generation == searchGeneration && suggestions.isNotEmpty()) {
                                 renderFollowUpsAfterAnswer(suggestions, generation)
+                            }
+                        }
+                    },
+                    onNextBriefs = { suggestions ->
+                        runOnUiThread {
+                            if (generation == searchGeneration && suggestions.isNotEmpty()) {
+                                renderNextBriefsAfterAnswer(suggestions, generation)
                             }
                         }
                     },
@@ -1047,7 +1091,12 @@ class MainActivity : Activity() {
         generation: Long,
         totalMatches: Int = matches.size,
     ) {
-        resultGrid.layoutParams = resultGrid.layoutParams.apply { height = dp(520) }
+        // Keep small result sets compact; larger sets retain an internal
+        // scroll surface instead of pushing the rest of the page downward.
+        val visibleRows = ((matches.size + 1) / 2).coerceIn(1, 2)
+        resultGrid.layoutParams = resultGrid.layoutParams.apply {
+            height = dp(visibleRows * 219 + 4)
+        }
         val current = resultAdapter
         if (current == null || current.generation != generation || !current.hasSameItems(matches)) {
             resultGrid.adapter = null
@@ -1072,7 +1121,7 @@ class MainActivity : Activity() {
         if (evidence.isEmpty()) return
         renderResults(evidence, generation)
         resultGrid.layoutParams = resultGrid.layoutParams.apply {
-            height = dp(220 * ((evidence.size + 1) / 2))
+            height = dp(219 * ((evidence.size + 1) / 2) + 4)
         }
         resultGrid.requestLayout()
         resultCount.text = "Evidence used for this answer • ${evidence.size} selected photo${if (evidence.size == 1) "" else "s"}"
@@ -1344,6 +1393,13 @@ class MainActivity : Activity() {
                     }
                 }
             },
+            onNextBriefs = { suggestions ->
+                runOnUiThread {
+                    if (generation == searchGeneration && !followUpInFlight && suggestions.isNotEmpty()) {
+                        renderNextBriefsAfterAnswer(suggestions, generation)
+                    }
+                }
+            },
         )
     }
 
@@ -1358,6 +1414,120 @@ class MainActivity : Activity() {
             }
         }
     }
+
+    private fun renderNextBriefsAfterAnswer(
+        suggestions: List<NextBriefSuggestion>,
+        generation: Long,
+    ) {
+        conversationPanel.post {
+            if (generation == searchGeneration && !followUpInFlight) {
+                renderNextBriefs(suggestions, generation)
+            }
+        }
+    }
+
+    private fun renderNextBriefs(
+        suggestions: List<NextBriefSuggestion>,
+        generation: Long,
+    ) {
+        nextBriefRow.removeAllViews()
+        if (suggestions.isEmpty()) {
+            nextBriefPanel.visibility = View.GONE
+            return
+        }
+        nextBriefPanel.visibility = View.VISIBLE
+        suggestions.forEach { suggestion ->
+            val chip = TextView(this).apply {
+                text = "↗ ${suggestion.text}"
+                textSize = 13f
+                setTextColor(Color.rgb(34, 91, 72))
+                setPadding(dp(13), dp(8), dp(13), dp(8))
+                maxLines = 2
+                background = roundedBackground(Color.rgb(231, 248, 239), dp(18).toFloat())
+                isClickable = true
+                setOnClickListener { executeNextBrief(suggestion, generation) }
+            }
+            nextBriefRow.addView(chip, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { marginEnd = dp(7) })
+        }
+    }
+
+    private fun executeNextBrief(
+        suggestion: NextBriefSuggestion,
+        generation: Long,
+    ) {
+        if (generation != searchGeneration) return
+        val records = activeSearchResponse?.answerContext?.records
+            ?: activeSearchResponse?.answerGallery.orEmpty()
+        val index = suggestion.sourceId.removePrefix("G").toIntOrNull()?.minus(1) ?: return
+        val media = records.getOrNull(index) ?: return
+        val intent = when (suggestion.action) {
+            NextBriefActionType.SHARE_MEDIA -> Intent(Intent.ACTION_SEND).apply {
+                type = media.mimeType.ifBlank { "image/*" }
+                putExtra(Intent.EXTRA_STREAM, Uri.parse(media.contentUri))
+                putExtra(Intent.EXTRA_TEXT, suggestion.payload)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                clipData = ClipData.newRawUri("Ask Galaxy", Uri.parse(media.contentUri))
+            }
+            NextBriefActionType.MAPS_SEARCH -> {
+                val place = media.locationName?.takeIf(String::isNotBlank)
+                    ?: media.location?.takeIf(String::isNotBlank)
+                    ?: return
+                Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=${Uri.encode(place)}"))
+            }
+            NextBriefActionType.CONTACT -> {
+                val email = contactEmail(media.ocrText)
+                val phone = contactPhone(media.ocrText)
+                when {
+                    email != null -> Intent(Intent.ACTION_SENDTO).apply {
+                        data = Uri.parse("mailto:$email")
+                        putExtra(Intent.EXTRA_TEXT, suggestion.payload)
+                    }
+                    phone != null -> Intent(Intent.ACTION_DIAL, Uri.parse("tel:${phone.filter { it.isDigit() || it == '+' }}"))
+                    else -> return
+                }
+            }
+            NextBriefActionType.CALENDAR_REMINDER -> Intent(Intent.ACTION_INSERT).apply {
+                setData(CalendarContract.Events.CONTENT_URI)
+                putExtra(CalendarContract.Events.TITLE, suggestion.payload)
+                putExtra(CalendarContract.Events.DESCRIPTION, "Created from Ask Galaxy. Source: ${media.displayName}")
+            }
+            NextBriefActionType.WEB_SEARCH -> Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("https://www.google.com/search?q=${Uri.encode(suggestion.payload)}"),
+            )
+            NextBriefActionType.SEND_MESSAGE -> {
+                val phone = contactPhone(media.ocrText)
+                if (phone != null) {
+                    Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${phone.filter { it.isDigit() || it == '+' }}")).apply {
+                        putExtra("sms_body", suggestion.payload)
+                    }
+                } else {
+                    Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, suggestion.payload)
+                    }
+                }
+            }
+        }
+        runCatching {
+            startActivity(Intent.createChooser(intent, suggestion.text))
+        }.onFailure {
+            Toast.makeText(this, "No app is available for this action yet.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun contactEmail(text: String): String? =
+        Regex("[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", RegexOption.IGNORE_CASE)
+            .find(text)?.value
+
+    private fun contactPhone(text: String): String? =
+        Regex("(?<!\\d)\\+?[0-9][0-9 ()-]{6,}[0-9](?!\\d)")
+            .findAll(text)
+            .map { it.value.trim() }
+            .firstOrNull { it.count(Char::isDigit) >= 7 }
 
     private fun appendConversationTurn(question: String, answerText: String) {
         appendConversationQuestion(question)

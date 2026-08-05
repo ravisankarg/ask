@@ -26,6 +26,30 @@ data class FollowUpSuggestion(
     val isQuery: Boolean = true,
 )
 
+enum class NextBriefActionType {
+    SHARE_MEDIA,
+    MAPS_SEARCH,
+    CONTACT,
+    CALENDAR_REMINDER,
+    WEB_SEARCH,
+    SEND_MESSAGE,
+}
+
+data class NextBriefSuggestion(
+    val action: NextBriefActionType,
+    val text: String,
+    /** Grounding record such as G1; resolved locally before the action runs. */
+    val sourceId: String,
+    /** Optional short cue selected by Gemma, used only for web/message intents. */
+    val payload: String = "",
+)
+
+data class NextBriefCapability(
+    val id: String,
+    val label: String,
+    val handlers: String,
+)
+
 data class SearchResponse(
     val gallery: List<GalleryMedia>,
     /** Full evaluated match count; [gallery] is the bounded UI browsing window. */
