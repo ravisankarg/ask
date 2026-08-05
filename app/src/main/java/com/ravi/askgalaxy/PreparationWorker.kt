@@ -241,9 +241,6 @@ class PreparationWorker(
             } else {
                 PreparationPhase.READY
             }
-            if (KvIndexPreferences.isEnabled(applicationContext)) {
-                KvIndexScheduler.enqueue(applicationContext, replaceExisting = false)
-            }
             indexProgressStore.update(
                 IndexProgressStage.VISUAL,
                 progress.completed.toLong(),

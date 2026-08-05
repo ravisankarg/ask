@@ -35,17 +35,12 @@ data class AnswerContextBundle(
 
 /** Converts the Gemma category into the same eligibility policy used by search and answers. */
 object QueryCategoryContextPolicy {
-    const val SCENARY_ANSWER_IMAGE_LIMIT = 4
-    const val SCENARY_ANSWER_IMAGE_MAX_DIMENSION = 512
-    const val ANSWER_IMAGE_MAX_DIMENSION = SCENARY_ANSWER_IMAGE_MAX_DIMENSION
+    /** Four 512 px inputs are the normal, medium-budget Gemma E4B answer path. */
+    const val ANSWER_IMAGE_LIMIT = 4
+    const val ANSWER_IMAGE_MAX_DIMENSION = 512
 
-    fun answerImageLimit(
-        category: QueryCategory,
-        modelVariant: GemmaModelVariant? = null,
-    ): Int = when {
-        category == QueryCategory.DOC && modelVariant == GemmaModelVariant.E2B ->
-            SCENARY_ANSWER_IMAGE_LIMIT
-        category == QueryCategory.SCENARY -> SCENARY_ANSWER_IMAGE_LIMIT
+    fun answerImageLimit(category: QueryCategory): Int = when (category) {
+        QueryCategory.DOC, QueryCategory.SCENARY -> ANSWER_IMAGE_LIMIT
         else -> 0
     }
 
@@ -93,7 +88,6 @@ class AnswerContextPicker(
         evidenceScope: AnswerEvidenceScope,
         queryCategory: QueryCategory,
         ocrKeywords: List<String> = emptyList(),
-        useKvIndex: Boolean = false,
         maxRecords: Int = MAX_RECORDS,
     ): AnswerContextBundle {
         val inputCandidates = rankedCandidates.distinctBy { it.mediaStoreId }
@@ -118,30 +112,6 @@ class AnswerContextPicker(
         }.toMap()
         val queryText = query.lowercase(Locale.ROOT)
         if (queryCategory == QueryCategory.DOC) {
-            if (useKvIndex) {
-                val chosen = eligibleCandidates.take(safeMax).map { media ->
-                    AnswerContextItem(
-                        media,
-                        setOf(AnswerCoverageFacet.CATEGORY_MATCH, AnswerCoverageFacet.RELEVANCE, AnswerCoverageFacet.OCR),
-                    )
-                }
-                val metadataFields = buildSet {
-                    addAll(evidenceScope.metadataFields)
-                    if (chosen.any { !it.media.personLabel.isNullOrBlank() }) add(AnswerMetadataField.PEOPLE)
-                    if (chosen.any { !it.media.locationName.isNullOrBlank() || !it.media.location.isNullOrBlank() }) {
-                        add(AnswerMetadataField.LOCATION)
-                    }
-                }
-                return AnswerContextBundle(
-                    items = chosen,
-                    metadataFields = metadataFields,
-                    includeOcr = true,
-                    queryCategory = queryCategory,
-                    includeVisuals = false,
-                    inputCandidateCount = inputCandidates.size,
-                    eligibleCandidateCount = eligibleCandidates.size,
-                )
-            }
             val normalizedKeywords = ocrKeywords
                 .map(String::lowercase)
                 .distinct()

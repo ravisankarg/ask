@@ -241,16 +241,9 @@ class QueryAndDiversityContractTest {
         assertFalse(QueryCategory.LOCATION.answerEvidenceScope().needsVisual)
         assertFalse(QueryCategory.TIME.answerEvidenceScope().needsVisual)
         assertEquals(4, QueryCategoryContextPolicy.answerImageLimit(QueryCategory.SCENARY))
-        assertEquals(0, QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC))
-        assertEquals(
-            4,
-            QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC, GemmaModelVariant.E2B),
-        )
-        assertEquals(
-            0,
-            QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC, GemmaModelVariant.E4B),
-        )
-        assertEquals(512, QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_MAX_DIMENSION)
+        assertEquals(4, QueryCategoryContextPolicy.answerImageLimit(QueryCategory.DOC))
+        assertTrue(QueryCategoryContextPolicy.includesVisuals(QueryCategory.DOC))
+        assertEquals(512, QueryCategoryContextPolicy.ANSWER_IMAGE_MAX_DIMENSION)
     }
 
     @Test
@@ -1039,7 +1032,6 @@ class QueryAndDiversityContractTest {
             timeHint = longText,
             locationHint = longText,
             recentFirst = true,
-            needsPersonalContext = true,
             mediaType = QueryMediaType.PHOTOS,
             answerEvidenceScope = AnswerEvidenceScope.all(),
         )

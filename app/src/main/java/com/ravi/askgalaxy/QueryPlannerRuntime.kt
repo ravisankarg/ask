@@ -605,14 +605,14 @@ object QueryPlannerRuntime {
     }
 
     /**
-     * E2B occasionally omits the closing bracket immediately before the top-level
+     * The planner occasionally omits the closing bracket immediately before the top-level
      * `&&` in a routing predicate, for example `[query_category == doc && ...`.
      * This changes no query term or operator: only the two fixed envelope fields
      * and their finite allowed values are eligible. The normal parser and every
      * production validator still run after this recovery.
      */
     internal fun repairUnambiguousEnvelopeBracket(candidate: String): String {
-        // E2B can collapse both fixed routing predicates into a single
+        // The planner can collapse both fixed routing predicates into a single
         // opening bracket: `[answer_needed == false && query_category ==
         // person && [people_only == Ravi]]`. Recover only that finite grammar
         // shell, retaining the model-authored retrieval predicate untouched.

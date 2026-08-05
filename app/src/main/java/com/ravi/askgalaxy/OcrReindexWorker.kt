@@ -63,9 +63,6 @@ class OcrReindexWorker(
                 )
             }
             val remaining = database.pendingOcrCount()
-            if (remaining == 0 && KvIndexPreferences.isEnabled(applicationContext)) {
-                KvIndexScheduler.enqueue(applicationContext, replaceExisting = false)
-            }
             if (remaining == 0) {
                 progressStore.update(
                     IndexProgressStage.OCR,

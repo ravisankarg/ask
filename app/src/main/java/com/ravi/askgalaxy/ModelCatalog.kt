@@ -29,7 +29,6 @@ enum class GemmaModelVariant(
     val preferenceValue: String,
     val displayName: String,
 ) {
-    E2B("e2b", "Gemma 4 E2B"),
     E4B("e4b", "Gemma 4 E4B"),
     ;
 
@@ -39,7 +38,7 @@ enum class GemmaModelVariant(
     }
 }
 
-/** The selected model is persistent; both downloads are kept independently. */
+/** The selected model is persistent. */
 object GemmaModelSelection {
     private const val PREFERENCES = "ask_galaxy_model_selection"
     private const val VARIANT_KEY = "gemma_variant"
@@ -125,17 +124,6 @@ object ModelCatalog {
         sourceLabel = "Pinned Apache-2.0 Android FaceNet TFLite artifact",
     )
 
-    val gemmaE2B = ModelArtifact(
-        name = "Gemma 4 E2B instruction",
-        relativePath = "models/gemma-4-E2B-it.litertlm",
-        runtime = "LiteRT-LM",
-        required = true,
-        downloadUrl = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/9262660a1676eed6d0c477ab1a86344430854664/gemma-4-E2B-it.litertlm?download=true",
-        expectedBytes = 2_588_147_712L,
-        sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
-        sourceLabel = "LiteRT Community pinned model revision",
-    )
-
     val gemmaE4B = ModelArtifact(
         name = "Gemma 4 E4B instruction",
         relativePath = "models/gemma-4-E4B-it.litertlm",
@@ -147,35 +135,20 @@ object ModelCatalog {
         sourceLabel = "LiteRT Community pinned model revision",
     )
 
-    // The public GGUF release is consumed by the embedded llama.cpp runtime.
-    // Keep it optional: enabling KV index never blocks the normal gallery path.
-    val lfmKvModel = ModelArtifact(
-        name = "LiquidAI LFM2.5-VL-450M KV model",
-        relativePath = "models/lfm2.5-vl/LFM2.5-VL-450M-Q4_K_M.gguf",
-        runtime = "llama.cpp GGUF Q4_K_M",
-        required = false,
-        downloadUrl = "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/6f15859c2de1583b6180a9bc56338342592b589a/LFM2.5-VL-450M-Q4_K_M.gguf?download=true",
-        expectedBytes = 229_313_568L,
-        sourceLabel = "LiquidAI public pinned GGUF release",
-    )
+    fun gemma(context: Context): ModelArtifact = gemmaE4B
 
-    val lfmKvVisionProjector = ModelArtifact(
-        name = "LiquidAI LFM2.5-VL-450M vision projector",
-        relativePath = "models/lfm2.5-vl/mmproj-LFM2.5-VL-450m-Q8_0.gguf",
-        runtime = "llama.cpp multimodal projector",
-        required = false,
-        downloadUrl = "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/6f15859c2de1583b6180a9bc56338342592b589a/mmproj-LFM2.5-VL-450m-Q8_0.gguf?download=true",
-        expectedBytes = 102_815_168L,
-        sourceLabel = "LiquidAI public pinned GGUF release",
-    )
-
-    fun lfmKvArtifacts(): List<ModelArtifact> = listOf(lfmKvModel, lfmKvVisionProjector)
-
-    fun lfmKvInstalled(context: Context): Boolean = lfmKvArtifacts().all { it.isInstalled(context) }
-
-    fun gemma(context: Context): ModelArtifact = when (GemmaModelSelection.selected(context)) {
-        GemmaModelVariant.E2B -> gemmaE2B
-        GemmaModelVariant.E4B -> gemmaE4B
+    /** Removes model files from versions that offered the retired E2B option. */
+    fun removeRetiredModels(context: Context) {
+        val modelsDir = File(context.filesDir, "models")
+        modelsDir.walkBottomUp()
+            .filter { it.name.contains("E2B", ignoreCase = true) }
+            .forEach { if (it.isDirectory) it.deleteRecursively() else it.delete() }
+        File(modelsDir, "lfm2.5-vl").deleteRecursively()
+        context.deleteDatabase("personal_context.db")
+        context.deleteSharedPreferences("ask_galaxy_kv_index")
+        context.deleteSharedPreferences("personal_context_settings")
+        context.getSharedPreferences("ask_galaxy_model_selection", Context.MODE_PRIVATE)
+            .edit().putString("gemma_variant", GemmaModelVariant.E4B.preferenceValue).apply()
     }
 
     fun all(context: Context): List<ModelArtifact> = listOf(

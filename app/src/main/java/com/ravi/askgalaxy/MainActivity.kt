@@ -28,6 +28,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.work.WorkManager
 import android.graphics.drawable.GradientDrawable
 
 class MainActivity : Activity() {
@@ -86,6 +87,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ModelCatalog.removeRetiredModels(this)
+        WorkManager.getInstance(this).cancelUniqueWork("ask_galaxy_kv_document_index")
         PreparationNotifier.createChannel(this)
         galleryIndexer = GalleryIndexer(this)
         setContentView(createContent())
@@ -113,7 +116,6 @@ class MainActivity : Activity() {
 
     private fun startBackgroundMaintenance() {
         GemmaDownloadScheduler.enqueueIfNeeded(this)
-        KvIndexScheduler.resumeIncompleteIndex(this)
         val preparation = PreparationStore(this).read()
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
         val visualWorkerStale =
@@ -155,6 +157,17 @@ class MainActivity : Activity() {
     override fun onPause() {
         handler.removeCallbacks(refresh)
         super.onPause()
+    }
+
+    override fun onStop() {
+        // Full-GPU E4B is intentionally released as soon as the UI is no
+        // longer visible. Reopening the app pays a cold-load cost, but avoids
+        // retaining several GiB of GL/native memory in the background.
+        if (!isChangingConfigurations) {
+            launchPlannerWarmupRequested = false
+            GemmaRuntime.releaseResidentAsync()
+        }
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -613,7 +626,6 @@ class MainActivity : Activity() {
         searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
         if (ready) {
             val plannerReady = GemmaRuntime.isPlannerReady()
-            val kvIndexing = KvIndexPreferences.isIndexing(this)
             val hasReusableFollowUpContext = activeSearchResponse != null && !followUpInFlight
             // A submitted query must consume the prewarmed QP system KV.
             // An uncached Conversation re-prefills the 12K system context and
@@ -625,8 +637,6 @@ class MainActivity : Activity() {
             gemmaWarmupIndicator.visibility = if (showWarmup) View.VISIBLE else View.GONE
             gemmaWarmupStatus.text = if (plannerReady) {
                 "${GemmaModelSelection.selected(this).displayName} ready • local ${GemmaRuntime.backendPlacement()}"
-            } else if (kvIndexing) {
-                "KV indexing is using CPU (4 threads) • Gemma 4 warm-up is paused"
             } else if (hasReusableFollowUpContext) {
                 "Follow-up answers are ready from the current results"
             } else {
@@ -655,7 +665,7 @@ class MainActivity : Activity() {
             // planner warmups are scheduled after the answer session closes.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
-            if (pendingOcr == 0 && !KvIndexPreferences.isIndexing(this)) {
+            if (pendingOcr == 0) {
                 launchPlannerWarmupRequested = true
                 GemmaRuntime.preloadPlannerAsync(
                     this,
@@ -764,11 +774,7 @@ class MainActivity : Activity() {
                             }
                             SearchStage.HYBRID_RETRIEVAL -> {
                                 renderTimeStats(progress.timings, "Search")
-                                if (progress.contextCount > 0) {
-                                    "Blending image, OCR, metadata, and ${progress.contextCount} personal context matches…"
-                                } else {
-                                    "Blending image, OCR, and metadata matches…"
-                                }
+                                "Blending image, OCR, and metadata matches…"
                             }
                             SearchStage.DIVERSE_EVIDENCE -> {
                                 renderTimeStats(progress.timings, "Search")
@@ -798,19 +804,17 @@ class MainActivity : Activity() {
                 }
                 renderQpOutput(response.effectivePlanJson)
                 renderTimeStats(response.timings, "Search")
-                if (response.gallery.isEmpty() && response.personalContext.isEmpty()) {
+                if (response.gallery.isEmpty()) {
                     activeSearchResponse = null
                     response.plannerSession?.close()
                     setModelLoading(false, "")
                     warmPlannerForNextSearch()
-                    answer.text = "I couldn't find matching photos or personal context yet."
+                    answer.text = "I couldn't find matching photos yet."
                     return@runOnUiThread
                 }
                 if (response.gallery.isNotEmpty()) {
                     renderResults(response.gallery, generation, response.totalGalleryMatches)
                     answer.text = "I found ${response.totalGalleryMatches} matching item${if (response.totalGalleryMatches == 1) "" else "s"}."
-                } else {
-                    answer.text = "I found relevant personal context."
                 }
                 if (!response.needsAnswer) {
                     activeSearchResponse = null
@@ -829,16 +833,14 @@ class MainActivity : Activity() {
                     contextCount > 0
                 val visualCount = if (hasVisualContext) {
                     contextCount.coerceAtMost(
-                        QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_LIMIT,
+                        QueryCategoryContextPolicy.ANSWER_IMAGE_LIMIT,
                     )
                 } else {
                     0
                 }
                 setModelLoading(
                     true,
-                    if (hasVisualContext && response.personalContext.isNotEmpty()) {
-                        "${GemmaModelSelection.selected(this).displayName} is joining $visualCount downscaled scenery images with $contextCount text records and personal context…"
-                    } else if (hasVisualContext) {
+                    if (hasVisualContext) {
                         "${GemmaModelSelection.selected(this).displayName} is joining $visualCount downscaled scenery images with $contextCount text records…"
                     } else {
                         "${GemmaModelSelection.selected(this).displayName} is reading $contextCount scoped OCR/metadata record${if (contextCount == 1) "" else "s"}…"
@@ -1216,7 +1218,6 @@ class MainActivity : Activity() {
         sources.forEach { source ->
             val icon = when (source.type) {
                 AnswerSourceType.GALLERY_IMAGE -> "▣"
-                AnswerSourceType.PERSONAL_CONTEXT -> source.context?.kind?.icon ?: "•"
             }
             val chip = TextView(this).apply {
                 text = "$icon ${source.label}"

@@ -55,8 +55,9 @@ The current milestone is an automatic, background-safe foundation:
 - Gemma answers stay natural and concise (2–3 sentences), never expose internal
   evidence IDs/reasoning/task echoes, and never add synthetic browse filler;
 - Context Picker's selected records are prompt-compacted for repeated
-  structured facts; QP/language remains on CPU while only Gemma vision uses GPU
-  with a CPU-vision initialization fallback;
+  structured facts; Gemma 4 E4B runs both its QP/language and vision graphs on
+  GPU, with no silent CPU fallback. It releases when the app backgrounds, and
+  visual answers do not reserve a disposable text-only answer prefill;
 - all shipped arm64 ELF load segments and APK native-library entries are 16 KiB aligned;
 - no Python, PyTorch, Paddle, ONNX Runtime, cloud retrieval, or cloud answer
   service is part of the APK; location enrichment tries Android's geocoder
@@ -150,19 +151,15 @@ persists one category per media row:
 an image with any non-empty OCR is `doc`; every other image/video is `scenary`.
 The QP category is a hard search-index scope, so the result grid itself contains
 only eligible records. A query-aware Context Picker then chooses at most 8
-records from those scoped results. `doc`, `person`, `location`, and `time`
-stay text-only. Only `scenary` uses persisted SigLIP diversity and may attach
-up to four images downscaled to a 512 px longest edge. Episode coverage and
+records from those scoped results. `doc` and `scenary` attach up to four images
+downscaled to a 512 px longest edge; each document tile is joined with its
+query-relevant OCR text. Only `scenary` uses persisted SigLIP diversity. Person,
+location, and time stay metadata-led. Episode coverage and
 relevance minimize duplicate context.
 Gemma 4 stays resident, but planner and answer use
 clean conversations: the planner session is closed immediately after planning,
 and a separate answer system-prefix prefill may be warmed during retrieval;
-neither role ever reuses the other's execution turn. If the user opts in under
-Settings and grants Android notification access, relevant future travel, receipt,
-delivery, and appointment alerts are searched separately only when the planner asks
-for personal context. OTP/PIN/password and bank-security alerts are skipped, no
-notification history is imported, and only bounded query-relevant facts enter
-the private answer context. The Context Picker's 8 records are never shown as a
+neither role ever reuses the other's execution turn. The Context Picker's 8 records are never shown as a
 replacement for the full result grid.
 
 ## v0.2 query and answer contract
@@ -179,7 +176,7 @@ user question
   -> category-scoped matches -> immediate overall-relevance virtualized result grid
   -> indexed episode membership join
   -> Context Picker -> at most 8 eligible text/metadata records; scenery alone uses persisted SigLIP embedding diversity
-  -> doc/person/location/time text-only answers; scenery may attach up to 4 images downscaled to a 512 px longest edge
+  -> doc/scenary answers attach up to 4 images downscaled to a 512 px longest edge; document images include OCR text
   -> scoped Gemma 4 E4B answer and follow-up generation in a clean answer conversation
   -> 2–3 sentence answer without internal evidence labels + contextual follow-ups
 ```
@@ -207,12 +204,9 @@ The v0.2 boundaries are deliberate:
   `amount`, never mutually exclusive receipt/bill/invoice alternatives. A self
   identity document uses the actual tagged name plus the document word, never
   `person`, `self`, `me`, or `my`.
-  The Context Picker uses
-  at most 8 text records, and only scenery may attach up to 4 downscaled images.
+  The Context Picker uses at most 8 records. Document and scenery answers may
+  attach up to 4 downscaled images, with OCR text paired to document tiles.
   Planner and answer
   use clean Gemma conversations; the planner's stable prefill may reuse KV state, but its execution
   turn is never carried into answer generation.
-- Personal context is opt-in, future-notification-only, encrypted locally, and
-  included only when the QP asks for it.
-
-This is the stable v1 baseline. OCR or notification semantic embeddings can be added later without changing the user-facing answer and source model.
+This is the stable v1 baseline.

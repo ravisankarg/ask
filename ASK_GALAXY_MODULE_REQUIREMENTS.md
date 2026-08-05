@@ -41,10 +41,11 @@ internal planner/evidence disclaimer.
 5. Person names are never hard-coded. Resolve any tagged name through the
    local face-cluster labels and apply the same logic for every name.
 6. Answer context is bounded to at most 8 query-aware, cross-episode records.
-   Doc/person/location/time are text-only. Scenary may attach at most 4
-   downscaled images from those records.
-7. Gemma must reason jointly over the query, complete selected OCR/metadata,
-   people, personal context, and any bounded scenery images.
+   Doc and scenary may attach at most 4 downscaled images from those records;
+   each selected document image includes its query-relevant OCR text.
+   Person/location/time remain text-only.
+7. Gemma must reason jointly over the query, selected OCR/metadata, people,
+   personal context, and any bounded document or scenery images.
 8. The final answer is natural language only. Never show the planner execution
    spec, regex,
    routing keys, code, “based on provided evidence,” “supplied records,”
@@ -87,7 +88,7 @@ WorkManager foreground preparation
 
 ```text
 search field visible
-  -> resident CPU Gemma 4 engine + planner preface warm-up
+  -> resident full-GPU Gemma 4 E4B engine + planner preface warm-up
   -> Gemma-only QP: required query_category + canonical C-like execution AST
   -> effective QP output shown below the search bar before retrieval
   -> recursive set execution over person/date/location/MIME/semantic predicates
@@ -98,7 +99,9 @@ search field visible
   -> Context Picker selects at most 8 eligible representatives without decoding images
   -> scenary: persisted SigLIP embedding diversity + at most 4 EXIF-correct
      answer images downscaled to a 512 px longest edge
-  -> doc/person/location/time: complete selected OCR/metadata text with no image decode
+  -> doc: top 4 OCR-retrieved images downscaled to a 512 px longest edge,
+     joined with their query-relevant OCR text
+  -> person/location/time: selected metadata text with no image decode
   -> clean Gemma answer turn and bounded follow-ups
   -> 2–3 sentence answer, contextual follow-ups, and expandable Time stats
 ```
@@ -160,7 +163,7 @@ Fixed model roles:
 | OCR | bundled ML Kit Text Recognition v2 Latin `16.0.1`, confidence-gated text stored in SQLite |
 | face detection | YuNet boxes + five landmarks |
 | face identity | FaceNet-512, aligned `160x160x3` RGB -> 512-D vector |
-| planner/answer | `google/gemma-4-E4B-it` LiteRT-LM, CPU resident |
+| planner/answer | `google/gemma-4-E4B-it` LiteRT-LM, GPU resident for text and vision |
 
 Requirements:
 
@@ -782,9 +785,8 @@ Primary file: `GemmaRuntime.kt`.
 Fixed runtime contract:
 
 - model file: `gemma-4-E4B-it.litertlm`;
-- CPU backend for the frozen QP and language graph;
-- GPU backend only for the vision encoder/adapter on the target Samsung, with
-  optional OpenCL/VNDK declarations and a CPU-vision initialization fallback;
+- GPU backend for both the frozen QP/language graph and vision encoder/adapter
+  on the target Samsung; no CPU fallback is permitted for E4B;
 - resident singleton engine per app process;
 - planner system preface warmed while the search field is available;
 - planner prefill session is taken for the planning turn;
@@ -846,14 +848,15 @@ episode/group reference when applicable
 
 Image-input contract:
 
-- doc/person/location/time pass no image input;
-- scenary passes at most four individual images, each strictly downscaled to a
-  512 px longest edge;
+- doc and scenary pass at most four individual images, each strictly
+  downscaled to a 512 px longest edge;
+- document images carry the paired OCR text selected for the query;
+- person/location/time pass no image input;
 - the prompt explicitly maps image-input order to G references.
 
 Prompt requirements:
 
-- Tell Gemma to reason over the complete joined text and any scenery images.
+- Tell Gemma to reason over the complete joined text and any attached images.
 - Use local person tags as authoritative identity links.
 - For “when” prefer capture time; for “where” use readable location/raw GPS;
   for “who” use named tags; for OCR use only supplied OCR.
@@ -1033,8 +1036,8 @@ Optimization rules:
   encoder repeatedly.
 - Use hard allowlists to reduce native search work and candidate enrichment.
 - Enrich/reverse-geocode only the final small set.
-- Keep doc/person/location/time answer generation text-only. For scenary,
-  pass at most four separate images with a strict 512 px longest-edge bound.
+- For doc and scenary, pass at most four separate images with a strict 512 px
+  longest-edge bound; document inputs also retain their query-relevant OCR text.
 - Recycle all temporary bitmaps and close conversations in `finally` blocks.
 - Keep Gemma generation serialized and monitor system low-memory kills.
 
@@ -1120,8 +1123,8 @@ For every query verify:
 - effective spec contains the expected person/time/location/MIME/subtraction
   scopes and no hard-coded name behavior;
 - unrelated records do not survive a named person/place/time scope;
-- visual queries attach no more than four 512 px scenery images selected from
-  no more than eight G records, with the correct named face metadata;
+- visual and document queries attach no more than four 512 px images selected
+  from no more than eight G records, with the correct paired OCR/face metadata;
 - metadata/OCR facts are present in the same G records used by Gemma;
 - answer has no planner/evidence/record boilerplate and no execution syntax/regex;
 - activity claims are visually calibrated and dates are capture dates;
@@ -1165,8 +1168,8 @@ text queries use a bounded embedding cache; planner KV is released immediately
 after planning; and planner/answer sampling is explicitly tuned for structured
 routing versus natural prose; the runtime now logs privacy-safe prefill/decode
 counters; named identity boards choose the highest-confidence face crop per
-person; answer rows are duplicate-compacted; language/QP stays on CPU while
-vision uses GPU with CPU initialization fallback; and answer sanitization is
+person; answer rows are duplicate-compacted; E4B language/QP and vision run on
+GPU with no CPU fallback; and answer sanitization is
 pure and unit-tested. The former
 deterministic/fallback planner is now disabled: Gemma emits every category and
 execution AST, gets one grammar-repair turn, and otherwise fails explicitly.

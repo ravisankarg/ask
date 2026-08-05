@@ -23,7 +23,6 @@ enum class SearchStage {
 data class SearchProgress(
     val stage: SearchStage,
     val candidateCount: Int,
-    val contextCount: Int = 0,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
     val plannerJson: String = "",
     val effectivePlanJson: String = "",
@@ -34,11 +33,10 @@ class GalleryIndexer(context: Context) {
     private val appContext = context.applicationContext
     private val resolver: ContentResolver = appContext.contentResolver
     private val database = GalleryDatabase(appContext)
-    private val personalContextDatabase = PersonalContextDatabase(appContext)
     private val semanticIndexer = GallerySemanticIndexer(appContext, database)
     private val metadataReader = GalleryMetadataReader(appContext)
     private val structuredSearchExecutor =
-        StructuredSearchExecutor(database, semanticIndexer, metadataReader, appContext)
+        StructuredSearchExecutor(database, semanticIndexer, metadataReader)
     private val evidenceBuilder = EvidenceBuilder(database)
     private val answerContextPicker = AnswerContextPicker(semanticIndexer)
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -111,15 +109,6 @@ class GalleryIndexer(context: Context) {
                     // Publish the practical browsing window before episode
                     // joining, Context Picker reranking, or Gemma answer work.
                     runCatching { onMatches(uiGallery, candidates.size) }
-                    val contextMatches = if (
-                        searchExecution.answerEvidenceScope.needsPersonalContext &&
-                        PersonalContextSettings.isEnabled(appContext) &&
-                        PersonalContextAccess.isNotificationListenerEnabled(appContext)
-                    ) {
-                        personalContextDatabase.search(query, CONTEXT_RETRIEVAL_LIMIT)
-                    } else {
-                        emptyList()
-                    }
                     timings = timings.copy(
                         searchMs = elapsedMs(planningFinished, System.nanoTime()),
                     )
@@ -127,7 +116,6 @@ class GalleryIndexer(context: Context) {
                         SearchProgress(
                             SearchStage.HYBRID_RETRIEVAL,
                             candidates.size,
-                            contextMatches.size,
                             searchExecution.answerEvidenceScope,
                             searchExecution.plannerJson,
                             searchExecution.effectivePlanJson,
@@ -138,7 +126,6 @@ class GalleryIndexer(context: Context) {
                         SearchProgress(
                             SearchStage.DIVERSE_EVIDENCE,
                             candidates.size,
-                            contextMatches.size,
                             searchExecution.answerEvidenceScope,
                             searchExecution.plannerJson,
                             searchExecution.effectivePlanJson,
@@ -174,7 +161,6 @@ class GalleryIndexer(context: Context) {
                         evidenceScope = searchExecution.answerEvidenceScope,
                         queryCategory = searchExecution.queryCategory,
                         ocrKeywords = searchExecution.ocrKeywords,
-                        useKvIndex = KvIndexPreferences.isEnabled(appContext),
                         maxRecords = MAX_ANSWER_RECORDS,
                     )
                     Log.i(
@@ -212,7 +198,6 @@ class GalleryIndexer(context: Context) {
                         // retaining the full evaluated count.
                         gallery = uiGallery,
                         totalGalleryMatches = candidates.size,
-                        personalContext = contextMatches.take(CONTEXT_ANSWER_LIMIT),
                         answerGallery = answerContext.records,
                         answerContext = answerContext,
                         evidenceRecords = emptyList(),
@@ -368,11 +353,7 @@ class GalleryIndexer(context: Context) {
                     ?.let(response.answerEvidenceScope::withMetadataFields)
                     ?: response.answerEvidenceScope
                 val attachedResults = ArrayList<GalleryMedia>(MAX_ANSWER_RECORDS)
-                val selectedModel = GemmaModelSelection.selected(appContext)
-                val useE2bDocumentImages =
-                    selectedModel == GemmaModelVariant.E2B && response.queryCategory == QueryCategory.DOC
-                val answerImageLimit =
-                    QueryCategoryContextPolicy.answerImageLimit(response.queryCategory, selectedModel)
+                val answerImageLimit = QueryCategoryContextPolicy.answerImageLimit(response.queryCategory)
                 val loadedEvidence = ArrayList<Pair<GalleryMedia, Bitmap>>(answerImageLimit)
                 // A present AnswerContextBundle is authoritative even when its
                 // strict category filter found zero eligible rows. Never fall
@@ -383,11 +364,9 @@ class GalleryIndexer(context: Context) {
                             response.gallery.take(MAX_ANSWER_RECORDS)
                         }
                     ).take(MAX_ANSWER_RECORDS)
-                val includeVisuals = answerImageLimit > 0 && (
-                    useE2bDocumentImages ||
-                        (response.answerContext?.includeVisuals
-                            ?: response.answerEvidenceScope.needsVisual)
-                    )
+                val includeVisuals = answerImageLimit > 0 &&
+                    (response.answerContext?.includeVisuals
+                        ?: response.answerEvidenceScope.needsVisual)
                 val visualGallery = if (includeVisuals) {
                     selectedContextRecords.take(answerImageLimit)
                 } else {
@@ -444,7 +423,7 @@ class GalleryIndexer(context: Context) {
                         "images=${imageBytes.size}, " +
                         "ocr=${evidenceScope.needsOcr}, metadata=${evidenceScope.needsMetadata}",
                 )
-                check(imageBytes.isNotEmpty() || attachedResults.isNotEmpty() || response.personalContext.isNotEmpty()) {
+                check(imageBytes.isNotEmpty() || attachedResults.isNotEmpty()) {
                     "No readable result evidence for Gemma"
                 }
                 val gemma = GemmaRuntime.shared(appContext)
@@ -454,7 +433,6 @@ class GalleryIndexer(context: Context) {
                     val answerPrompt = buildAnswerPrompt(
                         query,
                         attachedResults,
-                        response.personalContext,
                         imageReferences = imageReferences,
                         evidenceScope = evidenceScope,
                         richVisualIds = richVisualIds,
@@ -484,7 +462,6 @@ class GalleryIndexer(context: Context) {
                         prompt = buildAnswerPrompt(
                             query,
                             attachedResults,
-                            response.personalContext,
                             imageReferences = emptyList(),
                             evidenceScope = evidenceScope,
                             richVisualIds = emptySet(),
@@ -498,8 +475,7 @@ class GalleryIndexer(context: Context) {
                 val output = reviewGroundedAnswer(
                     gemma = gemma,
                     query = query,
-                    draft = if (KvIndexPreferences.isEnabled(appContext)) generatedOutput else
-                        DocumentAmountGrounding.constrainAnswer(query, generatedOutput, attachedResults),
+                    draft = DocumentAmountGrounding.constrainAnswer(query, generatedOutput, attachedResults),
                     results = attachedResults,
                     images = imageBytes,
                 )
@@ -521,7 +497,6 @@ class GalleryIndexer(context: Context) {
                 val followUps = (parsed.followUps + defaultFollowUps(
                     query,
                     attachedResults,
-                    response.personalContext,
                 ))
                     .distinctBy { it.text.lowercase() }
                     .take(MAX_FOLLOW_UPS)
@@ -555,7 +530,7 @@ class GalleryIndexer(context: Context) {
                 )
                 AnswerResult(
                     text = parsed.text,
-                    sources = buildAnswerSources(attachedResults, response.personalContext),
+                    sources = buildAnswerSources(attachedResults),
                     followUps = followUps,
                     timings = response.timings
                         .withAnswerTimings(answerGenerationMs, followUpMs)
@@ -569,7 +544,13 @@ class GalleryIndexer(context: Context) {
             } finally {
                 plannerSession?.close()
             }
-            if (warmAnswerAfterAnswer) {
+            // A visual answer cannot reuse a text-only raw prefill session:
+            // takePrefilledAnswerSession(false) must close it before creating
+            // the image-capable Conversation. Avoid retaining that needless
+            // second KV allocation for document/scenery follow-ups.
+            if (warmAnswerAfterAnswer &&
+                QueryCategoryContextPolicy.answerImageLimit(response.queryCategory) == 0
+            ) {
                 GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
             }
             onFinished(result)
@@ -602,23 +583,7 @@ class GalleryIndexer(context: Context) {
                 // persisted SigLIP image similarity with exact OCR evidence.
                 // The Context Picker then applies its normal top-four visual
                 // diversity policy to this fresh hybrid order.
-                val useKvIndex = KvIndexPreferences.isEnabled(appContext) &&
-                    currentResponse.queryCategory == QueryCategory.DOC
-                val semanticScores = if (useKvIndex) {
-                    runCatching {
-                        KvDocumentVectorIndex.open(appContext).use { index ->
-                            val embedding = SigLipTextEncoder.shared(appContext).encode(query)
-                            val result = index.search(
-                                embedding,
-                                currentResults.size.coerceAtLeast(1),
-                                currentResults.map { it.mediaStoreId }.toLongArray(),
-                            )
-                            result.ids.mapIndexed { position, id ->
-                                id to result.scores.getOrElse(position) { 0f }
-                            }.toMap()
-                        }
-                    }.getOrDefault(emptyMap())
-                } else semanticIndexer.searchNearestScoredBlocking(
+                val semanticScores = semanticIndexer.searchNearestScoredBlocking(
                     queries = listOf(query),
                     limit = currentResults.size.coerceAtLeast(1),
                     allowlist = currentResults.map { it.mediaStoreId }.toLongArray(),
@@ -626,7 +591,7 @@ class GalleryIndexer(context: Context) {
                 val minSemantic = semanticScores.values.minOrNull() ?: 0f
                 val maxSemantic = semanticScores.values.maxOrNull() ?: 0f
                 val ocrScores = currentResults.associate { media ->
-                    media.mediaStoreId to if (useKvIndex) 0 else followUpOcrLineMatchScore(query, media)
+                    media.mediaStoreId to followUpOcrLineMatchScore(query, media)
                 }
                 val maxOcr = ocrScores.values.maxOrNull()?.coerceAtLeast(1) ?: 1
                 fun semanticScore(media: GalleryMedia): Float {
@@ -651,7 +616,7 @@ class GalleryIndexer(context: Context) {
                 // reranks only those existing grounded records. Falling back
                 // to the current top context is safe because it was already
                 // admitted by that same original conjunction.
-                val inheritedOcrKeywords = if (useKvIndex) emptyList() else currentResponse.answerOcrKeywords
+                val inheritedOcrKeywords = currentResponse.answerOcrKeywords
                     .ifEmpty { followUpOcrKeywords(query) }
                 val pickedFollowUpContext = answerContextPicker.pick(
                     query = query,
@@ -660,7 +625,6 @@ class GalleryIndexer(context: Context) {
                     evidenceScope = followUpScope,
                     queryCategory = followUpCategory,
                     ocrKeywords = inheritedOcrKeywords,
-                    useKvIndex = useKvIndex,
                     maxRecords = MAX_ANSWER_RECORDS,
                 )
                 val followUpContext = if (
@@ -718,7 +682,6 @@ class GalleryIndexer(context: Context) {
         answerExecutor.shutdown()
         semanticIndexer.close()
         database.close()
-        personalContextDatabase.close()
     }
 
     private fun searchBlocking(
@@ -739,10 +702,6 @@ class GalleryIndexer(context: Context) {
         // a clean conversation, so holding this session through SQLite,
         // native retrieval, and diversity only increases memory pressure.
         plannedQuery.session?.close()
-        // Warm only the clean answer system prefix while retrieval and context
-        // selection run. The planner turn is already closed and can never enter
-        // the answer conversation.
-        GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
         var plan = plannedQuery.plan
         // Gemma is the sole source of person predicates. The database only
         // resolves those already-validated planner values to real local face
@@ -808,10 +767,18 @@ class GalleryIndexer(context: Context) {
                     needsAnswer = effectivePlan.needsAnswer,
                     plannerProfile = plannedQuery.generationProfile,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
-                    ocrKeywords = if (KvIndexPreferences.isEnabled(appContext)) emptyList() else effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                    ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
+            // The normal OCR/doc and scenery paths attach images. A warmed
+            // text-only answer session would be discarded before those image
+            // turns, so reserve answer KV only for metadata-only categories.
+            if (effectivePlan.needsAnswer &&
+                QueryCategoryContextPolicy.answerImageLimit(effectivePlan.queryCategory) == 0
+            ) {
+                GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
+            }
             onQueryPlanned(
                 plannedQuery.plannerJson,
                 renderedExecutionSpec,
@@ -828,7 +795,7 @@ class GalleryIndexer(context: Context) {
                 needsAnswer = effectivePlan.needsAnswer,
                 plannerProfile = plannedQuery.generationProfile,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
-                ocrKeywords = if (KvIndexPreferences.isEnabled(appContext)) emptyList() else effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
             )
         }
     }
@@ -836,15 +803,12 @@ class GalleryIndexer(context: Context) {
     private fun buildAnswerPrompt(
         query: String,
         results: List<GalleryMedia>,
-        contextMatches: List<PersonalContextMatch>,
         imageReferences: List<String>,
         evidenceScope: AnswerEvidenceScope,
         richVisualIds: Set<Long> = emptySet(),
         evidenceGroups: List<EvidenceGroup> = emptyList(),
     ): String {
         val includeImages = imageReferences.isNotEmpty()
-        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
-        val useFullDocumentOcr = GemmaModelSelection.selected(appContext) == GemmaModelVariant.E2B
         val documentMaps = ArrayList<String>(results.size)
         var rawOcrChars = 0
         var packedOcrChars = 0
@@ -892,25 +856,11 @@ class GalleryIndexer(context: Context) {
                 if (evidenceScope.needsOcr) {
                     val proofForAnswer: String
                     val proofLabel: String
-                    if (useKvIndex) {
-                        // KV mode deliberately bypasses query-word OCR packing.
-                        // Retrieval and answer grounding both consume only the
-                        // model-produced document facts.
-                        proofForAnswer = media.kvText.trim().ifBlank { "none" }
-                        proofLabel = "document_facts"
-                        rawOcrChars += proofForAnswer.length
-                        documentMaps += "$label fields: $proofForAnswer"
-                    } else {
-                        val packed = OcrAnswerContextPacker.pack(query, media.ocrText)
-                        rawOcrChars += packed.sourceChars
-                        proofForAnswer = if (useFullDocumentOcr) {
-                            media.ocrText.trim().ifBlank { "none" }
-                        } else {
-                            packed.proofLines
-                        }
-                        proofLabel = "document_facts"
-                        documentMaps += "$label headings: ${packed.documentMap}"
-                    }
+                    val packed = OcrAnswerContextPacker.pack(query, media.ocrText)
+                    rawOcrChars += packed.sourceChars
+                    proofForAnswer = packed.proofLines
+                    proofLabel = "document_facts"
+                    documentMaps += "$label headings: ${packed.documentMap}"
                     packedOcrChars += proofForAnswer.length
                     val proof = proofForAnswer
                         .replace('"', '\'')
@@ -950,26 +900,13 @@ class GalleryIndexer(context: Context) {
                 "location=$location"
         }
         val answerDirective = answerDirective(query, includeImages)
-        val amountEvidence = if (useKvIndex) {
-            "none (KV index mode)"
-        } else {
-            DocumentAmountGrounding.promptEvidence(query, results)
-        }
-        val contextEvidence = if (contextMatches.isEmpty()) {
-            "none"
-        } else {
-            contextMatches.mapIndexed { index, match ->
-                val item = match.item
-                "C${index + 1} ${item.title.ifBlank { item.kind.displayName }} " +
-                    contextSummary(item)
-            }.joinToString("\n")
-        }
+        val amountEvidence = DocumentAmountGrounding.promptEvidence(query, results)
         val inputInstruction = when {
             includeImages ->
                 "IMAGE INPUTS: the four-or-fewer downscaled images map in order to " +
                     imageReferences.joinToString(", ") + ". For document questions, use each " +
                     "image with that record's DOCUMENT_FACTS to distinguish documents and confirm label/value " +
-                    "layout; document facts remain primary for exact text."
+                    "layout; OCR text remains primary for exact text."
             evidenceScope.needsVisual ->
                 "IMAGE INPUTS: unavailable. Do not make scene/activity claims."
             else ->
@@ -981,11 +918,6 @@ class GalleryIndexer(context: Context) {
             if (evidenceScope.needsLocationMetadata) add("place")
             if (evidenceScope.needsOcr) add("OCR")
         }.joinToString(", ").ifBlank { "visual" }
-        val contextBlock = if (evidenceScope.needsPersonalContext) {
-            "\nPERSONAL_CONTEXT:\n$contextEvidence"
-        } else {
-            ""
-        }
         val documentMapBlock = if (evidenceScope.needsOcr) {
             "\nDOCUMENT_MAP (for follow-up ideas only; not answer evidence):\n" +
                 documentMaps.joinToString("\n").ifBlank { "none" }
@@ -1007,7 +939,7 @@ class GalleryIndexer(context: Context) {
             VERIFIED_AMOUNT_CANDIDATES: $amountEvidence
             RECORDS:
             $evidence
-            $documentMapBlock$contextBlock$episodeBlock
+            $documentMapBlock$episodeBlock
             Return only a direct, natural answer in at most $MAX_ANSWER_GENERATED_TOKENS generated tokens. For a direct document-field question, output exactly one concise sentence and stop. First compare the requested field across every supplied DOCUMENT_FACTS record and its matching visual tile: if one distinct supported value exists, state it; if two or more distinct supported values exist, state every distinct value rather than silently choosing one. When supplied, a VERIFIED_AMOUNT_CANDIDATE is an exact document-backed value: copy only such a value, never calculate, infer, or substitute a plausible amount. Pair a value with an issue/expiry date only when that date is clearly associated in the same document facts; otherwise call them values from separate documents. Do not count duplicate scans of the same value twice. Do not reproduce document-fact/evidence lines, but never suppress another direct supported value merely because the question is singular. Do not include a follow-up question, suggestion, question mark, source, provenance, or explanation of how the answer was found. Use a calibrated caveat only for a missing exact fact.
             ANSWER:
         """.trimIndent()
@@ -1015,8 +947,8 @@ class GalleryIndexer(context: Context) {
             TAG,
             "Answer prompt: chars=${prompt.length}, records=${results.size}, " +
                 "rows=${evidence.lineSequence().count()}, images=${imageReferences.size}, " +
-                "episodes=${episodeEvidence.size}, context=${contextMatches.size}, " +
-                "ocrMode=${if (useFullDocumentOcr) "e2b-full" else "e4b-packed"}, " +
+                "episodes=${episodeEvidence.size}, " +
+                "ocrMode=e4b-packed, " +
                 "ocrRawChars=$rawOcrChars, ocrProofChars=$packedOcrChars",
         )
         return prompt
@@ -1026,11 +958,7 @@ class GalleryIndexer(context: Context) {
     private fun buildFollowUpEvidence(results: List<GalleryMedia>): String = results
         .take(MAX_ANSWER_RECORDS)
         .mapIndexed { index, media ->
-            val fields = if (KvIndexPreferences.isEnabled(appContext)) {
-                media.kvText.trim().ifBlank { "none" }
-            } else {
-                OcrAnswerContextPacker.pack("", media.ocrText).documentMap
-            }
+            val fields = OcrAnswerContextPacker.pack("", media.ocrText).documentMap
             buildString {
                 append("G${index + 1}: fields=$fields")
                 media.personLabel?.trim()?.takeIf(String::isNotBlank)?.let { append("; person=$it") }
@@ -1125,7 +1053,7 @@ class GalleryIndexer(context: Context) {
                 if (includeImages) {
                     "GENERAL SCENERY TASK: synthesize the downscaled scenery images with the joined metadata into a useful direct answer."
                 } else {
-                    "GENERAL TEXT TASK: synthesize the strongest identity, metadata, OCR, and personal-context fields into a useful direct answer."
+                    "GENERAL TEXT TASK: synthesize the strongest identity, metadata, and OCR fields into a useful direct answer."
                 }
         }
     }
@@ -1196,8 +1124,7 @@ class GalleryIndexer(context: Context) {
         results: List<GalleryMedia>,
         images: List<ByteArray>,
     ): String {
-        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
-        val gate = AnswerReviewGate.reason(query, draft, results, useKvIndex)
+        val gate = AnswerReviewGate.reason(query, draft, results)
         if (gate == null) {
             Log.i(TAG, "Answer evidence review skipped: routine grounded answer")
             return draft
@@ -1214,8 +1141,7 @@ class GalleryIndexer(context: Context) {
                 Log.i(TAG, "Answer evidence review kept draft on pass ${attempt + 1}")
                 return current
             }
-            val constrained = if (useKvIndex) replacement else
-                DocumentAmountGrounding.constrainAnswer(query, replacement, results)
+            val constrained = DocumentAmountGrounding.constrainAnswer(query, replacement, results)
             if (AnswerTextSanitizer.clean(constrained) == AnswerTextSanitizer.clean(current)) {
                 Log.i(TAG, "Answer evidence review converged on pass ${attempt + 1}")
                 return current
@@ -1244,23 +1170,16 @@ class GalleryIndexer(context: Context) {
         draft: String,
         results: List<GalleryMedia>,
     ): String {
-        val useKvIndex = KvIndexPreferences.isEnabled(appContext)
         val records = results.mapIndexed { index, media ->
-            val proof = if (useKvIndex) {
-                media.kvText.trim().ifBlank { "none" }
-            } else if (GemmaModelSelection.selected(appContext) == GemmaModelVariant.E2B) {
-                media.ocrText.trim().ifBlank { "none" }
-            } else {
-                OcrAnswerContextPacker.pack(query, media.ocrText).proofLines
-            }
-            "G${index + 1} DOCUMENT_FACTS:\n${proof.prependIndent("  ")}"
+            val proof = OcrAnswerContextPacker.pack(query, media.ocrText).proofLines
+            "G${index + 1} DOCUMENT_FACTS:\n${proof.prependIndent("  ")}".trim()
         }.joinToString("\n")
         return """
             REVIEW_TASK:
             QUESTION: $query
             DRAFT_ANSWER: $draft
             VERIFIED_AMOUNT_CANDIDATES:
-            ${if (useKvIndex) "none (KV index mode)" else DocumentAmountGrounding.promptEvidence(query, results)}
+            ${DocumentAmountGrounding.promptEvidence(query, results)}
             TOP_GROUNDING_RECORDS:
             $records
             Inspect the supplied document facts and paired images. If the draft is fully supported and directly answers the question, return exactly KEEP. Otherwise return exactly one line: ANSWER: <corrected concise answer>. Never explain the review, identify records, calculate an amount, or invent a value.
@@ -1351,7 +1270,7 @@ class GalleryIndexer(context: Context) {
 
     /** Strictly bounds scenery pixels before LiteRT-LM creates vision tensors. */
     private fun downscaleAnswerImage(bitmap: Bitmap): Bitmap {
-        val maxDimension = QueryCategoryContextPolicy.SCENARY_ANSWER_IMAGE_MAX_DIMENSION
+        val maxDimension = QueryCategoryContextPolicy.ANSWER_IMAGE_MAX_DIMENSION
         val largest = maxOf(bitmap.width, bitmap.height)
         if (largest <= maxDimension) return bitmap
         val scale = maxDimension.toFloat() / largest.toFloat()
@@ -1440,7 +1359,6 @@ class GalleryIndexer(context: Context) {
     private fun defaultFollowUps(
         query: String,
         results: List<GalleryMedia>,
-        contextMatches: List<PersonalContextMatch>,
     ): List<FollowUpSuggestion> = buildList {
         val normalized = query.lowercase()
         val anchor = results.firstOrNull()
@@ -1485,9 +1403,6 @@ class GalleryIndexer(context: Context) {
         anchorPlace?.let {
             add(FollowUpSuggestion("What other moments happened in $it?"))
         }
-        if (isEmpty() && contextMatches.isNotEmpty()) {
-            add(FollowUpSuggestion("What happened nearby?"))
-        }
         if (isEmpty() && results.isNotEmpty()) {
             add(FollowUpSuggestion("What happened nearby?"))
         }
@@ -1522,9 +1437,8 @@ class GalleryIndexer(context: Context) {
 
     private fun buildAnswerSources(
         results: List<GalleryMedia>,
-        contextMatches: List<PersonalContextMatch>,
     ): List<AnswerSource> {
-        val sources = ArrayList<AnswerSource>(results.size + contextMatches.size)
+        val sources = ArrayList<AnswerSource>(results.size)
         results.forEachIndexed { index, media ->
             sources += AnswerSource(
                 id = "G${index + 1}",
@@ -1550,10 +1464,9 @@ class GalleryIndexer(context: Context) {
                         append("\nDuration: ")
                         append(formatDuration(media.durationMs))
                     }
-                    val documentFacts = if (KvIndexPreferences.isEnabled(appContext)) media.kvText else media.ocrText
-                    if (documentFacts.isNotBlank()) {
-                        append(if (KvIndexPreferences.isEnabled(appContext)) "\nDocument facts: " else "\nOCR: ")
-                        append(compactPromptText(documentFacts))
+                    if (media.ocrText.isNotBlank()) {
+                        append("\nOCR: ")
+                        append(compactPromptText(media.ocrText))
                     }
                     media.personLabel?.takeIf { it.isNotBlank() }?.let {
                         append("\nPerson: ")
@@ -1561,16 +1474,6 @@ class GalleryIndexer(context: Context) {
                     }
                 },
                 media = media,
-            )
-        }
-        contextMatches.forEachIndexed { index, match ->
-            val item = match.item
-            sources += AnswerSource(
-                id = "C${index + 1}",
-                type = AnswerSourceType.PERSONAL_CONTEXT,
-                label = item.sourceLabel.ifBlank { item.kind.displayName },
-                detail = "${item.title.ifBlank { item.kind.displayName }}\n${contextSummary(item)}",
-                context = item,
             )
         }
         return sources
@@ -1588,14 +1491,6 @@ class GalleryIndexer(context: Context) {
             if (date != "none") append(" • ").append(date.substringBefore(' '))
         }
     }
-
-    private fun contextSummary(item: PersonalContextItem): String = buildString {
-        item.route?.let { append(it).append("; ") }
-        item.merchant?.let { append(it).append("; ") }
-        item.amount?.let { append(it).append("; ") }
-        item.dateHint?.let { append(it).append("; ") }
-        append(item.body)
-    }.trim().trimEnd(';').ifBlank { item.title }
 
     private fun containsAnyPlanTerm(value: String, terms: List<String>): Boolean {
         val normalized = value.lowercase().replace(Regex("\\s+"), " ").trim()
@@ -1733,8 +1628,6 @@ class GalleryIndexer(context: Context) {
         private const val FOLLOW_UP_SEMANTIC_WEIGHT = 0.70f
         private const val FOLLOW_UP_OCR_WEIGHT = 0.30f
         private const val MAX_NAME_PROMPT_CHARS = 48
-        private const val CONTEXT_RETRIEVAL_LIMIT = 6
-        private const val CONTEXT_ANSWER_LIMIT = 4
         private val FOLLOW_UP_OCR_STOP_WORDS = setOf(
             "what", "which", "when", "where", "whose", "with", "from", "this", "that",
             "have", "does", "please", "show", "find", "give", "tell", "about", "photo", "image",

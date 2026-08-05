@@ -4,7 +4,6 @@ enum class AnswerEvidenceKind {
     VISUAL,
     OCR,
     METADATA,
-    PERSONAL_CONTEXT,
 }
 
 /** Hard media-type constraint extracted from the user's query. */
@@ -52,7 +51,6 @@ enum class QueryCategory(val wireName: String) {
             kinds = setOf(
                 AnswerEvidenceKind.OCR,
                 AnswerEvidenceKind.METADATA,
-                AnswerEvidenceKind.PERSONAL_CONTEXT,
             ),
         )
         SCENARY -> AnswerEvidenceScope(setOf(AnswerEvidenceKind.VISUAL))
@@ -129,8 +127,6 @@ data class AnswerEvidenceScope(
         get() = AnswerEvidenceKind.OCR in kinds
     val needsMetadata: Boolean
         get() = AnswerEvidenceKind.METADATA in kinds
-    val needsPersonalContext: Boolean
-        get() = AnswerEvidenceKind.PERSONAL_CONTEXT in kinds
     val needsPeopleMetadata: Boolean
         get() = needsMetadata && AnswerMetadataField.PEOPLE in metadataFields
     val needsTimeMetadata: Boolean
@@ -156,7 +152,6 @@ data class AnswerEvidenceScope(
                 AnswerEvidenceKind.VISUAL -> "visual"
                 AnswerEvidenceKind.OCR -> "ocr"
                 AnswerEvidenceKind.METADATA -> "metadata"
-                AnswerEvidenceKind.PERSONAL_CONTEXT -> "context"
             }
         }
         .sorted()
@@ -178,8 +173,6 @@ data class AnswerEvidenceScope(
                     "o", "ocr", "text", "words", "written" -> kinds += AnswerEvidenceKind.OCR
                     "m", "meta", "metadata", "people", "person", "time", "location" ->
                         kinds += AnswerEvidenceKind.METADATA
-                    "c", "context", "personal", "notifications", "notification" ->
-                        kinds += AnswerEvidenceKind.PERSONAL_CONTEXT
                     "all" -> kinds += AnswerEvidenceKind.values().toSet()
                 }
             }
@@ -208,9 +201,6 @@ data class AnswerEvidenceScope(
                 "\\b(wearing|wear|glasses|smile|smiling|holding|drinking|sip|eating|standing|sitting|"
                     + "drank|ate|held|color|colour|look|looks|appearance|describe|scene|without)\\b",
             ).containsMatchIn(normalized)
-            val context = Regex(
-                "\\b(notification|notifications|message|messages|chat|email|mail|order|orders|payment|payments|transaction|transactions|ticket|tickets)\\b",
-            ).containsMatchIn(normalized)
             // A time/location question may need visual retrieval to discover
             // the right event. Metadata/OCR remain authoritative for the
             // requested field, while the selected images are still auxiliary
@@ -226,7 +216,6 @@ data class AnswerEvidenceScope(
             if (asksMetadata) kinds += AnswerEvidenceKind.METADATA
             if (asksOcr) kinds += AnswerEvidenceKind.OCR
             if (visual) kinds += AnswerEvidenceKind.VISUAL
-            if (context) kinds += AnswerEvidenceKind.PERSONAL_CONTEXT
             if (kinds.isEmpty()) {
                 // A plain photo/scene request is answerable from visual
                 // evidence. Add metadata only when the question asks for a
@@ -261,7 +250,6 @@ data class QueryPlan(
     val locationHint: String = "",
     val recentFirst: Boolean = false,
     val sortByLocation: Boolean = false,
-    val needsPersonalContext: Boolean = false,
     val needsAnswer: Boolean = true,
     val answerIntentExplicit: Boolean = false,
     val mediaType: QueryMediaType? = null,
@@ -495,7 +483,6 @@ data class QueryPlan(
                 fromDate = dateBounds?.first.orEmpty(),
                 toDate = dateBounds?.second.orEmpty(),
                 recentFirst = isRecentSortQuery(normalized),
-                needsPersonalContext = answerScope.needsPersonalContext,
                 mediaType = mediaType,
                 answerEvidenceScope = answerScope,
             )

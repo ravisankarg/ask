@@ -2,7 +2,6 @@ package com.ravi.askgalaxy
 
 enum class AnswerSourceType {
     GALLERY_IMAGE,
-    PERSONAL_CONTEXT,
 }
 
 data class AnswerSource(
@@ -11,7 +10,6 @@ data class AnswerSource(
     val label: String,
     val detail: String,
     val media: GalleryMedia? = null,
-    val context: PersonalContextItem? = null,
 )
 
 data class AnswerResult(
@@ -32,14 +30,13 @@ data class SearchResponse(
     val gallery: List<GalleryMedia>,
     /** Full evaluated match count; [gallery] is the bounded UI browsing window. */
     val totalGalleryMatches: Int = gallery.size,
-    val personalContext: List<PersonalContextMatch>,
     val answerGallery: List<GalleryMedia> = emptyList(),
     val answerContext: AnswerContextBundle? = null,
     /** One representative record per evidence-builder episode, when used. */
     val evidenceRecords: List<GalleryMedia> = emptyList(),
     val evidenceGroups: List<EvidenceGroup> = emptyList(),
     val evidenceGroupingMode: EvidenceGroupingMode = EvidenceGroupingMode.NONE,
-    /** Planner-only KV session; answer generation deliberately uses a clean turn. */
+    /** Planner session; answer generation deliberately uses a clean turn. */
     val plannerSession: GemmaRuntime.ConversationSession? = null,
     val plannerJson: String = "",
     val effectivePlanJson: String = "",

@@ -151,7 +151,7 @@
         <article class="principle-card" data-reveal>
           <span class="principle-number">03</span>
           <h3>Bound what reaches Gemma</h3>
-          <p>At most 8 records. Documents and metadata questions send text only; scenery may attach at most four 512 px images.</p>
+          <p>At most 8 records. Document and scenery answers may attach at most four 512 px images; document tiles include their OCR text.</p>
         </article>
         <article class="principle-card" data-reveal>
           <span class="principle-number">04</span>
@@ -206,7 +206,7 @@
             <span>5</span><div><h3>Distill answer context</h3><p>Join episode membership and choose no more than 8 records. Preserve full stored OCR and metadata without prompt truncation.</p></div>
           </article>
           <article data-reveal>
-            <span>6</span><div><h3>Answer naturally</h3><p>Use text-only evidence for doc/person/location/time. Only scenery may attach up to four 512 px images to the clean Gemma answer conversation.</p></div>
+            <span>6</span><div><h3>Answer naturally</h3><p>Document and scenery answers may attach up to four 512 px images to the clean Gemma conversation; document tiles include paired OCR text.</p></div>
           </article>
         </div>
 
@@ -319,7 +319,7 @@
           <article>
             <span>Decode late</span>
             <h4>Selection stays text + vectors</h4>
-            <p>The picker loads no photo pixels. Only after selection may scenery decode at most four images, each reduced to a 512 px longest edge.</p>
+            <p>The picker loads no photo pixels. Only after selection may document or scenery answers decode at most four images, each reduced to a 512 px longest edge.</p>
           </article>
         </div>
 
@@ -441,9 +441,8 @@
         <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Query processor</h3><p>Gemma-only five-way routing, document-intent guards, self-name resolution, and one semantic + one OCR branch for every doc plan.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/QueryPlannerRuntime.kt">QueryPlannerRuntime · QueryPlan ↗</a></article>
         <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Structured executor</h3><p>Recursive hard scopes and category-aware overall ranking: semantic-first scenery, OCR-perfect documents, metadata-scoped people/places, then stable tie-breakers.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/StructuredSearchExecutor.kt">QueryExecutionSpec · Executor ↗</a></article>
         <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Context Picker</h3><p>Strict indexed category eligibility, text-only metadata paths, and episode/SigLIP diversity under a hard 8-record budget.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerContextPicker.kt">AnswerContextPicker · DiversitySelector ↗</a></article>
-        <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Gemma runtime</h3><p>Full OCR/metadata text for non-scenes; scenery alone may attach four images downscaled to a 512 px longest edge, with OOM recovery.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GemmaRuntime.kt">GemmaRuntime · GalleryIndexer ↗</a></article>
+        <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Gemma runtime</h3><p>OCR text is paired with the top four document images; scenery also uses up to four 512 px images, with OOM recovery.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GemmaRuntime.kt">GemmaRuntime · GalleryIndexer ↗</a></article>
         <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Response guardrails</h3><p>Duplicate-aware context, natural 2–3 sentences, reasoning/task/ID removal, and no synthetic filler.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerTextSanitizer.kt">AnswerTextSanitizer · AnswerModels ↗</a></article>
-        <article class="module-card" data-kind="platform answer" data-reveal><span>Optional context</span><h3>Personal signals</h3><p>Opt-in future notifications, sensitive-alert rejection, separate encryption, bounded local matching.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/PersonalContextDatabase.kt">PersonalContext modules ↗</a></article>
         <article class="module-card" data-kind="platform search" data-reveal><span>Product UI</span><h3>Search + recovery</h3><p>v0.2 badge, live QP/timing telemetry, relevance-ranked top-200 grid, per-stage progress bars, and separate clear/rebuild controls for every index.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/MainActivity.kt">MainActivity · SettingsActivity ↗</a></article>
         <article class="module-card" data-kind="platform search" data-reveal><span>Native core</span><h3>Rust TurboQuant</h3><p>4-bit persistent IdMap index, exact stable IDs, tokenizer JNI, atomic index replacement, arm64 ABI.</p><a href="https://github.com/ravisankarg/ask/blob/main/native/askgalaxy-native/src/lib.rs">native/askgalaxy-native ↗</a></article>
       </div>
@@ -458,7 +457,7 @@
         <div class="privacy-card" data-reveal>
           <div><span class="privacy-icon">⌂</span><p><b>Stays on device</b>Photo pixels, OCR, face vectors, filenames, query text, vector search, QP, and answers.</p></div>
           <div><span class="privacy-icon">◎</span><p><b>Optional network edge</b>Only GPS rounded to roughly 110 m can reach the fallback geocoder during indexing.</p></div>
-          <div><span class="privacy-icon">◇</span><p><b>Encrypted identities</b>Face vectors and optional personal context use separate Android Keystore AES-GCM keys.</p></div>
+          <div><span class="privacy-icon">◇</span><p><b>Encrypted identities</b>Face vectors remain protected by a separate Android Keystore AES-GCM key.</p></div>
         </div>
       </div>
     </section>
@@ -469,7 +468,7 @@
         <h2>From strong system to effortless product.</h2>
       </div>
       <div class="roadmap-grid">
-        <article data-reveal><span>Done · v0.2</span><h3>Bound answer inputs</h3><p>Eight-record evidence, text-only document answers, bounded scenery images, and private-output sanitation.</p><b>Performance</b></article>
+        <article data-reveal><span>Done · v0.2</span><h3>Bound answer inputs</h3><p>Eight-record evidence, OCR-paired document images, bounded scenery images, and private-output sanitation.</p><b>Performance</b></article>
         <article data-reveal><span>Now</span><h3>Expand live query matrix</h3><p>Automate category ranking, OCR conjunction, person/place scope, date, negation, event-count, typo, and empty-hard-scope checks on representative devices.</p><b>Quality</b></article>
         <article data-reveal><span>Next</span><h3>Calibrate episode boundaries</h3><p>Measure event purity and coverage across travel days, dense bursts, multi-day outings, and sparse archives.</p><b>Retrieval</b></article>
         <article data-reveal><span>Done</span><h3>Restore photo locations</h3><p>9,834 photos now carry readable indexed places through original EXIF; the isolated rebuild preserved every non-location index.</p><b>Metadata</b></article>

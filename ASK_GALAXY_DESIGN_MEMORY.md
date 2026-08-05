@@ -9,10 +9,10 @@ full module contracts, commands, live query matrix, and known issues are in
 ## Product contract
 
 Ask Galaxy is a private, local-first gallery assistant. It must answer natural
-questions about images, people, activities, dates, places, OCR, trips, and
-optional personal context without exposing internal search machinery. Quality
+questions about images, people, activities, dates, places, OCR, and trips
+without exposing internal search machinery. Quality
 comes from joining visual pixels, named faces, capture metadata, readable/raw
-locations, OCR, and personal context in one grounded answer.
+locations, and OCR in one grounded answer.
 
 ## End-to-end architecture
 
@@ -40,7 +40,8 @@ Search field visible
   -> persisted episode membership join
   -> Context Picker selects at most 8 eligible cross-episode records without decoding images
   -> scenery uses persisted SigLIP embedding diversity and up to 4 downscaled
-     answer images; doc/person/location/time stay text-only
+     answer images; document images are paired with OCR text while
+     person/location/time stay text-only
   -> clean Gemma answer turn
   -> concise answer and contextual follow-ups while the full grid stays visible
 ```
@@ -152,9 +153,6 @@ Search field visible
   remain the top 200 overall query matches in the sole scrollable grid before,
   during, and after answer generation. The effective QP spec appears below the search bar
   immediately after planning; Time stats show completed phase durations beside it.
-- Personal context is opt-in, separately encrypted, filtered, bounded, and
-  queried only when the plan requests it. It must never become an implicit
-  cloud or full-notification context path.
 - Rust/JNI owns tokenizer and TurboQuant hot paths. Stable IDs, dimensions,
   bit width, arm64 packaging, and alignment are explicit boundary contracts.
 

@@ -136,25 +136,26 @@ user query
   -> category-aware overall relevance is preserved into the virtualized UI:
      scenery semantic score first, doc OCR tier first, person/location exact
      metadata scope first, then capture-date tie-breaking
-  -> optional encrypted personal-context matcher runs only for a context scope
   -> persisted episode membership supplies cross-event diversity at query time
   -> Context Picker chooses at most 8 eligible records without decoding images;
      scenery alone uses persisted SigLIP embedding diversity
-  -> doc/person/location/time use text only; scenery may attach up to 4
-     images downscaled to a 512 px longest edge
+  -> doc/scenary answers attach up to 4 images downscaled to a 512 px
+     longest edge; document tiles are paired with their OCR text
   -> a clean Gemma 4 answer conversation writes the answer and follow-ups
 ```
 
-The Gemma-emitted category controls search eligibility, answer metadata fields,
-and whether bounded scenery inputs are attached. Planner and answer conversations share
+The Gemma-emitted category controls search eligibility and answer metadata fields.
+Document and scenery answers use the same bounded four-image Gemma input budget;
+document tiles are paired with their query-relevant OCR text. Planner and answer conversations share
 the resident Gemma engine, but not each other's turns: the planner session is closed
 immediately after planning, while a separate answer system-prefix conversation may
 be warmed during retrieval. This prevents planner syntax and routing language from
 leaking into the natural-language answer.
-The frozen QP and language graph stay on CPU. Only Gemma's image
-encoder/adapter uses the LiteRT GPU backend, with a CPU-vision initialization
-fallback for unsupported devices; this keeps the individual visual inputs below the
-Samsung CPU-only process-memory spike. The answer prompt groups identical
+Gemma 4 E4B uses the LiteRT GPU backend for both its QP/language graph and
+image encoder/adapter. There is no silent CPU fallback: GPU initialization
+must succeed. The GPU engine is released when Ask Galaxy moves to the
+background. Visual answers do not reserve a second text-only answer-prefill
+session because that session cannot accept images. The answer prompt groups identical
 structured rows and carries only category-selected metadata/OCR, reducing
 prefill without removing any of the Context Picker's selected records.
 The planner date gate rejects `from_date`/`to_date` unless the original query
@@ -179,27 +180,12 @@ FaceNet-512 vectors
   -> label-aware local metadata search
 ```
 
-Optional personal context is deliberately a separate path from gallery indexing:
-
-```text
-user enables Personal context + Android notification access
-  -> future notifications only
-  -> reject ongoing, OTP/PIN/password, and bank-security alerts
-  -> classify travel/receipt/delivery/appointment signals
-  -> encrypt payload with a separate Android Keystore AES-GCM key
-  -> bounded local fact store with dedupe and 180-day retention
-  -> query-aware in-memory matching (no SQL text search)
-  -> relevant context records join the Gemma evidence prompt
-```
-
 The answer model may use bounded internal source labels to keep its multimodal
 context aligned, but `AnswerTextSanitizer` removes those labels from user-visible
 prose, model-reasoning tags, and task echoes. The UI always presents the full
 bounded search browser rather than the private top-8 Context Picker set.
 Answers are limited to 2–3 natural sentences without synthetic browse filler,
-followed by useful contextual queries. Notification access is optional, can be
-disabled independently, and the Settings screen can clear the personal-context
-store without touching the gallery index.
+followed by useful contextual queries.
 
 Preparation is gated by a persisted flow state:
 

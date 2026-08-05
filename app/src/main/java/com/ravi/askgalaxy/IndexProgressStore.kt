@@ -6,7 +6,6 @@ enum class IndexProgressStage(val wire: String, val label: String) {
     MODELS("models", "Model downloads"),
     VISUAL("visual", "SigLIP visual index"),
     OCR("ocr", "OCR text index"),
-    KV("kv", "Document KV index"),
     LOCATION("location", "Photo locations"),
     FACE("face", "Face index"),
     EPISODE("episode", "Photo episodes"),

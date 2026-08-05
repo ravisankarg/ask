@@ -33,11 +33,11 @@ class AnswerGenerationDeviceAuditTest {
         val audit = harness.answer(query, QueryCategory.DOC, spec, candidates)
         assertTrue(audit.context.includeVisuals)
         assertTrue(audit.context.includeOcr)
-        assertTrue(audit.context.images.all(QueryCategoryContextPolicy::isDocumentLike))
+        assertTrue(audit.context.records.all(QueryCategoryContextPolicy::isDocumentLike))
         assertAnswerContract(audit)
         assertTokenOverlap(
             answer = audit.result.text,
-            context = audit.context.images.joinToString(" ") { it.ocrText },
+            context = audit.context.records.joinToString(" ") { it.ocrText },
             message = "The document answer did not use any meaningful OCR token",
         )
     }
@@ -52,7 +52,7 @@ class AnswerGenerationDeviceAuditTest {
         val audit = harness.answer(query, QueryCategory.SCENARY, spec, candidates)
         assertTrue(audit.context.includeVisuals)
         assertFalse(audit.context.includeOcr)
-        assertTrue(audit.context.images.none(QueryCategoryContextPolicy::isDocumentLike))
+        assertTrue(audit.context.records.none(QueryCategoryContextPolicy::isDocumentLike))
         assertAnswerContract(audit)
     }
 
@@ -73,7 +73,7 @@ class AnswerGenerationDeviceAuditTest {
             candidates = candidates,
         )
         assertFalse(audit.context.includeVisuals)
-        assertTrue(audit.context.images.all { !it.personLabel.isNullOrBlank() })
+        assertTrue(audit.context.records.all { !it.personLabel.isNullOrBlank() })
         assertAnswerContract(audit)
         assertContainsPrivateValue(
             audit.result.text,
@@ -99,7 +99,7 @@ class AnswerGenerationDeviceAuditTest {
             candidates = candidates,
         )
         assertFalse(audit.context.includeVisuals)
-        assertTrue(audit.context.images.all { !it.locationName.isNullOrBlank() })
+        assertTrue(audit.context.records.all { !it.locationName.isNullOrBlank() })
         assertAnswerContract(audit)
         assertContainsPrivateValue(
             audit.result.text,
@@ -129,7 +129,7 @@ class AnswerGenerationDeviceAuditTest {
             candidates = candidates,
         )
         assertFalse(audit.context.includeVisuals)
-        assertTrue(audit.context.images.all {
+        assertTrue(audit.context.records.all {
             it.dateTakenMs != null || it.dateModifiedSeconds > 0L
         })
         assertAnswerContract(audit)
@@ -271,18 +271,17 @@ class AnswerGenerationDeviceAuditTest {
                 evidenceGroups = evidence.contextGroups,
                 evidenceScope = scope,
                 queryCategory = category,
-                maxImages = 8,
+                maxRecords = 8,
             )
             assertEquals(category, context.queryCategory)
             assertTrue(
                 "Context Picker returned a category-ineligible record",
-                context.images.all { QueryCategoryContextPolicy.accepts(category, it) },
+                context.records.all { QueryCategoryContextPolicy.accepts(category, it) },
             )
             val response = SearchResponse(
                 gallery = ranked.take(200),
                 totalGalleryMatches = ranked.size,
-                personalContext = emptyList(),
-                answerGallery = context.images,
+                answerGallery = context.records,
                 answerContext = context,
                 evidenceGroups = evidence.evidenceGroups.filter { group ->
                     context.items.any {
@@ -300,10 +299,10 @@ class AnswerGenerationDeviceAuditTest {
             SigLipTextEncoder.releaseResident()
             val latch = CountDownLatch(1)
             var callback: Result<AnswerResult>? = null
-            galleryIndexer.answerAsync(query, response) {
+            galleryIndexer.answerAsync(query, response, onFinished = {
                 callback = it
                 latch.countDown()
-            }
+            })
             assertTrue(
                 "Timed out waiting for the ${category.wireName} answer",
                 latch.await(ANSWER_TIMEOUT_SECONDS, TimeUnit.SECONDS),

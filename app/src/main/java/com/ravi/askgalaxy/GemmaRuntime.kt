@@ -377,15 +377,8 @@ class GemmaRuntime private constructor(
             temperature = 0.35,
             seed = 29,
         )
-        // E4B has the proven 8K mobile configuration. E2B's LiteRT-LM
-        // artifact supports a 32K context, which lets document answers carry
-        // the full OCR from the four selected records instead of line packing.
+        // Gemma 4 E4B uses the proven 8K mobile configuration.
         private const val E4B_MAX_CONTEXT_TOKENS = 8192
-        // E2B can expose a 32K window, but reserving that KV cache together
-        // with its GPU weights exhausts this phone during answer prewarm.
-        // 8K still accommodates the full OCR from the four answer documents
-        // while keeping the resident engine below the LMK threshold.
-        private const val E2B_MAX_CONTEXT_TOKENS = 8192
         // LiteRT-LM's Gemma 4 graph must still be created with its compiled
         // capacity of eight even though Ask Galaxy sends at most four
         // downscaled scenery images in one answer request.
@@ -456,17 +449,8 @@ class GemmaRuntime private constructor(
         /** Starts only engine/model loading without blocking the UI. */
         fun preloadAsync(context: Context) {
             val appContext = context.applicationContext
-            if (KvIndexPreferences.isIndexing(appContext)) {
-                Log.i(TAG, "Gemma preload deferred while KV indexing uses CPU")
-                return
-            }
             if (!isModelInstalled(appContext) || !preloadRequested.compareAndSet(false, true)) return
             preloadExecutor.execute {
-                if (KvIndexPreferences.isIndexing(appContext)) {
-                    preloadRequested.set(false)
-                    Log.i(TAG, "Gemma preload cancelled for KV indexing")
-                    return@execute
-                }
                 runCatching { shared(appContext) }
                     .onSuccess { Log.i(TAG, "${GemmaModelSelection.selected(appContext).displayName} engine warmed") }
                     .onFailure { error ->
@@ -483,10 +467,6 @@ class GemmaRuntime private constructor(
          */
         fun preloadPlannerAsync(context: Context, plannerSystemInstruction: String) {
             val appContext = context.applicationContext
-            if (KvIndexPreferences.isIndexing(appContext)) {
-                Log.i(TAG, "Gemma planner warmup deferred while KV indexing uses CPU")
-                return
-            }
             if (!isModelInstalled(appContext) ||
                 answerPrefillRequested.get() ||
                 !plannerPrefillRequested.compareAndSet(false, true)
@@ -495,11 +475,6 @@ class GemmaRuntime private constructor(
             plannerReady.set(false)
             preloadExecutor.execute {
                 runCatching {
-                    if (KvIndexPreferences.isIndexing(appContext)) {
-                        plannerPrefillRequested.set(false)
-                        Log.i(TAG, "Gemma planner warmup cancelled for KV indexing")
-                        return@runCatching
-                    }
                     val session = runCatching {
                         shared(appContext).createPrefilledPlannerSession(plannerSystemInstruction)
                     }.getOrElse { error ->
@@ -574,10 +549,6 @@ class GemmaRuntime private constructor(
         }
 
         fun preloadPlannerAfterAnswerAsync(context: Context, plannerSystemInstruction: String) {
-            if (KvIndexPreferences.isIndexing(context.applicationContext)) {
-                Log.i(TAG, "Gemma planner warmup deferred while KV indexing uses CPU")
-                return
-            }
             releaseAnswerPrefillForPlanner()
             preloadPlannerAsync(context, plannerSystemInstruction)
         }
@@ -589,21 +560,12 @@ class GemmaRuntime private constructor(
          */
         fun preloadAnswerAsync(context: Context, answerSystemInstruction: String) {
             val appContext = context.applicationContext
-            if (KvIndexPreferences.isIndexing(appContext)) {
-                Log.i(TAG, "Gemma answer warmup deferred while KV indexing uses CPU")
-                return
-            }
             if (!isModelInstalled(appContext)) return
             releasePlannerPrefillForAnswer()
             if (!answerPrefillRequested.compareAndSet(false, true)) return
             val requestGeneration = answerPrefillGeneration.incrementAndGet()
             answerPrefillFuture = preloadExecutor.submit {
                 runCatching {
-                    if (KvIndexPreferences.isIndexing(appContext)) {
-                        answerPrefillRequested.set(false)
-                        Log.i(TAG, "Gemma answer warmup cancelled for KV indexing")
-                        return@runCatching
-                    }
                     val session = runCatching {
                         shared(appContext).createPrefilledAnswerSession(answerSystemInstruction)
                     }.getOrElse { error ->
@@ -625,17 +587,6 @@ class GemmaRuntime private constructor(
                     Log.e(TAG, "Gemma 4 answer prefill failed", error)
                 }
             }
-        }
-
-        /**
-         * Stops speculative planner/answer prefill as soon as the KV worker
-         * starts. A foreground query is deliberately not interrupted.
-         */
-        fun cancelWarmupsForKvIndex() {
-            releasePlannerPrefillForAnswer()
-            releaseAnswerPrefillForPlanner()
-            preloadRequested.set(false)
-            Log.i(TAG, "Gemma 4 warmups paused for KV indexing")
         }
 
         /** Takes the warmed answer conversation for the next answer turn. */
@@ -697,7 +648,6 @@ class GemmaRuntime private constructor(
             check(model.isFile) {
                 "Gemma model is not installed: ${model.absolutePath}"
             }
-            val selectedModel = GemmaModelSelection.selected(context)
             val cacheDir = File(context.filesDir, "models/cache").apply {
                 check(mkdirs() || isDirectory) {
                     "Could not create Gemma cache directory: $absolutePath"
@@ -728,43 +678,14 @@ class GemmaRuntime private constructor(
                     throw error
                 }
             }
-            return if (selectedModel == GemmaModelVariant.E2B) {
-                try {
-                    backendPlacement = "E2B full GPU"
-                    initialize(
-                        language = Backend.GPU(),
-                        vision = Backend.GPU(),
-                        maxContextTokens = E2B_MAX_CONTEXT_TOKENS,
-                    )
-                } catch (gpuError: RuntimeException) {
-                    Log.w(TAG, "E2B full-GPU initialization failed; using CPU text fallback", gpuError)
-                    backendPlacement = "E2B text CPU/4 fallback • vision GPU"
-                    initialize(
-                        language = Backend.CPU(CPU_THREADS),
-                        vision = Backend.GPU(),
-                        maxContextTokens = E2B_MAX_CONTEXT_TOKENS,
-                    )
-                }
-            } else {
-                // Keep E4B on its proven split backend and compact prompt
-                // budget; it has a materially higher native-memory footprint.
-                try {
-                    backendPlacement = "E4B text CPU/4 threads • vision GPU"
-                    initialize(
-                        language = Backend.CPU(CPU_THREADS),
-                        vision = Backend.GPU(),
-                        maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
-                    )
-                } catch (gpuError: RuntimeException) {
-                    Log.w(TAG, "E4B GPU vision initialization failed; using CPU vision fallback", gpuError)
-                    backendPlacement = "E4B text CPU/4 threads • vision CPU fallback"
-                    initialize(
-                        language = Backend.CPU(CPU_THREADS),
-                        vision = Backend.CPU(CPU_THREADS),
-                        maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
-                    )
-                }
-            }
+            // Strict E4B configuration: both language and vision run on the
+            // phone GPU. A device without a usable GPU backend fails clearly.
+            backendPlacement = "E4B full GPU • text + vision"
+            return initialize(
+                language = Backend.GPU(),
+                vision = Backend.GPU(),
+                maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
+            )
         }
     }
 }

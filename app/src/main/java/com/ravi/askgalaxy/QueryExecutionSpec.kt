@@ -630,7 +630,6 @@ object ExecutionSpecCompiler {
             sortByLocation = sortLocation,
             mediaType = mediaType,
             queryCategory = queryCategory,
-            needsPersonalContext = answerScope.needsPersonalContext,
             needsAnswer = requiredAnswerNeeded,
             answerIntentExplicit = true,
             answerEvidenceScope = answerScope,

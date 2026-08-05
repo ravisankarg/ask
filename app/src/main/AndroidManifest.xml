@@ -47,15 +47,6 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
         <service
-            android:name=".PersonalContextNotificationListener"
-            android:label="@string/personal_context_service_label"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.service.notification.NotificationListenerService" />
-            </intent-filter>
-        </service>
-        <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
