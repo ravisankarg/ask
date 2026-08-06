@@ -36,7 +36,8 @@ bool open_model(const char * path) {
     context_params.n_ctx = 2048;
     context_params.n_batch = 2048;
     context_params.n_ubatch = 2048;
-    context_params.n_threads = std::clamp<int>(sysconf(_SC_NPROCESSORS_ONLN), 2, 8);
+    const auto online_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    context_params.n_threads = std::max<int>(2, static_cast<int>(online_cores));
     context_params.n_threads_batch = context_params.n_threads;
     context_params.embeddings = true;
     context_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;

@@ -24,6 +24,8 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
     ) {
         require(model.isFile) { "EmbeddingGemma is not installed" }
         lock.withLock {
+            // Keep one initialized encoder resident for the complete
+            // cross-source pass; reopening per file would destroy throughput.
             check(EmbeddingNative.open(model.absolutePath)) { "Could not open EmbeddingGemma" }
             try {
                 sources.forEach { (source, records) ->

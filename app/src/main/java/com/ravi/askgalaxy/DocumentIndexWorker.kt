@@ -12,8 +12,10 @@ class DocumentIndexWorker(
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val progress = IndexProgressStore(applicationContext)
-        runCatching {
-            val reader = DocumentSourceReader(applicationContext)
+        DocumentIndexRuntimeGate.begin()
+        try {
+            runCatching {
+                val reader = DocumentSourceReader(applicationContext)
             if (DocumentSource.entries.none(reader::isAvailable)) {
                 DocumentSource.entries.forEach { source ->
                     progress.update(
@@ -87,16 +89,19 @@ class DocumentIndexWorker(
                 progress.update(source.progressStage(), chunks.size.toLong(), chunks.size.toLong(), completed = true, phase = "complete")
             }
             Result.success()
-        }.getOrElse { error ->
-            progress.update(
-                IndexProgressStage.DOCUMENT_FILES,
-                0L,
-                0L,
-                completed = false,
-                error = error.message.orEmpty().ifBlank { error.javaClass.simpleName },
-                phase = "extraction failed",
-            )
-            Result.retry()
+            }.getOrElse { error ->
+                progress.update(
+                    IndexProgressStage.DOCUMENT_FILES,
+                    0L,
+                    0L,
+                    completed = false,
+                    error = error.message.orEmpty().ifBlank { error.javaClass.simpleName },
+                    phase = "extraction failed",
+                )
+                Result.retry()
+            }
+        } finally {
+            DocumentIndexRuntimeGate.end()
         }
     }
 }

@@ -440,6 +440,9 @@ class GemmaRuntime private constructor(
 
         /** Returns the one resident CPU Gemma engine for the app process. */
         fun shared(context: Context): GemmaRuntime {
+            check(!DocumentIndexRuntimeGate.isActive()) {
+                "Gemma 4 is paused while personal document indexing is active"
+            }
             resident?.let { return it }
             return synchronized(residentLock) {
                 resident ?: open(context).also { resident = it }
@@ -449,6 +452,7 @@ class GemmaRuntime private constructor(
         /** Starts only engine/model loading without blocking the UI. */
         fun preloadAsync(context: Context) {
             val appContext = context.applicationContext
+            if (DocumentIndexRuntimeGate.isActive()) return
             if (!isModelInstalled(appContext) || !preloadRequested.compareAndSet(false, true)) return
             preloadExecutor.execute {
                 runCatching { shared(appContext) }
@@ -467,6 +471,7 @@ class GemmaRuntime private constructor(
          */
         fun preloadPlannerAsync(context: Context, plannerSystemInstruction: String) {
             val appContext = context.applicationContext
+            if (DocumentIndexRuntimeGate.isActive()) return
             if (!isModelInstalled(appContext) ||
                 answerPrefillRequested.get() ||
                 !plannerPrefillRequested.compareAndSet(false, true)
@@ -560,6 +565,7 @@ class GemmaRuntime private constructor(
          */
         fun preloadAnswerAsync(context: Context, answerSystemInstruction: String) {
             val appContext = context.applicationContext
+            if (DocumentIndexRuntimeGate.isActive()) return
             if (!isModelInstalled(appContext)) return
             releasePlannerPrefillForAnswer()
             if (!answerPrefillRequested.compareAndSet(false, true)) return
