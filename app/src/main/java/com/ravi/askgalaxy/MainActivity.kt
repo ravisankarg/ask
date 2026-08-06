@@ -1494,7 +1494,7 @@ class MainActivity : Activity() {
                 putExtra(CalendarContract.Events.TITLE, suggestion.payload)
                 putExtra(CalendarContract.Events.DESCRIPTION, "Created from Ask Galaxy. Source: ${media.displayName}")
             }
-            NextBriefActionType.WEB_SEARCH -> Intent(
+            NextBriefActionType.CONTINUE_WEB_TASK -> Intent(
                 Intent.ACTION_VIEW,
                 Uri.parse("https://www.google.com/search?q=${Uri.encode(suggestion.payload)}"),
             )

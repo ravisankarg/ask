@@ -1027,7 +1027,15 @@ class GalleryIndexer(context: Context) {
                                 .take(MAX_NEXT_BRIEF_PAYLOAD_CHARS)
                             if (action != null && label.isNotBlank() &&
                                 capabilities.any { it.id == action.name.lowercase() } &&
-                                isGroundedNextBriefAction(action, sourceId, answerRecords, payload, capabilities)
+                                isGroundedNextBriefAction(
+                                    action = action,
+                                    sourceId = sourceId,
+                                    records = answerRecords,
+                                    payload = payload,
+                                    capabilities = capabilities,
+                                    query = query,
+                                    answer = answer,
+                                )
                             ) {
                                 nextBriefs += NextBriefSuggestion(action, label, sourceId, payload)
                             }
@@ -1050,13 +1058,20 @@ class GalleryIndexer(context: Context) {
         records: List<GalleryMedia>,
         payload: String,
         capabilities: List<NextBriefCapability>,
+        query: String,
+        answer: String,
     ): Boolean {
         val index = sourceId.removePrefix("G").toIntOrNull()?.minus(1) ?: return false
         val media = records.getOrNull(index) ?: return false
         if (payload.length < 3) return false
+        val taskText = "$query $answer ${media.ocrText} $payload"
+            .lowercase()
+            .replace(Regex("\\s+"), " ")
         return when (action) {
             NextBriefActionType.SHARE_MEDIA -> {
-                val hasPerson = !media.personLabel.isNullOrBlank()
+                val person = media.personLabel.orEmpty().trim()
+                val hasPerson = person.isNotBlank() &&
+                    person.lowercase() !in setOf("person", "unknown", "unnamed")
                 val hasContact = extractContactTargets(media).isNotEmpty()
                 val hasMessagingApp = capabilities
                     .filter { it.id == NextBriefActionType.SEND_MESSAGE.name.lowercase() }
@@ -1067,13 +1082,31 @@ class GalleryIndexer(context: Context) {
                     }
                 hasPerson && (hasContact || hasMessagingApp)
             }
-            NextBriefActionType.CALENDAR_REMINDER -> true
-            NextBriefActionType.MAPS_SEARCH ->
-                !media.locationName.isNullOrBlank() || !media.location.isNullOrBlank()
+            NextBriefActionType.CALENDAR_REMINDER -> Regex(
+                "\\b(today|tomorrow|tonight|morning|evening|deadline|expiry|expires|" +
+                    "appointment|booking|ticket|show|event|at \\d{1,2}(?::\\d{2})?)\\b",
+            ).containsMatchIn(taskText)
+            NextBriefActionType.MAPS_SEARCH -> {
+                val hasPlace = !media.locationName.isNullOrBlank() || !media.location.isNullOrBlank()
+                hasPlace && Regex("\\b(direction|directions|map|maps|route|where|nearby|go to|visit|arrive)\\b")
+                    .containsMatchIn(taskText)
+            }
             NextBriefActionType.CONTACT -> extractContactTargets(media).isNotEmpty()
-            NextBriefActionType.WEB_SEARCH,
-            NextBriefActionType.SEND_MESSAGE,
-            -> payload.length >= 3
+            NextBriefActionType.CONTINUE_WEB_TASK -> {
+                val continuationCue = Regex(
+                    "\\b(book again|rebook|manage booking|check booking|check[- ]?in|reserve|" +
+                        "buy|purchase|availability|open booking|continue|go to)\\b",
+                ).containsMatchIn(taskText)
+                val taskCue = Regex(
+                    "\\b(hotel|flight|train|ticket|reservation|booking|itinerary|trip|" +
+                        "restaurant|concert|event|show|travel)\\b",
+                ).containsMatchIn(taskText)
+                continuationCue && taskCue
+            }
+            NextBriefActionType.SEND_MESSAGE -> {
+                val hasPerson = !media.personLabel.isNullOrBlank()
+                hasPerson && extractContactTargets(media).isNotEmpty()
+            }
         }
     }
 
@@ -1114,8 +1147,8 @@ class GalleryIndexer(context: Context) {
                 Intent(Intent.ACTION_INSERT).setData(CalendarContract.Events.CONTENT_URI),
             ),
             capability(
-                NextBriefActionType.WEB_SEARCH.name.lowercase(),
-                "search the web for the next task",
+                NextBriefActionType.CONTINUE_WEB_TASK.name.lowercase(),
+                "continue an explicit booking, purchase, or reservation task",
                 Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=Ask+Galaxy")),
             ),
             capability(
@@ -1790,16 +1823,17 @@ class GalleryIndexer(context: Context) {
             Use only the original question, the answer, GROUNDED ANSWER RECORDS, and AVAILABLE PHONE CAPABILITIES.
             First output up to two useful natural gallery-search queries as QUERY: <question>.
             Then output at most two useful next-step actions as ACTION: TYPE|short label|SOURCE_ID|PAYLOAD.
-            TYPE must exactly match an available capability id: share_media, maps_search, contact, calendar_reminder, web_search, or send_message.
+            TYPE must exactly match an available capability id: share_media, maps_search, contact, calendar_reminder, continue_web_task, or send_message.
             Use only a capability listed in AVAILABLE PHONE CAPABILITIES. SOURCE_ID must be one grounded record such as G1.
             Every action MUST have a meaningful PAYLOAD of 3-96 characters, extracted or carefully paraphrased from the question, answer, or grounded record. Never leave it empty, generic, or invented.
-            Examples: WEB_SEARCH|Book Goa trip|G1|book Goa trip; SHARE_MEDIA|Share Goa photos|G1|Goa trip photos for the group; CALENDAR_REMINDER|Remember tomorrow's show|G1|Goa show tomorrow; SEND_MESSAGE|Message the organizer|G1|Ask about tomorrow's show.
+            Examples: CONTINUE_WEB_TASK|Check hotel booking|G1|check hotel booking again; SHARE_MEDIA|Share Jaany photos|G1|Goa trip photos for Jaany; CALENDAR_REMINDER|Remember tomorrow's show|G1|Goa show tomorrow; SEND_MESSAGE|Message Jaany|G1|Ask Jaany about tomorrow's show.
             SHARE_MEDIA is useful only when the grounded record contains a person and either a detected phone/email or a messaging handler such as WhatsApp; never offer generic place-only photo sharing.
             MAPS_SEARCH is useful when a grounded place is present, especially for an imminent ticket, appointment, or trip.
             CONTACT is useful only when the grounded record contains a phone number or email address.
             CALENDAR_REMINDER is useful when the answer contains a date, deadline, ticket, appointment, expiry, or time-sensitive document.
-            WEB_SEARCH is useful when the user may need to book, buy, reserve, check availability, or continue a trip/event task.
-            SEND_MESSAGE is useful when a meaningful message can be drafted from the conversation.
+            CONTINUE_WEB_TASK is useful only when the question or evidence explicitly asks to book again, rebook, manage/check a booking, reserve, buy, check availability, or continue a named hotel/flight/train/ticket/trip/event task. Never use it for a normal question about a person's activities.
+            SEND_MESSAGE is useful only when the grounded person also has a detected phone/email; otherwise prefer sharing a photo through the available messaging handler.
+            If the user only asks what a person did, where photos were taken, or what an image contains, output no action unless a concrete next task is clearly grounded.
             Use the exact grounded source ID, never invent a source. Do not suggest an action when its required data is absent.
             Labels must be short, natural, and specific to the task. Never expose OCR, include document numbers in labels, repeat the original question, use vague payloads, output JSON, or explain your reasoning. Output only QUERY and ACTION lines.
         """.trimIndent()

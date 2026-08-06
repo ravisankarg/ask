@@ -31,7 +31,7 @@ enum class NextBriefActionType {
     MAPS_SEARCH,
     CONTACT,
     CALENDAR_REMINDER,
-    WEB_SEARCH,
+    CONTINUE_WEB_TASK,
     SEND_MESSAGE,
 }
 
