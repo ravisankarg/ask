@@ -15,7 +15,7 @@ object DocumentIndexScheduler {
     fun enqueue(context: Context) {
         val request = OneTimeWorkRequestBuilder<DocumentIndexWorker>()
             .setConstraints(
-                Constraints.Builder().setRequiredNetworkType(NetworkType.NOT_REQUIRED).build(),
+                Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build(),
             )
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30L, TimeUnit.SECONDS)
             .addTag(WORK)
@@ -25,5 +25,12 @@ object DocumentIndexScheduler {
             ExistingWorkPolicy.KEEP,
             request,
         )
+    }
+
+    /** Starts a fresh pass after a permission change or a stale failed retry. */
+    fun restart(context: Context) {
+        val appContext = context.applicationContext
+        WorkManager.getInstance(appContext).cancelUniqueWork(WORK)
+        enqueue(appContext)
     }
 }

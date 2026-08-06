@@ -58,7 +58,11 @@ class SettingsActivity : Activity() {
         super.onResume()
         // Returning from Android's all-files access screen should immediately
         // start the same complete personal-source pass.
-        DocumentIndexScheduler.enqueue(this)
+        if (!ModelCatalog.embeddingGemma.isInstalled(this)) {
+            DocumentIndexScheduler.restart(this)
+        } else {
+            DocumentIndexScheduler.enqueue(this)
+        }
         handler.post(refresh)
     }
 

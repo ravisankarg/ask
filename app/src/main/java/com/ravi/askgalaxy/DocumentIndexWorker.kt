@@ -14,6 +14,40 @@ class DocumentIndexWorker(
         runCatching {
             val reader = DocumentSourceReader(applicationContext)
             val progress = IndexProgressStore(applicationContext)
+            if (DocumentSource.entries.none(reader::isAvailable)) {
+                DocumentSource.entries.forEach { source ->
+                    progress.update(
+                        source.progressStage(),
+                        0L,
+                        0L,
+                        completed = false,
+                        error = "Permission not granted",
+                        phase = "permission needed",
+                    )
+                }
+                return@runCatching Result.success()
+            }
+
+            val embeddingGemma = ModelCatalog.embeddingGemma
+            if (!embeddingGemma.isInstalled(applicationContext)) {
+                progress.update(
+                    IndexProgressStage.EMBEDDING_GEMMA,
+                    embeddingGemma.partFile(applicationContext).length(),
+                    embeddingGemma.expectedBytes,
+                    phase = "starting download",
+                )
+                ModelInstaller(applicationContext).installArtifacts(listOf(embeddingGemma)) { install ->
+                    progress.update(
+                        IndexProgressStage.EMBEDDING_GEMMA,
+                        install.bytesDownloaded,
+                        install.bytesTotal,
+                        phase = "Downloading ${install.artifact.name}",
+                    )
+                }
+            }
+            check(embeddingGemma.isInstalled(applicationContext)) {
+                "EmbeddingGemma download did not complete"
+            }
             val batches = listOf(
                 DocumentSource.MESSAGES to reader.messages(),
                 DocumentSource.CALENDAR to reader.calendar(),
