@@ -34,6 +34,7 @@ class SettingsActivity : Activity() {
     private lateinit var models: TextView
     private lateinit var ocrStatus: TextView
     private lateinit var locationStatus: TextView
+    private lateinit var fileAccessStatus: TextView
     private lateinit var locationPermissionButton: Button
     private lateinit var gemmaModelChoice: RadioGroup
     private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
@@ -82,11 +83,11 @@ class SettingsActivity : Activity() {
             refreshState()
         }
         if (requestCode == DOCUMENT_PERMISSION_REQUEST) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-                openAllFilesAccess()
-            } else {
-                DocumentIndexScheduler.enqueue(this)
-            }
+            DocumentIndexScheduler.enqueue(this)
+            refreshState()
+        }
+        if (requestCode == FILE_ACCESS_PERMISSION_REQUEST) {
+            DocumentIndexScheduler.enqueue(this)
             refreshState()
         }
     }
@@ -176,7 +177,7 @@ class SettingsActivity : Activity() {
             setLineSpacing(3f, 1f)
         }, wrap())
         root.addView(Button(this).apply {
-            text = "Allow personal source access"
+            text = "Allow Messages, Calendar, Contacts & call logs"
             setAllCaps(false)
             setOnClickListener {
                 if (missingPersonalRuntimePermissions()) {
@@ -190,7 +191,27 @@ class SettingsActivity : Activity() {
                         DOCUMENT_PERMISSION_REQUEST,
                     )
                 } else {
-                    openAllFilesAccessOrIndex()
+                    DocumentIndexScheduler.enqueue(this@SettingsActivity)
+                }
+            }
+        }, wrap())
+        fileAccessStatus = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 4, 0, 0)
+        }
+        root.addView(fileAccessStatus, wrap())
+        root.addView(Button(this).apply {
+            text = "Allow internal storage / SD card access"
+            setAllCaps(false)
+            setOnClickListener {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    openAllFilesAccess()
+                } else {
+                    requestPermissions(
+                        arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
+                        FILE_ACCESS_PERMISSION_REQUEST,
+                    )
                 }
             }
         }, wrap())
@@ -433,6 +454,17 @@ class SettingsActivity : Activity() {
         val snapshot = PreparationStore(this).read()
         summary.text = snapshot.message
         progress.progress = snapshot.percent
+        val filesGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        fileAccessStatus.text = if (filesGranted) {
+            "My Files access: Granted (internal storage and accessible SD-card files)."
+        } else {
+            "My Files access: Needed. Android will open a separate All files access screen."
+        }
         val selectedGemma = ModelCatalog.gemma(this)
         updatingGemmaModelChoice = true
         gemmaModelChoice.check(GemmaModelSelection.selected(this).ordinal)
@@ -617,14 +649,6 @@ class SettingsActivity : Activity() {
         Manifest.permission.READ_CONTACTS,
     ).any { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
 
-    private fun openAllFilesAccessOrIndex() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            openAllFilesAccess()
-        } else {
-            DocumentIndexScheduler.enqueue(this)
-        }
-    }
-
     private fun openAllFilesAccess() {
         startActivity(Intent(
             Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -640,5 +664,6 @@ class SettingsActivity : Activity() {
     private companion object {
         const val LOCATION_PERMISSION_REQUEST = 2001
         const val DOCUMENT_PERMISSION_REQUEST = 4102
+        const val FILE_ACCESS_PERMISSION_REQUEST = 4103
     }
 }
