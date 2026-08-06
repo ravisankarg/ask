@@ -126,10 +126,13 @@ class MainActivity : Activity() {
         // also recovers when the gallery preparation worker completed before
         // personal-source indexing was enabled.
         val personalReader = DocumentSourceReader(this)
-        if (!ModelCatalog.embeddingGemma.isInstalled(this) &&
-            DocumentSource.entries.any(personalReader::isAvailable)
-        ) {
-            DocumentIndexScheduler.enqueue(this)
+        if (DocumentSource.entries.any(personalReader::isAvailable)) {
+            val filesProgress = IndexProgressStore(this).read(IndexProgressStage.DOCUMENT_FILES)
+            if (!ModelCatalog.embeddingGemma.isInstalled(this) || filesProgress.error.isNotBlank()) {
+                DocumentIndexScheduler.restart(this)
+            } else {
+                DocumentIndexScheduler.enqueue(this)
+            }
         }
         val preparation = PreparationStore(this).read()
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)

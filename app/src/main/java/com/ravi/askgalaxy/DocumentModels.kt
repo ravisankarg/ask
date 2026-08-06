@@ -197,5 +197,7 @@ private fun stableLong(value: String): Long {
     val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
     var result = 0L
     repeat(8) { result = (result shl 8) or (digest[it].toLong() and 0xff) }
-    return if (result == 0L) 1L else result
+    // TurboQuant uses a signed non-negative ID space.
+    val positive = result and Long.MAX_VALUE
+    return if (positive == 0L) 1L else positive
 }

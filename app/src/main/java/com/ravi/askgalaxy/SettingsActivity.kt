@@ -58,7 +58,8 @@ class SettingsActivity : Activity() {
         super.onResume()
         // Returning from Android's all-files access screen should immediately
         // start the same complete personal-source pass.
-        if (!ModelCatalog.embeddingGemma.isInstalled(this)) {
+        val filesProgress = IndexProgressStore(this).read(IndexProgressStage.DOCUMENT_FILES)
+        if (!ModelCatalog.embeddingGemma.isInstalled(this) || filesProgress.error.isNotBlank()) {
             DocumentIndexScheduler.restart(this)
         } else {
             DocumentIndexScheduler.enqueue(this)
