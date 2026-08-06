@@ -15,12 +15,17 @@ import android.provider.MediaStore
 import androidx.core.content.ContextCompat
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import java.io.InputStreamReader
 import java.util.zip.ZipInputStream
 
 /** Reads Android-public providers and all files exposed through MediaStore. */
 class DocumentSourceReader(private val context: Context) {
     private val resolver = context.contentResolver
+
+    init {
+        PDFBoxResourceLoader.init(context.applicationContext)
+    }
 
     fun canReadFiles(): Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         Environment.isExternalStorageManager()
