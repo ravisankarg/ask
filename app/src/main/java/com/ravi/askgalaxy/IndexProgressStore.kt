@@ -10,7 +10,7 @@ enum class IndexProgressStage(val wire: String, val label: String) {
     LOCATION("location", "Photo locations"),
     FACE("face", "Face index"),
     EPISODE("episode", "Photo episodes"),
-    DOCUMENT("document", "Personal document indexes"),
+    DOCUMENT("document", "All personal sources (overall)"),
     DOCUMENT_MESSAGES("document_messages", "Messages"),
     DOCUMENT_CALENDAR("document_calendar", "Calendar"),
     DOCUMENT_FILES("document_files", "My Files"),
