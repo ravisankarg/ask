@@ -218,7 +218,7 @@ object QueryPlannerRuntime {
         CATEGORY is exactly doc, scenary, person, location, or time.
 
         Decide CATEGORY from the answer requested, before reading event nouns:
-        - doc: read written content in a screenshot, receipt, bill, invoice, ticket, passport, driving licence/DL, SSN/social-security card, PAN card, Aadhaar/Aadhar card, ID card, mark sheet, report card, coupon, voucher, menu, sign, or card. Spending, totals, document-owner names, passport/licence/ID numbers, passwords, Wi-Fi passwords, user IDs, DOB/date of birth, exact age, marks, grades, scores, codes, and document expiry are doc.
+        - doc: search written content in gallery OCR/metadata plus non-gallery Messages, Calendar, My Files, call logs, and Contacts. Receipts, bills, invoices, tickets, passports, IDs, passwords, totals, dates, contacts, messages, appointments, and file text are doc.
         - person: who, whose, which person/people, or who else.
         - location: where, what/which place, places/cities visited, or destination.
         - time: when an event happened, what date, which dates/day, or what time.
@@ -237,7 +237,7 @@ object QueryPlannerRuntime {
         - Preserve one explicitly named place as location. Do not leave that place inside semantic. If multiple route endpoints are named, keep the route as semantic instead of choosing one.
         - Explicit photo/picture/image wording requires [mime type == photos]. Explicit video/clip wording requires [mime type == videos]. Correct spelling such as phootos. Movie ticket is content, never MIME.
         - Dates are ISO yyyy-MM-dd and appear only for an explicit temporal constraint. Resolve the complete requested range from Today. Last year is January 1 through December 31 of the previous year; last month is its full calendar month. One exact day requires equal from_date and to_date. After/before/since may use one open boundary. Never infer today.
-        - semantic is one compact conceptual phrase for SigLIP image similarity. It may be clarified or paraphrased. Exclude question words, dates, time words, person names, location names, and MIME words already represented structurally.
+        - semantic is one compact conceptual phrase. The gallery branch sends it to SigLIP; non-gallery sources send the original document question to EmbeddingGemma. Exclude question words, dates, time words, person names, location names, and MIME words already represented structurally.
         - OCR HYBRID FOR EVERY DOC QUERY: emit exactly one semantic predicate plus one OCR predicate joined with `+` inside one group: [[semantic == conceptual document phrase] + [ocr == {word1} && {word2}]]. The `&&` inside OCR means every braced word must occur in the same photo OCR text. A complete OCR match is perfect and always ranks above semantic-only document matches in the result grid and answer context. The outer `+` retains semantic-only fallback when no complete OCR match exists.
         - ocr is doc-only and contains 2-6 essential words likely to coexist on the intended document. Every word is separately braced and joined by `&&`; never write an OCR phrase, synonyms, or alternatives. Include the actual document subject name when known. For my passport with Self person Ravi, write [ocr == {Ravi} && {passport}], never person/self/me/my/owner aliases.
         - BROAD DOCUMENT EXPANSION: for an aggregate or collection question with no named merchant, item, event, or document, use one broad semantic phrase and only a small co-occurring OCR conjunction such as [ocr == {total} && {amount}]. Do not AND mutually exclusive document types such as receipt, bill, and invoice. Never use spending, expenses, finances, paperwork, or documents as OCR keywords.
@@ -785,9 +785,15 @@ internal object QueryCategoryConstraintPolicy {
     }
 
     private fun isWrittenDocumentAnswer(query: String): Boolean {
-        // These are document/OCR searches even when the user does not phrase
+        // These are document/text searches even when the user does not phrase
         // the request as a specific printed field (for example, "insurance"
         // or "property tax"). They must never fall into visual scenery.
+        if (Regex(
+                "\\b(?:message|messages|texted|text\\s+message|sms|calendar|appointment|meeting|" +
+                    "contact|contacts|phone\\s+number|call\\s+log|called|call|file|files|pdf|docx?|" +
+                    "spreadsheet|note|notes)\\b",
+            ).containsMatchIn(query)
+        ) return true
         if (
             Regex(
                 "\\b(?:insurance|tax|property\\s+tax|receipts?|recipts?|bills?|invoices?|" +

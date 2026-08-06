@@ -62,7 +62,7 @@ class PreparationWorker(
 
         val selectedGemma = ModelCatalog.gemma(applicationContext)
         val indexingModels = ModelCatalog.all(applicationContext)
-            .filter { it.required && it != selectedGemma }
+            .filter { (it.required && it != selectedGemma) || it == ModelCatalog.embeddingGemma }
         val installer = ModelInstaller(applicationContext)
         val report = installer.installArtifacts(indexingModels) { progress ->
             snapshot = snapshot.copy(
@@ -93,9 +93,10 @@ class PreparationWorker(
         }
 
         if (!hasGalleryPermission()) {
+            DocumentIndexScheduler.enqueue(applicationContext)
             snapshot = snapshot.copy(
                 phase = PreparationPhase.WAITING_FOR_PERMISSION,
-                message = "Allow photo and video access to index your gallery.",
+                message = "Gallery permission is pending; document indexing will continue for enabled sources.",
                 current = 0L,
                 total = 0L,
             )
@@ -279,6 +280,7 @@ class PreparationWorker(
             )
             store.write(snapshot)
             setForeground(PreparationNotifier.foregroundInfo(applicationContext, snapshot))
+            DocumentIndexScheduler.enqueue(applicationContext)
             return Result.success()
         } finally {
             indexer.close()

@@ -218,6 +218,7 @@ class GalleryIndexer(context: Context) {
                         answerEvidenceScope = searchExecution.answerEvidenceScope,
                         answerOcrKeywords = searchExecution.ocrKeywords,
                         timings = timings,
+                        documentMatches = searchExecution.documentMatches,
                     )
                 } finally {
                     SigLipTextEncoder.releaseResident()
@@ -427,7 +428,7 @@ class GalleryIndexer(context: Context) {
                         "images=${imageBytes.size}, " +
                         "ocr=${evidenceScope.needsOcr}, metadata=${evidenceScope.needsMetadata}",
                 )
-                check(imageBytes.isNotEmpty() || attachedResults.isNotEmpty()) {
+                check(imageBytes.isNotEmpty() || attachedResults.isNotEmpty() || response.documentMatches.isNotEmpty()) {
                     "No readable result evidence for Gemma"
                 }
                 val gemma = GemmaRuntime.shared(appContext)
@@ -441,7 +442,7 @@ class GalleryIndexer(context: Context) {
                         evidenceScope = evidenceScope,
                         richVisualIds = richVisualIds,
                         evidenceGroups = response.evidenceGroups,
-                    )
+                    ) + buildDocumentEvidence(response.documentMatches)
                     // The planner conversation contains the strict execution
                     // grammar and its previous turn. Reusing it for answers
                     // lets that syntax leak into the answer. Keep the Gemma engine
@@ -774,6 +775,7 @@ class GalleryIndexer(context: Context) {
                     plannerProfile = plannedQuery.generationProfile,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
                     ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                    documentMatches = emptyList(),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
@@ -792,6 +794,9 @@ class GalleryIndexer(context: Context) {
             )
             Log.i(TAG, "Executing QP spec: ${renderedExecutionSpec.take(600)}")
             val candidates = structuredSearchExecutor.execute(executionSpec)
+            val documentMatches = if (effectivePlan.queryCategory == QueryCategory.DOC) {
+                DocumentVectorIndex(appContext).use { it.search(query, limitPerSource = DOCUMENT_MATCHES_PER_SOURCE) }
+            } else emptyList()
             return SearchExecution(
                 candidates = candidates,
                 plannerSession = null,
@@ -802,6 +807,7 @@ class GalleryIndexer(context: Context) {
                 plannerProfile = plannedQuery.generationProfile,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
                 ocrKeywords = effectivePlan.ocrTerms.flatMap(OcrKeywordPolicy::keywords),
+                documentMatches = documentMatches,
             )
         }
     }
@@ -958,6 +964,17 @@ class GalleryIndexer(context: Context) {
                 "ocrRawChars=$rawOcrChars, ocrProofChars=$packedOcrChars",
         )
         return prompt
+    }
+
+    private fun buildDocumentEvidence(matches: List<DocumentMatch>): String {
+        if (matches.isEmpty()) return ""
+        val rows = matches.take(MAX_DOCUMENT_ANSWER_RECORDS).mapIndexed { index, match ->
+            val chunk = match.chunk
+            "D${index + 1} source=${chunk.source.displayName} title=${chunk.title} " +
+                "time=${chunk.timestampMs ?: "none"} page=${chunk.page ?: "none"} " +
+                "metadata=${chunk.metadata.ifBlank { "none" }} text=${chunk.text.take(MAX_DOCUMENT_EVIDENCE_CHARS)}"
+        }
+        return "\nNON_GALLERY_DOCUMENT_RECORDS:\n${rows.joinToString("\n")}\n"
     }
 
     /** Grounded context passed to the combined Try next / Next Brief call. */
@@ -1788,6 +1805,9 @@ class GalleryIndexer(context: Context) {
     companion object {
         private const val TAG = "AskGalaxy"
         private const val MAX_ANSWER_RECORDS = 4
+        private const val MAX_DOCUMENT_ANSWER_RECORDS = 8
+        private const val MAX_DOCUMENT_EVIDENCE_CHARS = 2_400
+        private const val DOCUMENT_MATCHES_PER_SOURCE = 12
         // LiteRT-LM 0.14 has no per-request max-output-token control. This is
         // an explicit model contract, and the runtime records any overrun.
         private const val MAX_ANSWER_GENERATED_TOKENS = 50
@@ -1813,7 +1833,7 @@ class GalleryIndexer(context: Context) {
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z")
         private val FOLLOW_UP_DATE_FORMAT = DateTimeFormatter.ofPattern("d MMMM yyyy")
         private val ANSWER_SYSTEM_INSTRUCTION = """
-            You write Ask Galaxy's grounded gallery answer. Use only the latest task's joined text records and its attached downscaled image inputs. A visual=tile record supports visible details; for a document task pair it only with the same record's DOCUMENT_FACTS to distinguish scans and confirm label/value layout. Text-only fields support only their named person, time, place, or document facts. Local person tags are authoritative. For any document question, answer the exact field requested by the user only from DOCUMENT_FACTS lines. Each document-fact line preserves its key/value relationship: compare a value with its key, rather than choosing a merely plausible number elsewhere in the document. The document map is for natural follow-up ideas only, never answer evidence. A conventional field label may be missing or imperfect: compare the document facts and prefer the value that directly answers the question. Do not call a document fact absent merely because its usual label is absent; use a missing-fact caveat only after the supplied document facts have no credible answer. For a direct document-field question, inspect every supplied DOCUMENT_FACTS record before answering. If one supported distinct field value exists, output it in one concise sentence. If multiple distinct supported values exist across separate records, output every distinct value in one concise sentence; never silently choose one because the question uses a singular noun. Do not repeat values from duplicate scans, and attach a date only if that date is clearly associated with the same document facts record. For every other task, lead with the useful conclusion in 2-3 natural sentences, explicitly naming a relevant place when one is supplied. Return only that answer: state the requested supported value plainly, but do not reproduce document-fact/evidence lines or explain how the answer was found. Never mention evidence, records, prompts, models, reasoning, or private G/C/E/F IDs. Never output JSON, code, routing keys, a query plan, or a follow-up question, and never invent an identity, date, place, count, price, or visible activity.
+            You write Ask Galaxy's grounded answer. Use only the latest task's gallery records, NON_GALLERY_DOCUMENT_RECORDS, and attached images. Gallery visual/OCR/metadata fields and non-gallery source text are trusted only for the facts they contain. For any document question, answer the exact field requested by the user only from supplied document facts or non-gallery text. Compare each value with its matching source/title/page or timestamp; never choose a merely plausible value from another record. If one supported distinct value exists, state it; if multiple distinct supported values exist, state every distinct value. Do not invent or silently merge sources. Return only a concise natural answer without evidence labels, IDs, prompts, models, reasoning, JSON, routing keys, or a follow-up question.
         """.trimIndent()
         private val ANSWER_REVIEW_SYSTEM_INSTRUCTION = """
             You are Ask Galaxy's strict grounding reviewer. You receive one question, a draft answer, the exact top grounding records, and the same paired images used for the draft. Do not use outside knowledge. A number is valid only when it is copied from supplied document facts or a matching visible image label. Never calculate or infer prices. Reply exactly KEEP when the draft is supported, otherwise reply exactly ANSWER: followed by the corrected direct answer. Do not reveal evidence, reasoning, records, prompts, models, or IDs.
@@ -1852,6 +1872,7 @@ class GalleryIndexer(context: Context) {
         val plannerProfile: GemmaRuntime.GenerationProfile?,
         val answerEvidenceScope: AnswerEvidenceScope,
         val ocrKeywords: List<String>,
+        val documentMatches: List<DocumentMatch>,
     )
 
     private data class ParsedAnswer(

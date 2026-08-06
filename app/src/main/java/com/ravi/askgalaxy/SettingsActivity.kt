@@ -6,9 +6,13 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.util.Linkify
 import android.text.method.LinkMovementMethod
 import android.view.ViewGroup
@@ -51,6 +55,9 @@ class SettingsActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // Returning from Android's all-files access screen should immediately
+        // start the same complete personal-source pass.
+        DocumentIndexScheduler.enqueue(this)
         handler.post(refresh)
     }
 
@@ -72,6 +79,14 @@ class SettingsActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == LOCATION_PERMISSION_REQUEST) {
             LocationReindexScheduler.enqueueIfNeeded(this)
+            refreshState()
+        }
+        if (requestCode == DOCUMENT_PERMISSION_REQUEST) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                openAllFilesAccess()
+            } else {
+                DocumentIndexScheduler.enqueue(this)
+            }
             refreshState()
         }
     }
@@ -147,6 +162,38 @@ class SettingsActivity : Activity() {
             setLineSpacing(5f, 1f)
         }
         root.addView(models, wrap())
+
+        root.addView(TextView(this).apply {
+            text = "Personal sources"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Index Messages, Calendar, Contacts, call logs, and all accessible My Files documents. PDFs use only their first five pages."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        root.addView(Button(this).apply {
+            text = "Allow personal source access"
+            setAllCaps(false)
+            setOnClickListener {
+                if (missingPersonalRuntimePermissions()) {
+                    requestPermissions(
+                        arrayOf(
+                            Manifest.permission.READ_SMS,
+                            Manifest.permission.READ_CALENDAR,
+                            Manifest.permission.READ_CALL_LOG,
+                            Manifest.permission.READ_CONTACTS,
+                        ),
+                        DOCUMENT_PERMISSION_REQUEST,
+                    )
+                } else {
+                    openAllFilesAccessOrIndex()
+                }
+            }
+        }, wrap())
 
         root.addView(TextView(this).apply {
             text = "Preparation progress"
@@ -552,6 +599,28 @@ class SettingsActivity : Activity() {
         ViewGroup.LayoutParams.WRAP_CONTENT,
     )
 
+    private fun missingPersonalRuntimePermissions(): Boolean = listOf(
+        Manifest.permission.READ_SMS,
+        Manifest.permission.READ_CALENDAR,
+        Manifest.permission.READ_CALL_LOG,
+        Manifest.permission.READ_CONTACTS,
+    ).any { checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED }
+
+    private fun openAllFilesAccessOrIndex() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            openAllFilesAccess()
+        } else {
+            DocumentIndexScheduler.enqueue(this)
+        }
+    }
+
+    private fun openAllFilesAccess() {
+        startActivity(Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName"),
+        ))
+    }
+
     private data class StageProgressView(
         val label: TextView,
         val bar: ProgressBar,
@@ -559,5 +628,6 @@ class SettingsActivity : Activity() {
 
     private companion object {
         const val LOCATION_PERMISSION_REQUEST = 2001
+        const val DOCUMENT_PERMISSION_REQUEST = 4102
     }
 }

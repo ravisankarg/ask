@@ -70,6 +70,7 @@ data class SearchResponse(
     /** OCR conjunction that grounded the original answer; follow-ups inherit it for "it". */
     val answerOcrKeywords: List<String> = emptyList(),
     val timings: PhaseTimings = PhaseTimings(),
+    val documentMatches: List<DocumentMatch> = emptyList(),
 )
 
 /** Wall-clock durations shown to the user for one complete search answer. */

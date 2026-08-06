@@ -66,6 +66,16 @@ object GemmaModelSelection {
 }
 
 object ModelCatalog {
+    val embeddingGemma = ModelArtifact(
+        name = "EmbeddingGemma 300M document encoder",
+        relativePath = "models/embeddinggemma-300M-Q8_0.gguf",
+        runtime = "llama.cpp CPU embeddings",
+        required = false,
+        downloadUrl = "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/0f741b5a6585bd53aeb15cd1372c56f2a0f65e12/embeddinggemma-300M-Q8_0.gguf?download=true",
+        expectedBytes = 333_590_944L,
+        sourceLabel = "Public revision-pinned GGUF; no Hugging Face credential required",
+    )
+
     val siglipVision = ModelArtifact(
         name = "SigLIP2 ViT-B/16 224 image encoder",
         relativePath = "models/siglip2/siglip2_base_224_fp16.tflite",
@@ -158,6 +168,7 @@ object ModelCatalog {
         faceDetector,
         faceEmbedder,
         gemma(context),
+        embeddingGemma,
     )
 
     fun installedCount(context: Context): Int = all(context).count { it.isInstalled(context) }

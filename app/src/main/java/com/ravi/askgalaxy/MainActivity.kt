@@ -836,17 +836,19 @@ class MainActivity : Activity() {
                 }
                 renderQpOutput(response.effectivePlanJson)
                 renderTimeStats(response.timings, "Search")
-                if (response.gallery.isEmpty()) {
+                if (response.gallery.isEmpty() && response.documentMatches.isEmpty()) {
                     activeSearchResponse = null
                     response.plannerSession?.close()
                     setModelLoading(false, "")
                     warmPlannerForNextSearch()
-                    answer.text = "I couldn't find matching photos yet."
+                    answer.text = "I couldn't find matching gallery or personal records yet."
                     return@runOnUiThread
                 }
                 if (response.gallery.isNotEmpty()) {
                     renderResults(response.gallery, generation, response.totalGalleryMatches)
                     answer.text = "I found ${response.totalGalleryMatches} matching item${if (response.totalGalleryMatches == 1) "" else "s"}."
+                } else if (response.documentMatches.isNotEmpty()) {
+                    answer.text = "I found ${response.documentMatches.size} matching personal record${if (response.documentMatches.size == 1) "" else "s"}."
                 }
                 if (!response.needsAnswer) {
                     activeSearchResponse = null

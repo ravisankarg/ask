@@ -38,6 +38,12 @@ android {
     }
 
     sourceSets["main"].jniLibs.srcDir(generatedJniDir)
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
     // The direct LiteRT Community SigLIP2 artifact is shipped as an
     // uncompressed APK asset when present. ModelInstaller copies it into the
     // app-private model directory on first launch; the catalog also carries a
@@ -55,6 +61,14 @@ android {
         // AGP 8.13 packages native libraries at 16 KiB ZIP boundaries; the
         // Rust linker is configured with matching ELF load-segment pages.
         jniLibs.useLegacyPackaging = false
+    }
+
+    defaultConfig {
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
     }
 
     compileOptions {
@@ -85,6 +99,7 @@ dependencies {
     // LiteRT-LM provides the native Gemma session runtime; the .litertlm file
     // is installed separately because the E4B artifact is too large to bundle.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.6.1")
