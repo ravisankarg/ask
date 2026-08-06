@@ -122,6 +122,15 @@ class MainActivity : Activity() {
 
     private fun startBackgroundMaintenance() {
         GemmaDownloadScheduler.enqueueIfNeeded(this)
+        // Personal indexing owns its public EmbeddingGemma download. This
+        // also recovers when the gallery preparation worker completed before
+        // personal-source indexing was enabled.
+        val personalReader = DocumentSourceReader(this)
+        if (!ModelCatalog.embeddingGemma.isInstalled(this) &&
+            DocumentSource.entries.any(personalReader::isAvailable)
+        ) {
+            DocumentIndexScheduler.enqueue(this)
+        }
         val preparation = PreparationStore(this).read()
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
         val visualWorkerStale =
