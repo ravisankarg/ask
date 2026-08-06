@@ -31,14 +31,29 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                 sources.forEach { (source, records) ->
                     val all = records.toList()
                     val vectorIndex = indexes.getValue(source)
-                    all.forEachIndexed { position, chunk ->
-                        val vector = EmbeddingNative.embed(chunk.text) ?: return@forEachIndexed
-                        require(vector.size == DocumentDatabase.EMBEDDING_DIMENSION) {
-                            "EmbeddingGemma dimension changed: ${vector.size}"
+                    all.chunked(BATCH_SIZE).forEachIndexed { batchIndex, batch ->
+                        val flattened = EmbeddingNative.embedBatch(batch.map { it.text }.toTypedArray())
+                        if (flattened == null || flattened.size != batch.size * DocumentDatabase.EMBEDDING_DIMENSION) {
+                            batch.forEach { chunk ->
+                                val vector = EmbeddingNative.embed(chunk.text) ?: return@forEach
+                                require(vector.size == DocumentDatabase.EMBEDDING_DIMENSION) {
+                                    "EmbeddingGemma dimension changed: ${vector.size}"
+                                }
+                                vectorIndex.upsert(chunk.stableId, vector)
+                                database.upsertChunk(chunk)
+                            }
+                        } else {
+                            batch.forEachIndexed { index, chunk ->
+                                val start = index * DocumentDatabase.EMBEDDING_DIMENSION
+                                val vector = flattened.copyOfRange(start, start + DocumentDatabase.EMBEDDING_DIMENSION)
+                                vectorIndex.upsert(chunk.stableId, vector)
+                                database.upsertChunk(chunk)
+                            }
                         }
-                        vectorIndex.upsert(chunk.stableId, vector)
-                        database.upsertChunk(chunk)
-                        onProgress(source, position + 1, all.size)
+                        val completedBefore = batchIndex * BATCH_SIZE
+                        batch.indices.forEach { index ->
+                            onProgress(source, completedBefore + index + 1, all.size)
+                        }
                     }
                 }
             } finally {
@@ -79,5 +94,6 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
 
     private companion object {
         const val RRF_K = 60f
+        const val BATCH_SIZE = 4
     }
 }

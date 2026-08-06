@@ -6,5 +6,6 @@ object EmbeddingNative {
 
     external fun open(modelPath: String): Boolean
     external fun embed(text: String): FloatArray?
+    external fun embedBatch(texts: Array<String>): FloatArray?
     external fun close()
 }
