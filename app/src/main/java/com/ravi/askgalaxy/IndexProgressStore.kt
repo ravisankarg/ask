@@ -4,6 +4,7 @@ import android.content.Context
 
 enum class IndexProgressStage(val wire: String, val label: String) {
     MODELS("models", "Model downloads"),
+    EMBEDDING_GEMMA("embedding_gemma", "EmbeddingGemma 300M download"),
     VISUAL("visual", "SigLIP visual index"),
     OCR("ocr", "OCR text index"),
     LOCATION("location", "Photo locations"),

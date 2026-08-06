@@ -65,6 +65,14 @@ class PreparationWorker(
             .filter { (it.required && it != selectedGemma) || it == ModelCatalog.embeddingGemma }
         val installer = ModelInstaller(applicationContext)
         val report = installer.installArtifacts(indexingModels) { progress ->
+            if (progress.artifact == ModelCatalog.embeddingGemma) {
+                indexProgressStore.update(
+                    stage = IndexProgressStage.EMBEDDING_GEMMA,
+                    current = progress.bytesDownloaded,
+                    total = progress.bytesTotal,
+                    phase = "Downloading ${progress.artifact.name}",
+                )
+            }
             snapshot = snapshot.copy(
                 phase = PreparationPhase.DOWNLOADING,
                 message = "Installing indexing model ${progress.artifact.name}…",

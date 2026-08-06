@@ -465,6 +465,16 @@ class SettingsActivity : Activity() {
                     completed = true,
                 )
             }
+            val embeddingGemma = ModelCatalog.embeddingGemma
+            if (embeddingGemma.isInstalled(this)) {
+                progressStore.update(
+                    IndexProgressStage.EMBEDDING_GEMMA,
+                    embeddingGemma.expectedBytes,
+                    embeddingGemma.expectedBytes,
+                    completed = true,
+                    phase = "Installed",
+                )
+            }
             val stageProgress = progressStore.readAll()
             runOnUiThread {
                 if (!isFinishing) {
@@ -535,12 +545,13 @@ class SettingsActivity : Activity() {
         if (progress.completed) return "Complete"
         if (progress.updatedAtMs == 0L) return "Waiting"
         val counts = when {
-            stage == IndexProgressStage.MODELS ->
+            stage == IndexProgressStage.MODELS || stage == IndexProgressStage.EMBEDDING_GEMMA ->
                 "${formatBytes(progress.current)} / ${formatBytes(progress.total)}"
             else -> "${progress.current} / ${progress.total}"
         }
         val eta = progress.etaMs(nowMs)?.let { " • ETA ${formatDuration(it)}" }.orEmpty()
-        return "$counts (${progress.percent}%)$eta"
+        val phase = progress.phase.takeIf { it.isNotBlank() }?.let { " • $it" }.orEmpty()
+        return "$counts (${progress.percent}%)$phase$eta"
     }
 
     private fun formatBytes(bytes: Long): String {
