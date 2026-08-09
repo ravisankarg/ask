@@ -318,6 +318,11 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 db.delete(TABLE_ANSWERABILITY_FACTS, "media_store_id IN ($placeholders)", args)
                 db.delete(TABLE_MEDIA, "media_store_id IN ($placeholders)", args)
             }
+            // A deleted photo may have been the representative of an
+            // otherwise healthy face cluster. Repair the derived representative
+            // and count before the review UI reads the inventory; do not drop
+            // surviving embeddings or their labels.
+            repairFaceClusterRows(db)
             db.delete(
                 TABLE_EPISODES,
                 "NOT EXISTS (SELECT 1 FROM $TABLE_EPISODE_MEMBERS m WHERE m.episode_id = $TABLE_EPISODES.episode_id)",
@@ -996,6 +1001,10 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     /** Returns the complete review inventory unless an explicit diagnostic limit is supplied. */
     fun faceClusters(limit: Int? = null): List<FaceCluster> {
+        // Repair rows left behind by an older build or a deletion that happened
+        // before representative maintenance existed. This touches only
+        // derived cluster pointers, never the surviving face vectors.
+        repairFaceClusterRows(writableDatabase)
         val result = ArrayList<FaceCluster>()
         val safeLimit = limit?.coerceAtLeast(1)?.toString()
         val projection = arrayOf(
@@ -1048,6 +1057,33 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             }
         }
         return result
+    }
+
+    private fun repairFaceClusterRows(db: SQLiteDatabase) {
+        db.delete(
+            TABLE_FACE_CLUSTERS,
+            "NOT EXISTS (SELECT 1 FROM $TABLE_FACE_EMBEDDINGS f WHERE f.cluster_id = $TABLE_FACE_CLUSTERS.cluster_id)",
+            null,
+        )
+        db.execSQL(
+            """
+            UPDATE $TABLE_FACE_CLUSTERS
+            SET face_count = (
+                SELECT COUNT(*) FROM $TABLE_FACE_EMBEDDINGS f
+                WHERE f.cluster_id = $TABLE_FACE_CLUSTERS.cluster_id
+            ),
+            representative_face_id = (
+                SELECT f.id FROM $TABLE_FACE_EMBEDDINGS f
+                WHERE f.cluster_id = $TABLE_FACE_CLUSTERS.cluster_id
+                ORDER BY f.detection_score DESC, f.id ASC LIMIT 1
+            ),
+            representative_media_store_id = (
+                SELECT f.media_store_id FROM $TABLE_FACE_EMBEDDINGS f
+                WHERE f.cluster_id = $TABLE_FACE_CLUSTERS.cluster_id
+                ORDER BY f.detection_score DESC, f.id ASC LIMIT 1
+            )
+            """.trimIndent(),
+        )
     }
 
     /** Merges selected anonymous groups into the first selected group. */

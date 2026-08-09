@@ -1,5 +1,6 @@
 package com.ravi.askgalaxy
 
+import android.animation.ObjectAnimator
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
@@ -63,6 +64,9 @@ class MainActivity : Activity() {
     private lateinit var sourceDetails: LinearLayout
     private lateinit var modelProgress: ProgressBar
     private lateinit var modelStatus: TextView
+    private lateinit var answerPipelinePanel: LinearLayout
+    private lateinit var answerPipelineLabel: TextView
+    private lateinit var answerPipelineProgress: ProgressBar
     private lateinit var resultCount: TextView
     private lateinit var resultGrid: GridView
     private lateinit var timeStatsPanel: LinearLayout
@@ -87,7 +91,16 @@ class MainActivity : Activity() {
     private var deferredPreserveConversation = false
     private var deferredDisplayQuestion: String? = null
     private var timeStatsSummary = "Timing…"
+    private var answerPipelineAnimator: ObjectAnimator? = null
     private val handler = Handler(Looper.getMainLooper())
+
+    private enum class PipelineUiStage(val title: String, val progress: Int) {
+        PLANNING("Query planning", 12),
+        SEARCHING("Searching", 38),
+        ANSWERING("Answer generation", 66),
+        REVIEWING("Review", 84),
+        ACCEPTING("Accept", 96),
+    }
 
     private sealed class SearchResultItem {
         data class Gallery(
@@ -233,6 +246,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        answerPipelineAnimator?.cancel()
         DocumentIndexRuntimeGate.removeReleaseListener(documentIndexReleasedListener)
         GemmaRuntime.setPlannerWarmupStateListener(null)
         if (::resultGrid.isInitialized) {
@@ -639,6 +653,36 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         resultPanel.addView(modelStatus, matchWrap())
+        answerPipelinePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(6), dp(2), dp(6), dp(5))
+        }
+        answerPipelineLabel = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.rgb(76, 81, 105))
+            setSingleLine(true)
+            isHorizontalScrollBarEnabled = false
+        }
+        answerPipelinePanel.addView(answerPipelineLabel, matchWrap())
+        answerPipelineProgress = ProgressBar(
+            this,
+            null,
+            android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            max = 100
+            progress = 0
+            progressTintList = ColorStateList.valueOf(Color.rgb(82, 103, 205))
+            minHeight = dp(3)
+            maxHeight = dp(3)
+        }
+        answerPipelinePanel.addView(
+            answerPipelineProgress,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3)).apply {
+                topMargin = dp(3)
+            },
+        )
+        resultPanel.addView(answerPipelinePanel, matchWrap())
         resultCount = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.rgb(63, 66, 78))
@@ -846,6 +890,7 @@ class MainActivity : Activity() {
         nextBriefPanel.visibility = View.GONE
         nextBriefRow.removeAllViews()
         showQueryPlanningTelemetry()
+        showAnswerPipeline(PipelineUiStage.PLANNING)
         expandedSourceId = null
         setModelLoading(true, "Blending image, OCR, and metadata matches…")
         galleryIndexer.searchAsync(
@@ -866,18 +911,23 @@ class MainActivity : Activity() {
                     setModelLoading(
                         true,
                         when (progress.stage) {
-                            SearchStage.QUERY_PLANNING ->
+                            SearchStage.QUERY_PLANNING -> {
+                                showAnswerPipeline(PipelineUiStage.PLANNING)
                                 "${GemmaModelSelection.selected(this).displayName} is planning this query locally…"
+                            }
                             SearchStage.QUERY_PLANNED -> {
+                                showAnswerPipeline(PipelineUiStage.SEARCHING)
                                 renderQpOutput(progress.effectivePlanJson)
                                 renderTimeStats(progress.timings, "Planning")
                                 "QP ready. Searching image, OCR, and metadata indexes…"
                             }
                             SearchStage.HYBRID_RETRIEVAL -> {
+                                showAnswerPipeline(PipelineUiStage.SEARCHING)
                                 renderTimeStats(progress.timings, "Search")
                                 "Search results ready."
                             }
                             SearchStage.DIVERSE_EVIDENCE -> {
+                                showAnswerPipeline(PipelineUiStage.SEARCHING)
                                 renderTimeStats(progress.timings, "Search")
                                 "Search results ready."
                             }
@@ -891,6 +941,7 @@ class MainActivity : Activity() {
                 val response = result.getOrElse { error ->
                     activeSearchResponse = null
                     setModelLoading(false, "")
+                    hideAnswerPipeline()
                     renderQpFailure()
                     warmPlannerForNextSearch()
                     answer.text = if (
@@ -911,6 +962,7 @@ class MainActivity : Activity() {
                     activeSearchResponse = null
                     response.plannerSession?.close()
                     setModelLoading(false, "")
+                    hideAnswerPipeline()
                     warmPlannerForNextSearch()
                     resultGrid.visibility = View.GONE
                     resultCount.text = "No matching records found."
@@ -945,6 +997,7 @@ class MainActivity : Activity() {
                 if (response.needsAnswer) {
                     answer.visibility = View.VISIBLE
                     answer.text = "Answering from the top 4 hybrid records…"
+                    showAnswerPipeline(PipelineUiStage.ANSWERING)
                     if (!preserveConversation) appendConversationQuestion(text)
                     setModelLoading(
                         true,
@@ -960,6 +1013,7 @@ class MainActivity : Activity() {
                                 setModelLoading(false, "")
                                 answerResult.fold(
                                     onSuccess = {
+                                        showAnswerPipelineAccepted(generation)
                                         answer.visibility = View.GONE
                                         appendConversationAnswer(
                                             it.text.ifBlank { "I couldn't answer that yet." },
@@ -969,6 +1023,7 @@ class MainActivity : Activity() {
                                         renderTimeStats(it.timings, "Answer")
                                     },
                                     onFailure = {
+                                        hideAnswerPipeline()
                                         answer.text = "I couldn't answer that yet."
                                         answer.visibility = View.VISIBLE
                                     },
@@ -989,9 +1044,22 @@ class MainActivity : Activity() {
                                 }
                             }
                         },
+                        onStage = { stage ->
+                            runOnUiThread {
+                                if (generation != searchGeneration) return@runOnUiThread
+                                showAnswerPipeline(
+                                    when (stage) {
+                                        AnswerPipelineStage.ANSWERING -> PipelineUiStage.ANSWERING
+                                        AnswerPipelineStage.REVIEWING -> PipelineUiStage.REVIEWING
+                                        AnswerPipelineStage.ACCEPTING -> PipelineUiStage.ACCEPTING
+                                    },
+                                )
+                            }
+                        },
                     )
                 } else {
                     setModelLoading(false, "")
+                    hideAnswerPipeline()
                     response.plannerSession?.close()
                     warmPlannerForNextSearch()
                 }
@@ -1007,6 +1075,49 @@ class MainActivity : Activity() {
         // Keep the status text stable; the progress indicator alone conveys
         // active work without repeatedly fading the rest of the screen.
         modelStatus.clearAnimation()
+    }
+
+    /** Small, real-time pipeline hint that shares the existing result footer. */
+    private fun showAnswerPipeline(stage: PipelineUiStage) {
+        if (!::answerPipelinePanel.isInitialized) return
+        answerPipelinePanel.visibility = View.VISIBLE
+        val activeIndex = stage.ordinal
+        answerPipelineLabel.text = PipelineUiStage.entries.mapIndexed { index, item ->
+            val marker = when {
+                index < activeIndex -> "✓"
+                index == activeIndex -> "●"
+                else -> "○"
+            }
+            "$marker ${item.title}"
+        }.joinToString("   ")
+        answerPipelineAnimator?.cancel()
+        answerPipelineAnimator = ObjectAnimator.ofInt(
+            answerPipelineProgress,
+            "progress",
+            answerPipelineProgress.progress,
+            stage.progress,
+        ).apply {
+            duration = 260L
+            start()
+        }
+    }
+
+    private fun showAnswerPipelineAccepted(generation: Long) {
+        if (!::answerPipelinePanel.isInitialized) return
+        answerPipelineAnimator?.cancel()
+        answerPipelineProgress.progress = 100
+        answerPipelineLabel.text = "✓ Accepted"
+        answerPipelinePanel.visibility = View.VISIBLE
+        handler.postDelayed({
+            if (generation == searchGeneration) hideAnswerPipeline()
+        }, 1_500L)
+    }
+
+    private fun hideAnswerPipeline() {
+        if (!::answerPipelinePanel.isInitialized) return
+        answerPipelineAnimator?.cancel()
+        answerPipelinePanel.visibility = View.GONE
+        answerPipelineProgress.progress = 0
     }
 
     /** Replaces a QP session consumed by a browse, empty, or failed search. */

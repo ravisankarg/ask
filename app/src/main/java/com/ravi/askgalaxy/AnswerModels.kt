@@ -23,6 +23,13 @@ data class AnswerResult(
     val effectivePlanJson: String = "",
 )
 
+/** Live stages shown by the compact answer pipeline indicator. */
+enum class AnswerPipelineStage {
+    ANSWERING,
+    REVIEWING,
+    ACCEPTING,
+}
+
 data class FollowUpSuggestion(
     val text: String,
     val isQuery: Boolean = true,

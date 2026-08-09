@@ -355,6 +355,7 @@ class GalleryIndexer(context: Context) {
         onNextBriefs: (List<NextBriefSuggestion>) -> Unit = {},
         warmPlannerAfterAnswer: Boolean = true,
         warmAnswerAfterAnswer: Boolean = false,
+        onStage: (AnswerPipelineStage) -> Unit = {},
     ) {
         answerExecutor.execute {
             if (!response.needsAnswer) {
@@ -379,7 +380,9 @@ class GalleryIndexer(context: Context) {
             // prompt assembly so
             // those hot paths do not compete with a second KV cache.
             plannerSession?.close()
+            onStage(AnswerPipelineStage.ANSWERING)
             directCommunicationAnswer(query, response)?.let { directAnswer ->
+                onStage(AnswerPipelineStage.ACCEPTING)
                 onFinished(Result.success(directAnswer))
                 if (warmPlannerAfterAnswer) {
                     GemmaRuntime.preloadPlannerAfterAnswerAsync(appContext, QueryPlannerRuntime.plannerSystemInstruction())
@@ -632,6 +635,7 @@ class GalleryIndexer(context: Context) {
                         results = attachedResults,
                     )
                 }
+                onStage(AnswerPipelineStage.REVIEWING)
                 val output = reviewGroundedAnswer(
                     gemma = gemma,
                     query = query,
@@ -669,6 +673,7 @@ class GalleryIndexer(context: Context) {
                     parsed.text,
                 )
                 val followUpMs = elapsedMs(followUpStarted, System.nanoTime())
+                onStage(AnswerPipelineStage.ACCEPTING)
                 deferredFollowUps = {
                     val generatedStarted = System.nanoTime()
                     runCatching {
