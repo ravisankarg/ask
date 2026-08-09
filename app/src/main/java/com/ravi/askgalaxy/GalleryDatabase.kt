@@ -98,6 +98,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         db.execSQL("CREATE INDEX media_items_date_taken ON media_items(date_taken_ms)")
         db.execSQL("CREATE INDEX media_items_location_name ON media_items(location_name)")
         db.execSQL("CREATE INDEX media_items_content_class ON media_items(content_class)")
+        createAnswerabilityFactsTable(db)
         createFaceTables(db)
         createLocationCache(db)
         createEpisodeTables(db)
@@ -218,6 +219,12 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             // The retired KV document index is intentionally discarded on upgrade.
             runCatching { db.execSQL("UPDATE media_items SET kv_text = '', kv_indexed = 0, kv_signature = ''") }
         }
+        if (oldVersion < 16) {
+            // Candidate answer facts are derived data. Creating this table and
+            // lazily filling it must never rewrite OCR, vectors, faces, or
+            // metadata rows.
+            createAnswerabilityFactsTable(db)
+        }
     }
 
     fun upsert(media: GalleryMedia) {
@@ -308,6 +315,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                 val args = chunk.map(Long::toString).toTypedArray()
                 db.delete(TABLE_FACE_EMBEDDINGS, "media_store_id IN ($placeholders)", args)
                 db.delete(TABLE_EPISODE_MEMBERS, "media_store_id IN ($placeholders)", args)
+                db.delete(TABLE_ANSWERABILITY_FACTS, "media_store_id IN ($placeholders)", args)
                 db.delete(TABLE_MEDIA, "media_store_id IN ($placeholders)", args)
             }
             db.delete(
@@ -409,6 +417,83 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "media_store_id = ?",
             arrayOf(mediaStoreId.toString()),
         )
+    }
+
+    /** Returns persisted candidate label/value cards for the requested gallery rows. */
+    fun answerabilityFacts(mediaStoreIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
+        if (mediaStoreIds.isEmpty()) return emptyMap()
+        val placeholders = mediaStoreIds.joinToString(",") { "?" }
+        val result = LinkedHashMap<Long, MutableList<AnswerFactGrounding.IndexedFact>>()
+        readableDatabase.query(
+            TABLE_ANSWERABILITY_FACTS,
+            arrayOf("media_store_id", "label", "value"),
+            "media_store_id IN ($placeholders)",
+            mediaStoreIds.map(Long::toString).toTypedArray(),
+            null,
+            null,
+            "media_store_id ASC, id ASC",
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result.getOrPut(cursor.getLong(0)) { ArrayList() } +=
+                    AnswerFactGrounding.IndexedFact(cursor.getString(1), cursor.getString(2))
+            }
+        }
+        return result
+    }
+
+    /** Backfills only missing derived cards for selected evidence rows. */
+    fun ensureAnswerabilityFacts(mediaStoreIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
+        val existing = answerabilityFacts(mediaStoreIds)
+        mediaStoreIds.filterNot(existing::containsKey).forEach { mediaStoreId ->
+            val sourceText = readableDatabase.query(
+                TABLE_MEDIA,
+                arrayOf("display_name", "ocr_text"),
+                "media_store_id = ?",
+                arrayOf(mediaStoreId.toString()),
+                null,
+                null,
+                null,
+                "1",
+            ).use { cursor ->
+                if (!cursor.moveToFirst()) null
+                else listOf(cursor.getString(0).orEmpty(), cursor.getString(1).orEmpty())
+                    .filter(String::isNotBlank)
+                    .joinToString("\n")
+            }
+            sourceText?.let { replaceAnswerabilityFacts(mediaStoreId, it) }
+        }
+        return answerabilityFacts(mediaStoreIds)
+    }
+
+    /** Fills one derived row set after OCR completes; source data is unchanged. */
+    private fun replaceAnswerabilityFacts(mediaStoreId: Long, ocrText: String) {
+        val db = writableDatabase
+        val title = db.query(
+            TABLE_MEDIA,
+            arrayOf("display_name"),
+            "media_store_id = ?",
+            arrayOf(mediaStoreId.toString()),
+            null,
+            null,
+            null,
+            "1",
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0).orEmpty() else "" }
+        val facts = AnswerFactGrounding.extractFactsForIndex(
+            listOf(title, ocrText).filter(String::isNotBlank).joinToString("\n"),
+        )
+        db.beginTransaction()
+        try {
+            db.delete(TABLE_ANSWERABILITY_FACTS, "media_store_id = ?", arrayOf(mediaStoreId.toString()))
+            facts.forEach { fact ->
+                db.execSQL(
+                    "INSERT OR IGNORE INTO $TABLE_ANSWERABILITY_FACTS(media_store_id,label,value) VALUES(?,?,?)",
+                    arrayOf(mediaStoreId, fact.label, fact.value),
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     fun cachedLocationName(coordinateKey: String): String? =
@@ -617,6 +702,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             "media_store_id = ?",
             arrayOf(mediaStoreId.toString()),
         )
+        replaceAnswerabilityFacts(mediaStoreId, cleanText)
     }
 
     /**
@@ -1692,9 +1778,26 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    private fun createAnswerabilityFactsTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS answerability_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_store_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                UNIQUE(media_store_id, label, value)
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS answerability_facts_media ON answerability_facts(media_store_id)",
+        )
+    }
+
     companion object {
         private const val DATABASE_NAME = "gallery.db"
-    private const val DATABASE_VERSION = 15
+        private const val DATABASE_VERSION = 16
         private const val SQLITE_ID_CHUNK = 900
         private const val TABLE_MEDIA = "media_items"
         private const val TABLE_FACE_EMBEDDINGS = "face_embeddings"
@@ -1702,6 +1805,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         private const val TABLE_LOCATION_CACHE = "location_cache"
         private const val TABLE_EPISODES = "photo_episodes"
         private const val TABLE_EPISODE_MEMBERS = "photo_episode_members"
+        private const val TABLE_ANSWERABILITY_FACTS = "answerability_facts"
         const val LOCATION_PENDING = 0
         const val LOCATION_COMPLETE_NO_GPS = 1
         const val LOCATION_RESOLVED = 2

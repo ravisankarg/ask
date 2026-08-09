@@ -10,7 +10,7 @@ import java.util.Locale
  * question against those labels, and leaves final validation to the answer
  * model with the complete records.
  */
-internal object AnswerFactGrounding {
+object AnswerFactGrounding {
     data class Grounding(
         val matchedFacts: List<Fact>,
     ) {
@@ -36,8 +36,21 @@ internal object AnswerFactGrounding {
         val recordScore: Int,
     )
 
+    /** Persisted candidate fact produced without an LLM. */
+    data class IndexedFact(
+        val label: String,
+        val value: String,
+    )
+
+    data class DraftCheck(
+        val needsRepair: Boolean,
+        val missingValues: List<String>,
+    )
+
     private data class Record(
+        val key: String,
         val text: String,
+        val indexedFacts: List<IndexedFact>,
     )
 
     private data class RawFact(
@@ -48,29 +61,49 @@ internal object AnswerFactGrounding {
     )
 
     fun ground(query: String, evidence: List<HybridSearchResult>): Grounding {
+        return ground(query, evidence, emptyMap())
+    }
+
+    /**
+     * Resolves against persisted candidate facts when available. The complete
+     * evidence text is still retained for record-anchor scoring and is always
+     * sent to Gemma; the persisted rows are only a fast candidate lookup.
+     */
+    fun ground(
+        query: String,
+        evidence: List<HybridSearchResult>,
+        indexedFacts: Map<String, List<IndexedFact>>,
+    ): Grounding {
         if (DocumentAmountGrounding.isAmountQuestion(query)) return Grounding(emptyList())
 
         val records = evidence.map { item ->
             when (item) {
                 is HybridSearchResult.Gallery -> Record(
-                    listOf(
+                    key = galleryKey(item.media.mediaStoreId),
+                    text = listOf(
                         item.media.displayName,
                         item.media.personLabel,
                         item.media.ocrText,
                     ).filterNotNull().filter(String::isNotBlank).joinToString("\n"),
+                    indexedFacts = indexedFacts[galleryKey(item.media.mediaStoreId)].orEmpty(),
                 )
                 is HybridSearchResult.Document -> Record(
-                    listOf(
+                    key = documentKey(item.match.chunk.stableId),
+                    text = listOf(
                         item.match.chunk.title,
                         item.match.chunk.metadata,
                         item.match.chunk.text,
                     ).filter(String::isNotBlank).joinToString("\n"),
+                    indexedFacts = indexedFacts[documentKey(item.match.chunk.stableId)].orEmpty(),
                 )
             }
         }
         val rawFacts = records.flatMapIndexed { recordIndex, record ->
-            extractFacts(record.text).map { (label, value) ->
-                RawFact(recordIndex, record.text, label, value)
+            val facts = record.indexedFacts.ifEmpty {
+                extractFacts(record.text).map { (label, value) -> IndexedFact(label, value) }
+            }
+            facts.map { fact ->
+                RawFact(recordIndex, record.text, fact.label, fact.value)
             }
         }
         if (rawFacts.isEmpty()) return Grounding(emptyList())
@@ -119,6 +152,23 @@ internal object AnswerFactGrounding {
         val normalizedDraft = normalize(draft)
         return values.filterNot { normalizedDraft.contains(normalize(it)) }
     }
+
+    /** Cheap pre-review contract; it never attempts to interpret the answer. */
+    fun checkDraft(draft: String, requiredValues: List<String>): DraftCheck {
+        val missing = missingValues(draft, requiredValues)
+        val failedText = draft.isBlank() || FAILED_ANSWER_MARKER.containsMatchIn(draft)
+        return DraftCheck(
+            needsRepair = failedText || missing.isNotEmpty(),
+            missingValues = missing,
+        )
+    }
+
+    fun extractFactsForIndex(text: String): List<IndexedFact> =
+        extractFacts(text).map { (label, value) -> IndexedFact(label, value) }
+
+    fun galleryKey(mediaStoreId: Long): String = "gallery:$mediaStoreId"
+
+    fun documentKey(stableId: Long): String = "document:$stableId"
 
     fun requestedFieldInstruction(query: String): String =
         "Resolve the exact attribute requested in ${quote(query)} by matching it to the closest explicit field label in each relevant record. " +
@@ -247,6 +297,9 @@ internal object AnswerFactGrounding {
     private val GENERIC_FIELD_TOKENS = setOf("number", "date", "id", "code", "value")
     private val IGNORED_LABELS = setOf("http", "https", "uri", "url")
     private val IGNORED_VALUES = setOf("none", "null", "unknown", "na")
+    private val FAILED_ANSWER_MARKER = Regex(
+        "(?i)\\b(?:couldn['’]?t|cannot|can['’]?t|unable to)\\b.*\\b(?:answer|find|determine)\\b",
+    )
     private const val MAX_LABEL_WORDS = 8
     private const val MAX_VALUE_CHARS = 160
     private const val MAX_MATCHED_FACTS = 8

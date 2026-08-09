@@ -210,6 +210,13 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
         database.distinctTitles(DocumentSource.CONTACTS)
     }
 
+    /** Loads the small persisted candidate-fact set without touching vectors. */
+    fun answerabilityFacts(matches: List<DocumentMatch>): Map<String, List<AnswerFactGrounding.IndexedFact>> =
+        lock.withLock {
+            database.ensureAnswerabilityFacts(matches.map { it.chunk.stableId }.distinct().toLongArray())
+                .mapKeys { (stableId, _) -> AnswerFactGrounding.documentKey(stableId) }
+        }
+
     /** Direct newest-first path for conversational call/message questions. */
     fun latestCommunicationMatches(
         source: DocumentSource,

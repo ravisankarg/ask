@@ -416,7 +416,22 @@ class GalleryIndexer(context: Context) {
                 var attachedResults = orderedEvidence.mapNotNull { item ->
                     (item as? HybridSearchResult.Gallery)?.media
                 }
-                val groundedFacts = AnswerFactGrounding.ground(query, orderedEvidence)
+                val galleryFactRows = database.ensureAnswerabilityFacts(
+                    attachedResults.map(GalleryMedia::mediaStoreId).toLongArray(),
+                ).mapKeys { (mediaStoreId, _) -> AnswerFactGrounding.galleryKey(mediaStoreId) }
+                val documentEvidence = orderedEvidence.mapNotNull {
+                    (it as? HybridSearchResult.Document)?.match
+                }
+                val documentFactRows = if (documentEvidence.isEmpty()) {
+                    emptyMap()
+                } else {
+                    DocumentVectorIndex.shared(appContext).answerabilityFacts(documentEvidence)
+                }
+                val groundedFacts = AnswerFactGrounding.ground(
+                    query = query,
+                    evidence = orderedEvidence,
+                    indexedFacts = galleryFactRows + documentFactRows,
+                )
                 val groundedFactValues = groundedFacts.matchedValues
                 if (groundedFactValues.isNotEmpty()) {
                     Log.i(
@@ -2060,10 +2075,10 @@ class GalleryIndexer(context: Context) {
     }
 
     /**
-     * A short ReAct-style verification pass. Every turn gets exactly the same
-     * selected evidence and image bytes as the draft; it cannot retrieve a
-     * tempting but unrelated result. `KEEP` exits immediately, while at most
-     * three corrective turns are permitted for a genuinely disputed answer.
+     * A bounded structured verification pass. Every turn gets exactly the
+     * same selected evidence and image bytes as the draft; it cannot retrieve
+     * a tempting but unrelated result. `KEEP` exits immediately, while at
+     * most two corrective turns are permitted.
      */
     private fun reviewGroundedAnswer(
         gemma: GemmaRuntime,
@@ -2088,7 +2103,8 @@ class GalleryIndexer(context: Context) {
             .distinctBy { it.lowercase().replace(Regex("[^a-z0-9]"), "") }
         var current = draft
         repeat(MAX_ANSWER_REVIEW_TURNS) { attempt ->
-            val missingValues = AnswerFactGrounding.missingValues(current, requiredValues)
+            val draftCheck = AnswerFactGrounding.checkDraft(current, requiredValues)
+            val missingValues = draftCheck.missingValues
             val review = generateAnswerReview(
                 gemma = gemma,
                 prompt = buildAnswerReviewPrompt(
@@ -2119,6 +2135,15 @@ class GalleryIndexer(context: Context) {
                 return@repeat
             }
             val constrained = DocumentAmountGrounding.constrainAnswer(query, replacement, results)
+            val replacementCheck = AnswerFactGrounding.checkDraft(constrained, requiredValues)
+            if (requiredValues.isNotEmpty() && replacementCheck.needsRepair) {
+                Log.w(
+                    TAG,
+                    "Answer evidence review produced a replacement missing grounded values=" +
+                        replacementCheck.missingValues.size + "; retaining current draft",
+                )
+                return@repeat
+            }
             if (AnswerTextSanitizer.clean(constrained) == AnswerTextSanitizer.clean(current)) {
                 Log.i(TAG, "Answer evidence review converged on pass ${attempt + 1}")
                 return current
@@ -2699,7 +2724,7 @@ class GalleryIndexer(context: Context) {
         // LiteRT-LM 0.14 has no per-request max-output-token control. This is
         // an explicit model contract, and the runtime records any overrun.
         private const val MAX_ANSWER_GENERATED_TOKENS = 50
-        private const val MAX_ANSWER_REVIEW_TURNS = 3
+        private const val MAX_ANSWER_REVIEW_TURNS = 2
         private const val MAX_FACE_CROP_IMAGES = 2
         private const val FACE_CROP_MAX_DIMENSION = 256
         private const val UI_RESULT_LIMIT = 16

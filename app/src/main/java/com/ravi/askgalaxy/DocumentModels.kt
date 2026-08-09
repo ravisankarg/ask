@@ -88,7 +88,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
     context.applicationContext,
     "document_context.db",
     null,
-    1,
+    2,
 ) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
@@ -105,21 +105,28 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                 metadata TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL,
                 model_revision TEXT NOT NULL
-            )""".trimIndent(),
+        )""".trimIndent(),
         )
         db.execSQL("CREATE INDEX chunks_source_record ON chunks(source, record_key)")
         db.execSQL("CREATE INDEX chunks_source_time ON chunks(source, timestamp_ms)")
+        createAnswerabilityFactsTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS chunks")
-        onCreate(db)
+        // Derived answerability rows are additive. Never drop the document
+        // corpus or its stable IDs during an app upgrade.
+        if (oldVersion < 2) createAnswerabilityFactsTable(db)
     }
 
     fun replaceRecord(source: DocumentSource, recordKey: String, chunks: List<DocumentChunk>) {
         writableDatabase.beginTransaction()
         try {
             writableDatabase.delete("chunks", "source=? AND record_key=?", arrayOf(source.wire, recordKey))
+            writableDatabase.delete(
+                TABLE_ANSWERABILITY_FACTS,
+                "source=? AND record_key=?",
+                arrayOf(source.wire, recordKey),
+            )
             chunks.forEach { chunk ->
                 writableDatabase.execSQL(
                     "INSERT OR REPLACE INTO chunks(stable_id,source,record_key,chunk_number,title,text,uri,page,timestamp_ms,metadata,content_hash,model_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -129,6 +136,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                         chunk.metadata, sha256(chunk.text), EMBEDDING_MODEL_REVISION,
                     ),
                 )
+                replaceAnswerabilityFacts(writableDatabase, chunk)
             }
             writableDatabase.setTransactionSuccessful()
         } finally {
@@ -145,6 +153,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                 chunk.metadata, sha256(chunk.text), EMBEDDING_MODEL_REVISION,
             ),
         )
+        replaceAnswerabilityFacts(writableDatabase, chunk)
     }
 
     /** True when this chunk was already embedded with the current model. */
@@ -164,6 +173,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
     fun deleteMissingRecords(source: DocumentSource, activeRecordKeys: Set<String>) {
         if (activeRecordKeys.isEmpty()) {
             writableDatabase.delete("chunks", "source=?", arrayOf(source.wire))
+            writableDatabase.delete(TABLE_ANSWERABILITY_FACTS, "source=?", arrayOf(source.wire))
             return
         }
         writableDatabase.query("chunks", arrayOf("record_key"), "source=?", arrayOf(source.wire), null, null, null).use { cursor ->
@@ -172,7 +182,10 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                 val key = cursor.getString(0)
                 if (key !in activeRecordKeys) stale += key
             }
-            stale.forEach { key -> writableDatabase.delete("chunks", "source=? AND record_key=?", arrayOf(source.wire, key)) }
+            stale.forEach { key ->
+                writableDatabase.delete("chunks", "source=? AND record_key=?", arrayOf(source.wire, key))
+                writableDatabase.delete(TABLE_ANSWERABILITY_FACTS, "source=? AND record_key=?", arrayOf(source.wire, key))
+            }
         }
     }
 
@@ -199,6 +212,39 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
             }
         }
         return output.sortedBy { it.first }.map { it.second }
+    }
+
+    /** Returns persisted candidate label/value cards for document chunks. */
+    fun answerabilityFacts(stableIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
+        if (stableIds.isEmpty()) return emptyMap()
+        val placeholders = stableIds.joinToString(",") { "?" }
+        val result = LinkedHashMap<Long, MutableList<AnswerFactGrounding.IndexedFact>>()
+        readableDatabase.query(
+            TABLE_ANSWERABILITY_FACTS,
+            arrayOf("stable_id", "label", "value"),
+            "stable_id IN ($placeholders)",
+            stableIds.map(Long::toString).toTypedArray(),
+            null,
+            null,
+            "stable_id ASC, id ASC",
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result.getOrPut(cursor.getLong(0)) { ArrayList() } +=
+                    AnswerFactGrounding.IndexedFact(cursor.getString(1), cursor.getString(2))
+            }
+        }
+        return result
+    }
+
+    /** Backfills only missing derived cards for selected evidence chunks. */
+    fun ensureAnswerabilityFacts(stableIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
+        val existing = answerabilityFacts(stableIds)
+        stableIds.filterNot(existing::containsKey).forEach { stableId ->
+            chunks(longArrayOf(stableId)).firstOrNull()?.let { chunk ->
+                replaceAnswerabilityFacts(writableDatabase, chunk)
+            }
+        }
+        return answerabilityFacts(stableIds)
     }
 
     /** Names already present in a private source, used only for typo-tolerant routing. */
@@ -461,9 +507,47 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    private fun replaceAnswerabilityFacts(db: SQLiteDatabase, chunk: DocumentChunk) {
+        val facts = AnswerFactGrounding.extractFactsForIndex(
+            listOf(chunk.title, chunk.metadata, chunk.text)
+                .filter(String::isNotBlank)
+                .joinToString("\n"),
+        )
+        db.delete(TABLE_ANSWERABILITY_FACTS, "stable_id = ?", arrayOf(chunk.stableId.toString()))
+        facts.forEach { fact ->
+            db.execSQL(
+                "INSERT OR IGNORE INTO $TABLE_ANSWERABILITY_FACTS(stable_id,source,record_key,label,value) VALUES(?,?,?,?,?)",
+                arrayOf(chunk.stableId, chunk.source.wire, chunk.recordKey, fact.label, fact.value),
+            )
+        }
+    }
+
+    private fun createAnswerabilityFactsTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS answerability_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stable_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                record_key TEXT NOT NULL,
+                label TEXT NOT NULL,
+                value TEXT NOT NULL,
+                UNIQUE(stable_id, label, value)
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS answerability_facts_stable ON answerability_facts(stable_id)",
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS answerability_facts_record ON answerability_facts(source, record_key)",
+        )
+    }
+
     companion object {
         const val EMBEDDING_DIMENSION = 768
         const val EMBEDDING_MODEL_REVISION = "litert-community/embeddinggemma-300m@main-sm8750-seq512"
+        private const val TABLE_ANSWERABILITY_FACTS = "answerability_facts"
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
     }
