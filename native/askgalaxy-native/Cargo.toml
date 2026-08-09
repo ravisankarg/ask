@@ -10,4 +10,5 @@ crate-type = ["cdylib"]
 [dependencies]
 jni = "0.21"
 tokenizers = { version = "0.21.4", default-features = false, features = ["fancy-regex"] }
+sentencepiece-rs = "0.2.2"
 turbovec = { git = "https://github.com/RyanCodrai/turbovec.git", rev = "1e7200cfd8f26c92ce2855652db64bc7f85bc039" }

@@ -95,7 +95,10 @@ dependencies {
     // line confidence and native layout/rotation handling.
     implementation("com.google.mlkit:text-recognition:16.0.1")
     // LiteRT executes the visual/text encoders and face models through native code.
-    implementation("com.google.ai.edge.litert:litert:1.0.1")
+    // CompiledModel is the optimized LiteRT CPU/GPU/NPU path used by the
+    // EmbeddingGemma semantic-similarity sample. Interpreter remains
+    // available for the other fixed-shape app models.
+    implementation("com.google.ai.edge.litert:litert:2.1.0")
     // LiteRT-LM provides the native Gemma session runtime; the .litertlm file
     // is installed separately because the E4B artifact is too large to bundle.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")

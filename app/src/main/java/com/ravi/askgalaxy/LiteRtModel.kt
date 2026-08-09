@@ -28,6 +28,8 @@ class LiteRtModel private constructor(
         output.rewind()
     }
 
+    fun lastInferenceDurationNs(): Long = interpreter.lastNativeInferenceDurationNanoseconds ?: 0L
+
     fun runMultiple(input: ByteBuffer, outputs: List<ByteBuffer>) {
         input.rewind()
         outputs.forEach(ByteBuffer::rewind)
@@ -42,11 +44,14 @@ class LiteRtModel private constructor(
     }
 
     companion object {
-        fun open(file: File, threads: Int = 4): LiteRtModel {
+        fun open(file: File, threads: Int = 4, gpu: Boolean = false): LiteRtModel {
             check(file.isFile) { "LiteRT model is not installed: ${file.absolutePath}" }
-            val options = InterpreterApi.Options()
-                .setNumThreads(threads)
-                .setUseXNNPACK(true)
+            val options = InterpreterApi.Options().setNumThreads(threads)
+            if (gpu) {
+                error("Use LiteRtCompiledEmbedding for GPU inference; Interpreter is CPU-only in LiteRT 2.x")
+            } else {
+                options.setUseXNNPACK(true)
+            }
             return LiteRtModel(InterpreterApi.create(file, options).also { it.allocateTensors() })
         }
     }

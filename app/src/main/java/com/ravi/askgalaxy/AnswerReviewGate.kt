@@ -14,7 +14,7 @@ object AnswerReviewGate {
         draft: String,
         records: List<GalleryMedia>,
     ): Reason? {
-        if (DIRECT_FIELD_INTENT.containsMatchIn(query.lowercase(Locale.ROOT))) {
+        if (isDirectFieldQuestion(query)) {
             return Reason.DIRECT_FIELD
         }
         val draftValues = valueTokens(draft)
@@ -30,6 +30,9 @@ object AnswerReviewGate {
             null
         }
     }
+
+    fun isDirectFieldQuestion(query: String): Boolean =
+        DIRECT_FIELD_INTENT.containsMatchIn(query.lowercase(Locale.ROOT))
 
     private fun valueTokens(value: String): List<String> = VALUE_TOKEN.findAll(value)
         .map { it.value }

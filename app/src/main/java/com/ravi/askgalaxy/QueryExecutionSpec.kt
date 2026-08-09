@@ -28,7 +28,8 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
             }
         }
         collectCategories(root)
-        require(categories.size == 1) { "Planner spec must contain exactly one query_category" }
+        if (categories.isEmpty()) return QueryCategory.SCENARY
+        require(categories.size == 1) { "Planner spec may contain at most one query_category" }
         val categoryPredicate = categories.single()
         return requireNotNull(QueryCategory.fromWireName(categoryPredicate.value)) {
             "query_category must be one of doc, scenary, person, location, time"
@@ -49,10 +50,7 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
             }
         }
         collect(root)
-        require(answers.size == 1) {
-            "Planner spec must contain exactly one answer_needed predicate"
-        }
-        return answers.single().value == "true"
+        return answers.singleOrNull()?.value == "true" || answers.isEmpty()
     }
 
     /**
@@ -60,12 +58,10 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
      * All non-category predicates and operators remain model-authored.
      */
     fun canonicalizeCategoryEnvelope(): QueryExecutionSpec {
-        requiredQueryCategory()
-        lateinit var category: ExecutionNode.Predicate
-        lateinit var answerNeeded: ExecutionNode.Predicate
+        val category = findCategory(root)
+        var answerNeeded: ExecutionNode.Predicate? = null
         fun withoutCategory(node: ExecutionNode): ExecutionNode? = when (node) {
             is ExecutionNode.Predicate -> if (node.field == ExecutionField.QUERY_CATEGORY) {
-                category = node
                 null
             } else if (node.field == ExecutionField.ANSWER_NEEDED) {
                 answerNeeded = node
@@ -87,20 +83,14 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
                 }
             }
         }
-        val retrieval = requireNotNull(withoutCategory(root)) {
-            "Planner spec must include a retrieval predicate after query_category"
-        }
-        return QueryExecutionSpec(
-            ExecutionNode.Binary(
-                answerNeeded,
-                ExecutionBinaryOperator.INTERSECT,
-                ExecutionNode.Binary(
-                    category,
-                    ExecutionBinaryOperator.INTERSECT,
-                    retrieval,
-                ),
-            ),
-        )
+        val retrieval = requireNotNull(withoutCategory(root)) { "Planner spec must include a retrieval predicate" }
+        return QueryExecutionSpec(retrieval)
+    }
+
+    private fun findCategory(node: ExecutionNode): ExecutionNode.Predicate? = when (node) {
+        is ExecutionNode.Predicate -> node.takeIf { it.field == ExecutionField.QUERY_CATEGORY }
+        is ExecutionNode.Sorted -> findCategory(node.value)
+        is ExecutionNode.Binary -> findCategory(node.left) ?: findCategory(node.right)
     }
 
     companion object {
@@ -120,18 +110,15 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
                         }
                         when (node.field) {
                             ExecutionField.MIME_TYPE -> require(
-                                node.value == "photos" || node.value == "videos",
+                                QueryMediaType.fromToken(node.value) != null,
                             ) {
-                                "mime type must be exactly photos or videos"
+                                "mime type must be one of photos, videos, pdf, doc, messages, sms, calendar, contacts, call_logs, or files"
                             }
                             ExecutionField.FROM_DATE,
                             ExecutionField.TO_DATE,
                             -> require(runCatching { LocalDate.parse(node.value) }.isSuccess) {
                                 "${node.field.wireName} must be an ISO yyyy-MM-dd date"
                             }
-                            ExecutionField.ANSWER_NEEDED -> require(
-                                node.value == "true" || node.value == "false",
-                            ) { "answer_needed must be true or false" }
                             ExecutionField.QUERY_CATEGORY -> require(
                                 QueryCategory.fromWireName(node.value) != null,
                             ) {
@@ -166,7 +153,9 @@ enum class ExecutionField(val wireName: String) {
     FROM_DATE("from_date"),
     TO_DATE("to_date"),
     LOCATION("location"),
+    TIME("time"),
     SEMANTIC("semantic"),
+    KEYWORD("keyword"),
     OCR("ocr"),
     ;
 
@@ -182,7 +171,9 @@ enum class ExecutionField(val wireName: String) {
             "from_date" -> FROM_DATE
             "to_date" -> TO_DATE
             "location" -> LOCATION
+            "time" -> TIME
             "semantic" -> SEMANTIC
+            "keyword" -> KEYWORD
             "ocr" -> OCR
             else -> null
         }
@@ -224,8 +215,8 @@ object ExecutionSpecRenderer {
 
     private fun render(node: ExecutionNode, parentPrecedence: Int): String = when (node) {
         is ExecutionNode.Predicate -> {
-            val value = if (node.field == ExecutionField.OCR) {
-                renderOcrKeywords(node.value)
+            val value = if (node.field == ExecutionField.OCR || node.field == ExecutionField.KEYWORD) {
+                renderWordList(node.value)
             } else {
                 renderValue(node.value)
             }
@@ -262,7 +253,7 @@ object ExecutionSpecRenderer {
         return "\"" + clean.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
     }
 
-    private fun renderOcrKeywords(value: String): String {
+    private fun renderWordList(value: String): String {
         val keywords = value
             .split(Regex("[^\\p{L}\\p{N}]+"))
             .filter(String::isNotBlank)
@@ -333,8 +324,8 @@ private class ExecutionSpecParser(value: String) {
         expect(TokenKind.EQUALS)
         val field = ExecutionField.fromWireName(fieldText)
             ?: throw IllegalArgumentException("Unsupported execution field '$fieldText'")
-        val value = if (field == ExecutionField.OCR) {
-            collectOcrValue()
+        val value = if (field == ExecutionField.OCR || field == ExecutionField.KEYWORD) {
+            collectWordListValue(field.wireName)
         } else {
             collectUntil(TokenKind.RIGHT_BRACKET)
         }
@@ -349,15 +340,16 @@ private class ExecutionSpecParser(value: String) {
      * internal value "Ravi passport"; the AND tokens never become AST-level
      * set intersections.
      */
-    private fun collectOcrValue(): String {
+    private fun collectWordListValue(fieldName: String): String {
         val values = ArrayList<String>()
         var expectKeyword = true
         var usedExplicitAnd = false
+        val requireBraces = fieldName == "keyword"
         while (peek() != null && peek()?.kind != TokenKind.RIGHT_BRACKET) {
             val token = peek()!!
             if (expectKeyword) {
                 require(token.kind == TokenKind.WORD) {
-                    "Expected {keyword} inside ocr predicate but found '${token.text}'"
+                    "Expected {word} inside $fieldName predicate but found '${token.text}'"
                 }
                 val unquoted = unquote(token.text)
                 val keyword = if (
@@ -367,10 +359,16 @@ private class ExecutionSpecParser(value: String) {
                 ) {
                     unquoted.substring(1, unquoted.lastIndex)
                 } else {
+                    require(!requireBraces) {
+                        "$fieldName must use one braced word per list item"
+                    }
                     unquoted
                 }
+                require(!keyword.any { it.isWhitespace() }) {
+                    "$fieldName items must be individual words, not phrases"
+                }
                 require(keyword.isNotBlank() && '{' !in keyword && '}' !in keyword) {
-                    "Invalid OCR keyword '${token.text}'"
+                    "Invalid $fieldName word '${token.text}'"
                 }
                 values += keyword
                 position += 1
@@ -380,17 +378,16 @@ private class ExecutionSpecParser(value: String) {
                 position += 1
                 expectKeyword = true
             } else if (!usedExplicitAnd && token.kind == TokenKind.WORD) {
-                // Backward-compatible parsing for previously persisted/logged
-                // [ocr == Ravi passport] expressions.
+                // Backward-compatible parsing for previously persisted/logged word lists.
                 expectKeyword = true
             } else {
                 throw IllegalArgumentException(
-                    "Expected && between OCR keywords but found '${token.text}'",
+                    "Expected && between $fieldName words but found '${token.text}'",
                 )
             }
         }
         require(values.isNotEmpty() && !expectKeyword) {
-            "OCR predicate must end with a keyword"
+            "$fieldName predicate must end with a word"
         }
         return values.joinToString(" ")
     }
@@ -540,6 +537,7 @@ object ExecutionSpecCompiler {
         val canonicalSpec = spec.canonicalizeCategoryEnvelope()
         val queryCategory = canonicalSpec.requiredQueryCategory()
         val semantic = ArrayList<String>()
+        val keywords = ArrayList<String>()
         val negativeSemantic = ArrayList<String>()
         val ocr = ArrayList<String>()
         val negativeOcr = ArrayList<String>()
@@ -550,17 +548,14 @@ object ExecutionSpecCompiler {
         var fromDate = ""
         var toDate = ""
         var location = ""
+        var time = ""
         var sortDate = false
         var sortLocation = false
 
         fun visit(node: ExecutionNode, subtract: Boolean = false) {
             when (node) {
                 is ExecutionNode.Predicate -> when (node.field) {
-                    ExecutionField.ANSWER_NEEDED -> if (!subtract) {
-                        require(node.value.equals(requiredAnswerNeeded.toString(), ignoreCase = true)) {
-                            "answer_needed must be a single consistent predicate"
-                        }
-                    }
+                    ExecutionField.ANSWER_NEEDED -> Unit
                     ExecutionField.QUERY_CATEGORY -> Unit
                     ExecutionField.PERSON ->
                         if (subtract) excludedPeople += node.value else people += node.value
@@ -575,8 +570,10 @@ object ExecutionSpecCompiler {
                     ExecutionField.FROM_DATE -> if (!subtract) fromDate = node.value
                     ExecutionField.TO_DATE -> if (!subtract) toDate = node.value
                     ExecutionField.LOCATION -> if (!subtract) location = node.value
+                    ExecutionField.TIME -> if (!subtract) time = node.value
                     ExecutionField.SEMANTIC ->
                         if (subtract) negativeSemantic += node.value else semantic += node.value
+                    ExecutionField.KEYWORD -> if (!subtract) keywords += node.value
                     ExecutionField.OCR ->
                         if (subtract) negativeOcr += node.value else ocr += node.value
                 }
@@ -599,7 +596,7 @@ object ExecutionSpecCompiler {
         visit(canonicalSpec.root)
         val metadataFields = buildSet {
             if (people.isNotEmpty() || excludedPeople.isNotEmpty()) add(AnswerMetadataField.PEOPLE)
-            if (fromDate.isNotBlank() || toDate.isNotBlank()) add(AnswerMetadataField.TIME)
+            if (fromDate.isNotBlank() || toDate.isNotBlank() || time.isNotBlank()) add(AnswerMetadataField.TIME)
             if (location.isNotBlank()) add(AnswerMetadataField.LOCATION)
         }
         val answerScope = queryCategory.answerEvidenceScope()
@@ -608,6 +605,7 @@ object ExecutionSpecCompiler {
         val cleanOcr = ocr.distinctBy { it.lowercase() }
         return QueryPlan(
             semanticQueries = cleanSemantic,
+            keywordTerms = keywords.distinctBy { it.lowercase() },
             metadataQueries = if (answerScope.needsMetadata || answerScope.needsOcr) {
                 (cleanSemantic + cleanOcr).distinctBy { it.lowercase() }
             } else {
@@ -630,8 +628,9 @@ object ExecutionSpecCompiler {
             sortByLocation = sortLocation,
             mediaType = mediaType,
             queryCategory = queryCategory,
-            needsAnswer = requiredAnswerNeeded,
-            answerIntentExplicit = true,
+            timeHint = time,
+            needsAnswer = true,
+            answerIntentExplicit = false,
             answerEvidenceScope = answerScope,
             executionSpec = canonicalSpec,
         )

@@ -26,7 +26,7 @@ import org.junit.Test
  */
 class SearchResultsUiDeviceTest {
     @Test
-    fun broadSearchShowsScrollable200AndPreservesItAcrossDetails() {
+    fun broadSearchShowsTop16InFourColumnsAndPreservesItAcrossDetails() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val context = instrumentation.targetContext
         val activity = instrumentation.startActivitySync(
@@ -55,7 +55,6 @@ class SearchResultsUiDeviceTest {
 
             var qpReadyAtMs = 0L
             var resultsAtMs = 0L
-            var sawAnswerGeneration = false
             var finalSnapshot = UiSnapshot()
             var priorState = ""
             val deadline = SystemClock.elapsedRealtime() + SEARCH_TIMEOUT_MS
@@ -68,14 +67,12 @@ class SearchResultsUiDeviceTest {
                 }
                 if (qpReadyAtMs == 0L && snapshot.qpReady) qpReadyAtMs = now
                 if (resultsAtMs == 0L && snapshot.resultCount > 0) resultsAtMs = now
-                sawAnswerGeneration = sawAnswerGeneration || snapshot.answerGenerating
                 finalSnapshot = snapshot
                 if (
                     snapshot.qpReady &&
                     snapshot.resultCount == PUBLIC_RESULT_LIMIT &&
-                    snapshot.resultLabel.contains("Showing newest 200") &&
-                    snapshot.qpSpec.contains("query_category") &&
-                    sawAnswerGeneration &&
+                    snapshot.resultLabel.contains("Showing top 16") &&
+                    snapshot.qpSpec.contains("mime type") &&
                     !snapshot.answerGenerating
                 ) {
                     break
@@ -84,12 +81,11 @@ class SearchResultsUiDeviceTest {
             }
 
             assertTrue("QP output never became ready: ${finalSnapshot.stateKey()}", finalSnapshot.qpReady)
-            assertTrue("Executable QP spec was not shown", finalSnapshot.qpSpec.contains("query_category"))
+            assertTrue("Executable QP spec was not shown", finalSnapshot.qpSpec.contains("mime type"))
             assertTrue("QP output was not published before search results", qpReadyAtMs in 1..resultsAtMs)
-            assertTrue("The test never observed answer generation", sawAnswerGeneration)
-            assertFalse("The result set was checked before answer completion", finalSnapshot.answerGenerating)
+            assertFalse("Answer generation must be disabled in search-only mode", finalSnapshot.answerGenerating)
             assertEquals(PUBLIC_RESULT_LIMIT, finalSnapshot.resultCount)
-            assertTrue(finalSnapshot.resultLabel.contains("Showing newest 200"))
+            assertTrue(finalSnapshot.resultLabel.contains("Showing top 16"))
             assertFalse(
                 "The private top-16 context leaked into the public surface",
                 finalSnapshot.visibleTexts.any { it.startsWith("Answer context") },
@@ -104,48 +100,8 @@ class SearchResultsUiDeviceTest {
             val grid = onMain(instrumentation) {
                 activity.field<GridView>("resultGrid")
             }
-            val simulatedLockedViewport = onMain(instrumentation) {
-                val simulated = grid.height == 0
-                if (simulated) {
-                    val width = View.MeasureSpec.makeMeasureSpec(
-                        SIMULATED_VIEWPORT_WIDTH,
-                        View.MeasureSpec.EXACTLY,
-                    )
-                    val height = View.MeasureSpec.makeMeasureSpec(
-                        SIMULATED_VIEWPORT_HEIGHT,
-                        View.MeasureSpec.EXACTLY,
-                    )
-                    grid.measure(width, height)
-                    grid.layout(0, 0, SIMULATED_VIEWPORT_WIDTH, SIMULATED_VIEWPORT_HEIGHT)
-                }
-                grid.setSelection(SCROLL_TARGET_POSITION)
-                simulated
-            }
-            val scrollDeadline = SystemClock.elapsedRealtime() + SCROLL_TIMEOUT_MS
-            var firstVisible = 0
-            while (SystemClock.elapsedRealtime() < scrollDeadline && firstVisible == 0) {
-                instrumentation.waitForIdleSync()
-                SystemClock.sleep(POLL_INTERVAL_MS)
-                firstVisible = onMain(instrumentation) {
-                    if (grid.isLayoutRequested) {
-                        val width = View.MeasureSpec.makeMeasureSpec(
-                            SIMULATED_VIEWPORT_WIDTH,
-                            View.MeasureSpec.EXACTLY,
-                        )
-                        val height = View.MeasureSpec.makeMeasureSpec(
-                            SIMULATED_VIEWPORT_HEIGHT,
-                            View.MeasureSpec.EXACTLY,
-                        )
-                        grid.measure(width, height)
-                        grid.layout(0, 0, SIMULATED_VIEWPORT_WIDTH, SIMULATED_VIEWPORT_HEIGHT)
-                    }
-                    grid.firstVisiblePosition
-                }
-            }
-            assertTrue(
-                "The 200-result grid did not scroll beyond its first rows",
-                firstVisible > 0,
-            )
+            val gridColumns = onMain(instrumentation) { grid.numColumns }
+            assertEquals(4, gridColumns)
 
             val detailMonitor = instrumentation.addMonitor(
                 MediaDetailActivity::class.java.name,
@@ -153,7 +109,7 @@ class SearchResultsUiDeviceTest {
                 false,
             )
             onMain(instrumentation) {
-                val position = grid.firstVisiblePosition.coerceAtLeast(0)
+                val position = 0
                 val item = grid.adapter.getView(position, null, grid)
                 item.performClick()
             }
@@ -173,8 +129,7 @@ class SearchResultsUiDeviceTest {
                 TAG,
                 "SEARCH_UI|query=$BROAD_QUERY|count=${afterBack.resultCount}|" +
                     "qpBeforeResults=${qpReadyAtMs in 1..resultsAtMs}|" +
-                    "answerCompleted=true|firstVisible=$firstVisible|" +
-                    "lockedViewportSimulated=$simulatedLockedViewport|" +
+                    "answerDisabled=true|columns=$gridColumns|" +
                     "detailBackPreserved=true|rawFilenameVisible=false|contextVisible=false",
             )
         } finally {
@@ -273,8 +228,7 @@ class SearchResultsUiDeviceTest {
 
     private companion object {
         const val BROAD_QUERY = "Show photos"
-        const val PUBLIC_RESULT_LIMIT = 200
-        const val SCROLL_TARGET_POSITION = 80
+        const val PUBLIC_RESULT_LIMIT = 16
         const val SIMULATED_VIEWPORT_WIDTH = 1_080
         const val SIMULATED_VIEWPORT_HEIGHT = 1_600
         const val POLL_INTERVAL_MS = 250L

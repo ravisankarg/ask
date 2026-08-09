@@ -35,7 +35,7 @@ data class AnswerContextBundle(
 
 /** Converts the Gemma category into the same eligibility policy used by search and answers. */
 object QueryCategoryContextPolicy {
-    /** Four 512 px inputs are the normal, medium-budget Gemma E4B answer path. */
+    /** Four 512px inputs keep the multimodal answer path within phone memory. */
     const val ANSWER_IMAGE_LIMIT = 4
     const val ANSWER_IMAGE_MAX_DIMENSION = 512
 
@@ -59,6 +59,10 @@ object QueryCategoryContextPolicy {
 
     fun isDocumentLike(media: GalleryMedia): Boolean =
         media.contentClass == MediaContentClass.DOC
+
+    fun isVisualMedia(media: GalleryMedia): Boolean =
+        media.mimeType.startsWith("image/", ignoreCase = true) ||
+            media.mimeType.startsWith("video/", ignoreCase = true)
 }
 
 /**
@@ -91,15 +95,15 @@ class AnswerContextPicker(
         maxRecords: Int = MAX_RECORDS,
     ): AnswerContextBundle {
         val inputCandidates = rankedCandidates.distinctBy { it.mediaStoreId }
-        val eligibleCandidates = inputCandidates.filter {
-            QueryCategoryContextPolicy.accepts(queryCategory, it)
-        }
-        val includeVisuals = QueryCategoryContextPolicy.includesVisuals(queryCategory)
+        // query_category is no longer part of QP. Keep all ranked gallery
+        // records and decide modality from the actual MIME of each record.
+        val eligibleCandidates = inputCandidates
+        val includeVisuals = eligibleCandidates.any(QueryCategoryContextPolicy::isVisualMedia)
         if (eligibleCandidates.isEmpty() || maxRecords <= 0) {
             return AnswerContextBundle(
                 items = emptyList(),
                 metadataFields = evidenceScope.metadataFields,
-                includeOcr = queryCategory == QueryCategory.DOC,
+                includeOcr = true,
                 queryCategory = queryCategory,
                 includeVisuals = includeVisuals,
                 inputCandidateCount = inputCandidates.size,
@@ -143,11 +147,9 @@ class AnswerContextPicker(
             // Diversity may now suppress duplicate scans, but it can operate
             // only on strict OCR matches. A distinct renewal/reissue can take
             // a slot; an unrelated semantic neighbour cannot.
-            val candidates = if (relevanceOrdered.size > safeMax) {
-                selectDiverse(relevanceOrdered, safeMax)
-            } else {
-                relevanceOrdered
-            }
+            // The hybrid executor already sorted these by query-match score.
+            // Do not replace a higher-ranked record with a diversity pick.
+            val candidates = relevanceOrdered.take(safeMax)
             val chosen = candidates.take(safeMax).map { media ->
                 val coverage = linkedSetOf(
                     AnswerCoverageFacet.CATEGORY_MATCH,
@@ -192,11 +194,10 @@ class AnswerContextPicker(
                 },
             )
         }
-        val diversityOrder = if (includeVisuals) {
-            selectDiverse(candidates, minOf(candidates.size, safeMax))
-        } else {
-            candidates.take(safeMax)
-        }
+        // Answer evidence must remain in executor rank order. Diversity is
+        // appropriate for browsing, not for the four records grounding an
+        // answer.
+        val diversityOrder = candidates.take(safeMax)
         val diversityRank = diversityOrder.mapIndexed { index, media ->
             media.mediaStoreId to index
         }.toMap()
@@ -313,7 +314,9 @@ class AnswerContextPicker(
                 add(CoverageStream(AnswerCoverageFacet.EPISODE, episodeRepresentatives))
             }
         }
-        val maximumDepth = coverageStreams.maxOfOrNull { it.candidates.size } ?: 0
+        // Do not spend answer slots on coverage streams; retain the highest
+        // ranked query matches exactly.
+        val maximumDepth = 0
         for (depth in 0 until maximumDepth) {
             coverageStreams.forEach { stream ->
                 stream.candidates.getOrNull(depth)?.let { add(it, stream.facet) }
@@ -339,25 +342,11 @@ class AnswerContextPicker(
                         relevanceRank[it.mediaStoreId] ?: Int.MAX_VALUE
                     }
                 }
-            val episodeFill = if (includeVisuals) {
-                selectDiverse(
-                    unseenEpisodeRepresentatives,
-                    (safeMax - selected.size).coerceAtLeast(0),
-                )
-            } else {
-                unseenEpisodeRepresentatives.take((safeMax - selected.size).coerceAtLeast(0))
-            }
+            val episodeFill = emptyList<GalleryMedia>()
             episodeFill.forEach { add(it, AnswerCoverageFacet.EPISODE, safeMax) }
             if (selected.size < safeMax) {
                 val finalCandidates = remaining.filterNot { it.mediaStoreId in selected }
-                val finalFill = if (includeVisuals) {
-                    selectDiverse(
-                        finalCandidates,
-                        (safeMax - selected.size).coerceAtLeast(0),
-                    )
-                } else {
-                    finalCandidates.take((safeMax - selected.size).coerceAtLeast(0))
-                }
+                val finalFill = finalCandidates.take((safeMax - selected.size).coerceAtLeast(0))
                 finalFill.forEach {
                     add(
                         it,
@@ -391,7 +380,7 @@ class AnswerContextPicker(
         return AnswerContextBundle(
             items = chosen,
             metadataFields = metadataFields,
-            includeOcr = queryCategory == QueryCategory.DOC,
+            includeOcr = true,
             queryCategory = queryCategory,
             includeVisuals = includeVisuals,
             inputCandidateCount = inputCandidates.size,
@@ -549,7 +538,7 @@ class AnswerContextPicker(
 
     private companion object {
         const val MAX_RECORDS = 8
-        // Mine the top-eight hybrid-ranked records, while the caller retains
+        // Mine the top-four hybrid-ranked records, while the caller retains
         // its four-record prompt budget for answer latency.
         const val DOCUMENT_HYBRID_WINDOW = 8
         const val DOCUMENT_OCR_NEIGHBOUR_LINES = 2

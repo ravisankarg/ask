@@ -196,6 +196,15 @@ class GallerySemanticIndexer(
         return finalProgress
     }
 
+    /** Removes only deleted MediaStore IDs from the persisted visual index. */
+    fun removeMediaStoreIdsBlocking(mediaStoreIds: LongArray) {
+        if (mediaStoreIds.isEmpty()) return
+        NativeVectorIndex.releaseResident()
+        NativeVectorIndex.open(appContext).use { index ->
+            index.removeBatch(mediaStoreIds)
+        }
+    }
+
     /** Rebuilds only the SigLIP image-vector index. */
     fun reindexVisualsBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress =
         indexImagesBlocking(onProgress)
@@ -452,7 +461,7 @@ class GallerySemanticIndexer(
         private const val DIVERSITY_CANDIDATE_LIMIT = 100
         /** Retrieval budget only; presentation never truncates the returned set. */
         private const val MAX_SEARCH_RESULTS = 512
-        internal const val MIN_SEMANTIC_COSINE_SCORE = 0.10f
+        internal const val MIN_SEMANTIC_COSINE_SCORE = 0.18f
         private const val MAX_QUERY_VARIANTS = 4
         private const val TAG = "AskGalaxyImageIndex"
 

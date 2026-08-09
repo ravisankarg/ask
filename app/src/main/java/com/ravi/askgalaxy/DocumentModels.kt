@@ -41,6 +41,8 @@ data class DocumentMatch(
     val rank: Int,
     /** Reciprocal-rank score; raw cosine values are not comparable across sources. */
     val fusionScore: Float = 0f,
+    /** Raw EmbeddingGemma cosine when this record had a semantic hit. */
+    val cosineScore: Float? = null,
 )
 
 /** Conservative sentence-aware chunks for the 512-token application contract. */
@@ -145,6 +147,20 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    /** True when this chunk was already embedded with the current model. */
+    fun containsCurrentChunk(chunk: DocumentChunk): Boolean {
+        readableDatabase.query(
+            "chunks",
+            arrayOf("stable_id"),
+            "stable_id=? AND content_hash=? AND model_revision=?",
+            arrayOf(chunk.stableId.toString(), sha256(chunk.text), EMBEDDING_MODEL_REVISION),
+            null,
+            null,
+            null,
+            "1",
+        ).use { cursor -> return cursor.moveToFirst() }
+    }
+
     fun deleteMissingRecords(source: DocumentSource, activeRecordKeys: Set<String>) {
         if (activeRecordKeys.isEmpty()) {
             writableDatabase.delete("chunks", "source=?", arrayOf(source.wire))
@@ -185,9 +201,269 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         return output.sortedBy { it.first }.map { it.second }
     }
 
+    /** Names already present in a private source, used only for typo-tolerant routing. */
+    fun distinctTitles(source: DocumentSource): List<String> {
+        val output = LinkedHashSet<String>()
+        readableDatabase.query(
+            "chunks",
+            arrayOf("title"),
+            "source=?",
+            arrayOf(source.wire),
+            null,
+            null,
+            "title COLLATE NOCASE ASC",
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                cursor.getString(0)?.trim()?.takeIf(String::isNotBlank)?.let(output::add)
+            }
+        }
+        return output.toList()
+    }
+
+    /** Contact phone values allow message records indexed with only an address to resolve by name. */
+    fun contactNumbersForName(name: String): List<String> {
+        if (name.isBlank()) return emptyList()
+        val output = LinkedHashSet<String>()
+        readableDatabase.query(
+            "chunks",
+            arrayOf("record_key", "metadata"),
+            "source=? AND lower(title)=lower(?)",
+            arrayOf(DocumentSource.CONTACTS.wire, name.trim()),
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val recordKey = cursor.getString(0).orEmpty()
+                val metadata = cursor.getString(1).orEmpty()
+                val phone = Regex("(?:^|\\s)phone=([^\\s]+)", RegexOption.IGNORE_CASE)
+                    .find(metadata)?.groupValues?.getOrNull(1)
+                    ?: recordKey.substringAfter('|', "")
+                phone.takeIf(String::isNotBlank)?.let(output::add)
+            }
+        }
+        return output.toList()
+    }
+
+    /** Newest matching records for conversational "last call/message" queries. */
+    fun latestChunksMatching(
+        source: DocumentSource,
+        needles: List<String>,
+        limit: Int,
+        timeHint: String = "",
+        fromDate: String = "",
+        toDate: String = "",
+        senderOnly: Boolean = false,
+    ): List<DocumentChunk> {
+        val normalizedNeedles = needles.map { it.trim().lowercase() }.filter(String::isNotBlank).distinct()
+        if (normalizedNeedles.isEmpty() || limit <= 0) return emptyList()
+        val timeScope = QueryScopeParser.parse(
+            timeHint = timeHint,
+            locationHint = "",
+            fromDate = fromDate,
+            toDate = toDate,
+        ).time
+        val output = ArrayList<DocumentChunk>()
+        readableDatabase.query(
+            "chunks",
+            null,
+            "source=?",
+            arrayOf(source.wire),
+            null,
+            null,
+            "timestamp_ms DESC",
+        ).use { cursor ->
+            while (cursor.moveToNext() && output.size < limit) {
+                val chunk = chunkFromCursor(cursor)
+                if (timeScope != null && chunk.timestampMs != null && !timeScope.matches(chunk.timestampMs)) {
+                    continue
+                }
+                val searchable = if (senderOnly) {
+                    "${chunk.title} ${chunk.metadata}".lowercase()
+                } else {
+                    "${chunk.title} ${chunk.text} ${chunk.metadata}".lowercase()
+                }
+                if (normalizedNeedles.any { needle -> searchable.contains(needle) }) {
+                    output += chunk
+                }
+            }
+        }
+        return output
+    }
+
+    /**
+     * Returns the persisted vector IDs that satisfy hard document scopes.
+     * These IDs are passed to native ANN search before ranking, so a MIME or
+     * time predicate cannot be applied only after a source's top-K window.
+     * Chunks without timestamps retain the existing behaviour and remain
+     * eligible for a time-scoped search because their date is unknown.
+     */
+    fun stableIdsForSearchScope(
+        sources: Set<DocumentSource>,
+        timeScope: QueryTimeScope? = null,
+        mediaType: QueryMediaType? = null,
+        senderNeedles: List<String> = emptyList(),
+    ): Map<DocumentSource, LongArray> {
+        if (sources.isEmpty()) return emptyMap()
+        val sourceArgs = sources.map { it.wire }.toTypedArray()
+        val placeholders = sourceArgs.joinToString(",") { "?" }
+        val ids = sources.associateWith { ArrayList<Long>() }.toMutableMap()
+        readableDatabase.query(
+            "chunks",
+            arrayOf("stable_id", "source", "title", "metadata", "timestamp_ms"),
+            "source IN ($placeholders)",
+            sourceArgs,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            val stableIdColumn = cursor.getColumnIndexOrThrow("stable_id")
+            val sourceColumn = cursor.getColumnIndexOrThrow("source")
+            val titleColumn = cursor.getColumnIndexOrThrow("title")
+            val metadataColumn = cursor.getColumnIndexOrThrow("metadata")
+            val timestampColumn = cursor.getColumnIndexOrThrow("timestamp_ms")
+            while (cursor.moveToNext()) {
+                val source = DocumentSource.fromWire(cursor.getString(sourceColumn)) ?: continue
+                val timestamp = cursor.getLong(timestampColumn).takeIf { !cursor.isNull(timestampColumn) }
+                if (source == DocumentSource.MESSAGES &&
+                    senderNeedles.isNotEmpty() &&
+                    senderNeedles.none { needle ->
+                        val value = needle.trim().lowercase()
+                        value.isNotBlank() && (
+                            cursor.getString(titleColumn).orEmpty().lowercase().contains(value) ||
+                                cursor.getString(metadataColumn).orEmpty().lowercase().contains(value)
+                            )
+                    }
+                ) continue
+                if (timeScope != null && timestamp != null && !timeScope.matches(timestamp)) continue
+                if (mediaType != null && !mediaType.matchesDocumentChunk(
+                        DocumentChunk(
+                            source = source,
+                            recordKey = "",
+                            chunkNumber = 0,
+                            title = cursor.getString(titleColumn),
+                            text = "",
+                            timestampMs = timestamp,
+                        ),
+                    )
+                ) continue
+                ids.getValue(source) += cursor.getLong(stableIdColumn)
+            }
+        }
+        return ids.mapValues { (_, values) -> values.toLongArray() }
+    }
+
+    /** Returns private text chunks containing at least one keyword, with coverage. */
+    fun searchKeywordChunks(
+        keywordGroups: List<List<String>>,
+        sources: Set<DocumentSource>,
+        limitPerSource: Int,
+        requireCompleteGroup: Boolean = false,
+        timeScope: QueryTimeScope? = null,
+        mediaType: QueryMediaType? = null,
+        senderNeedles: List<String> = emptyList(),
+    ): List<Pair<DocumentChunk, Float>> {
+        val forbiddenKeywords = setOf("number", "numbers", "num")
+        val normalizedGroups = keywordGroups.map { group ->
+            group.map { it.lowercase() }
+                .filter { it.isNotBlank() && it !in forbiddenKeywords }
+                .distinct()
+        }.filter { it.isNotEmpty() }
+        if (normalizedGroups.isEmpty() || sources.isEmpty()) return emptyList()
+        val sourceArgs = sources.map { it.wire }.toTypedArray()
+        val placeholders = sourceArgs.joinToString(",") { "?" }
+        val result = ArrayList<Pair<DocumentChunk, Float>>()
+        readableDatabase.query(
+            "chunks",
+            null,
+            "source IN ($placeholders)",
+            sourceArgs,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val source = DocumentSource.fromWire(cursor.getString(cursor.getColumnIndexOrThrow("source")))
+                    ?: continue
+                val title = cursor.getString(cursor.getColumnIndexOrThrow("title"))
+                val text = cursor.getString(cursor.getColumnIndexOrThrow("text"))
+                val metadata = cursor.getString(cursor.getColumnIndexOrThrow("metadata"))
+                if (source == DocumentSource.MESSAGES &&
+                    senderNeedles.isNotEmpty() &&
+                    senderNeedles.none { needle ->
+                        val value = needle.trim().lowercase()
+                        value.isNotBlank() &&
+                            (title.lowercase().contains(value) || metadata.lowercase().contains(value))
+                    }
+                ) continue
+                val timestampColumn = cursor.getColumnIndexOrThrow("timestamp_ms")
+                val timestamp = cursor.getLong(timestampColumn).takeIf { !cursor.isNull(timestampColumn) }
+                if (timeScope != null && timestamp != null && !timeScope.matches(timestamp)) continue
+                if (mediaType != null && !mediaType.matchesDocumentChunk(
+                        DocumentChunk(
+                            source = source,
+                            recordKey = "",
+                            chunkNumber = 0,
+                            title = title,
+                            text = "",
+                            timestampMs = timestamp,
+                        ),
+                    )
+                ) continue
+                val searchable = "$title $text $metadata".lowercase()
+                val coverage = normalizedGroups.maxOfOrNull { group ->
+                    group.count { keyword ->
+                        searchable.contains(keyword) || when (keyword) {
+                            "aadhar", "aadhaar" ->
+                                searchable.contains("aadhar") || searchable.contains("aadhaar")
+                            else -> false
+                        }
+                    }.toFloat() / group.size.toFloat()
+                } ?: 0f
+                if (coverage > 0f && (!requireCompleteGroup || coverage >= 1f)) {
+                    result += DocumentChunk(
+                        source,
+                        cursor.getString(cursor.getColumnIndexOrThrow("record_key")),
+                        cursor.getInt(cursor.getColumnIndexOrThrow("chunk_number")),
+                        title,
+                        text,
+                        cursor.getString(cursor.getColumnIndexOrThrow("uri")),
+                        cursor.getInt(cursor.getColumnIndexOrThrow("page")).takeIf {
+                            !cursor.isNull(cursor.getColumnIndexOrThrow("page"))
+                        },
+                        timestamp,
+                        metadata,
+                    ) to coverage
+                }
+            }
+        }
+        return result
+            .groupBy { it.first.source }
+            .values
+            .flatMap { it.sortedByDescending { pair -> pair.second }.take(limitPerSource) }
+    }
+
+    private fun chunkFromCursor(cursor: android.database.Cursor): DocumentChunk {
+        val source = DocumentSource.fromWire(cursor.getString(cursor.getColumnIndexOrThrow("source")))
+            ?: error("Unknown document source")
+        val timestampColumn = cursor.getColumnIndexOrThrow("timestamp_ms")
+        val pageColumn = cursor.getColumnIndexOrThrow("page")
+        return DocumentChunk(
+            source = source,
+            recordKey = cursor.getString(cursor.getColumnIndexOrThrow("record_key")),
+            chunkNumber = cursor.getInt(cursor.getColumnIndexOrThrow("chunk_number")),
+            title = cursor.getString(cursor.getColumnIndexOrThrow("title")),
+            text = cursor.getString(cursor.getColumnIndexOrThrow("text")),
+            uri = cursor.getString(cursor.getColumnIndexOrThrow("uri")),
+            page = cursor.getInt(pageColumn).takeIf { !cursor.isNull(pageColumn) },
+            timestampMs = cursor.getLong(timestampColumn).takeIf { !cursor.isNull(timestampColumn) },
+            metadata = cursor.getString(cursor.getColumnIndexOrThrow("metadata")),
+        )
+    }
+
     companion object {
         const val EMBEDDING_DIMENSION = 768
-        const val EMBEDDING_MODEL_REVISION = "embeddinggemma-300M-Q8_0@0f741b5a6585bd53aeb15cd1372c56f2a0f65e12"
+        const val EMBEDDING_MODEL_REVISION = "litert-community/embeddinggemma-300m@main-sm8750-seq512"
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
     }

@@ -12,6 +12,7 @@ import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.Telephony
 import android.provider.MediaStore
+import android.util.Log
 import androidx.core.content.ContextCompat
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
@@ -22,6 +23,10 @@ import java.util.zip.ZipInputStream
 /** Reads Android-public providers and all files exposed through MediaStore. */
 class DocumentSourceReader(private val context: Context) {
     private val resolver = context.contentResolver
+
+    /** Number of supported document references found during the last Files read. */
+    var supportedFileCount: Int = 0
+        private set
 
     init {
         PDFBoxResourceLoader.init(context.applicationContext)
@@ -44,6 +49,7 @@ class DocumentSourceReader(private val context: Context) {
     fun allFiles(): Sequence<DocumentChunk> = sequence {
         if (!canReadFiles()) return@sequence
         val refs = ArrayList<FileReference>()
+        var candidates = 0
         resolver.query(
             MediaStore.Files.getContentUri("external"),
             arrayOf(MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.DISPLAY_NAME,
@@ -51,8 +57,9 @@ class DocumentSourceReader(private val context: Context) {
             null, null, "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC",
         )?.use { cursor ->
             while (cursor.moveToNext()) {
+                candidates++
                 val name = cursor.getString(1).orEmpty()
-                if (name.isBlank()) continue
+                if (!isSupportedDocumentName(name)) continue
                 refs += FileReference(
                     ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), cursor.getLong(0)),
                     name,
@@ -60,6 +67,8 @@ class DocumentSourceReader(private val context: Context) {
                 )
             }
         }
+        supportedFileCount = refs.size
+        Log.i(TAG, "file_candidates=$candidates supported=${refs.size}")
         refs.asSequence().forEach { reference ->
             yieldAll(file(reference.uri, reference.name, reference.modifiedMs))
         }
@@ -198,6 +207,20 @@ class DocumentSourceReader(private val context: Context) {
 
     private data class FileReference(val uri: Uri, val name: String, val modifiedMs: Long?)
 
+    private fun isSupportedDocumentName(name: String): Boolean {
+        val lower = name.lowercase()
+        return SUPPORTED_EXTENSIONS.any(lower::endsWith)
+    }
+
     private fun record(source: DocumentSource, key: String, title: String, text: String, timestamp: Long?, metadata: String): List<DocumentChunk> =
         DocumentChunker.chunk(text).mapIndexed { index, chunk -> DocumentChunk(source, key, index, title, chunk, timestampMs = timestamp, metadata = metadata) }
+
+    private companion object {
+        const val TAG = "AskGalaxyDocumentReader"
+        val SUPPORTED_EXTENSIONS = setOf(
+            ".pdf", ".docx", ".odt", ".txt", ".md", ".csv", ".json", ".xml",
+            ".yaml", ".yml", ".html", ".rtf", ".kt", ".java", ".js", ".ts",
+            ".sql", ".ini", ".properties", ".log",
+        )
+    }
 }

@@ -294,6 +294,51 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         "SELECT COUNT(*) FROM $TABLE_MEDIA",
     ).simpleQueryForLong()
 
+    /** Removes MediaStore rows that disappeared since the completed gallery scan. */
+    fun removeMissingMediaStoreIds(activeMediaStoreIds: Set<Long>): LongArray {
+        val staleIds = allMediaStoreIds()
+            .filterNot(activeMediaStoreIds::contains)
+            .distinct()
+        if (staleIds.isEmpty()) return LongArray(0)
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            staleIds.chunked(SQLITE_ID_CHUNK).forEach { chunk ->
+                val placeholders = chunk.joinToString(",") { "?" }
+                val args = chunk.map(Long::toString).toTypedArray()
+                db.delete(TABLE_FACE_EMBEDDINGS, "media_store_id IN ($placeholders)", args)
+                db.delete(TABLE_EPISODE_MEMBERS, "media_store_id IN ($placeholders)", args)
+                db.delete(TABLE_MEDIA, "media_store_id IN ($placeholders)", args)
+            }
+            db.delete(
+                TABLE_EPISODES,
+                "NOT EXISTS (SELECT 1 FROM $TABLE_EPISODE_MEMBERS m WHERE m.episode_id = $TABLE_EPISODES.episode_id)",
+                null,
+            )
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return staleIds.toLongArray()
+    }
+
+    /** All gallery rows are eligible until the QP contributes an explicit filter. */
+    fun allMediaStoreIds(): Set<Long> {
+        val ids = LinkedHashSet<Long>()
+        readableDatabase.query(
+            TABLE_MEDIA,
+            arrayOf("media_store_id"),
+            null,
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) ids += cursor.getLong(0)
+        }
+        return ids
+    }
+
     fun pendingEmbeddings(): List<GalleryMedia> = queryMedia(
         selection = "image_embedding_indexed = 0",
         orderBy = "date_modified_seconds DESC",
@@ -1157,7 +1202,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     private fun isNegatedPersonMention(query: String, label: String): Boolean {
         val directPattern = Regex(
-            "(?i)\\b(?:without|excluding|except|not|no)\\s+(?:the\\s+)?" +
+            "(?i)\\b(?:without|with\\s+out|excluding|exclude|except|but\\s+not|not|no)\\s+(?:the\\s+)?" +
                 Regex.escape(label) + "(?:\\b|$)",
         )
         if (directPattern.containsMatchIn(query)) return true
@@ -1208,12 +1253,16 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     /** Returns the existing indexed rows for a hard MIME intersection. */
     fun mediaStoreIdsForMediaType(type: QueryMediaType): Set<Long> {
+        // Messages, SMS, files, and the other private-source selectors are
+        // not Gallery rows. Their scope is applied by DocumentVectorIndex;
+        // returning an empty gallery set prevents cross-source leakage.
+        val prefix = type.mimePrefix() ?: return emptySet()
         val ids = LinkedHashSet<Long>()
         readableDatabase.query(
             TABLE_MEDIA,
             arrayOf("media_store_id"),
             "mime_type LIKE ?",
-            arrayOf("${type.mimePrefix()}%"),
+            arrayOf("$prefix%"),
             null,
             null,
             null,
@@ -1328,17 +1377,21 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         return emptySet<Long>().takeIf { sawLocation && !hasPendingLocationRows }
     }
 
-    fun searchMetadataRanked(query: String, limit: Int = 16): List<MetadataMatch> =
-        searchMetadataRanked(listOf(query), limit)
+    fun searchMetadataRanked(
+        query: String,
+        limit: Int = 16,
+        allowedMediaStoreIds: Set<Long>? = null,
+    ): List<MetadataMatch> = searchMetadataRanked(listOf(query), limit, allowedMediaStoreIds)
 
     /**
      * Matches planner-selected document keywords against OCR text only.
-     * Every keyword must occur in the same row. A row satisfying the complete
-     * keyword set is a perfect OCR match; partial matches are not returned.
+     * Rows containing partial keyword coverage are retained so hybrid ranking
+     * can reduce their keyword contribution proportionally.
      */
     fun searchOcrKeywordsRanked(
         keywords: List<String>,
         limit: Int = 512,
+        allowedMediaStoreIds: Set<Long>? = null,
     ): List<MetadataMatch> {
         val terms = keywords.asSequence()
             .map { it.trim().lowercase() }
@@ -1347,16 +1400,20 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .take(OcrKeywordPolicy.MAX_KEYWORDS)
             .toList()
         if (terms.isEmpty()) return emptyList()
+        // A keyword predicate is an AND group: all requested words must be
+        // present in the same OCR record. Semantic retrieval remains the
+        // separate OR branch of gallery hybrid search.
         val selection = terms.joinToString(" AND ") {
             "LOWER(ocr_text) LIKE ? ESCAPE '\\'"
         }
         val args = terms.map { term ->
             "%${escapeSqlLike(term)}%"
         }.toTypedArray()
-        return queryMedia(
+        return queryMediaScoped(
             selection = selection,
             selectionArgs = args,
             orderBy = "date_modified_seconds DESC",
+            allowedMediaStoreIds = allowedMediaStoreIds,
         ).asSequence()
             .map { media ->
                 MetadataMatch(media, OcrKeywordPolicy.score(media.ocrText, terms))
@@ -1367,10 +1424,14 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
     }
 
     /** Searches several planner-produced keyword forms and keeps the best row score. */
-    fun searchMetadataRanked(queries: List<String>, limit: Int = 16): List<MetadataMatch> {
+    fun searchMetadataRanked(
+        queries: List<String>,
+        limit: Int = 16,
+        allowedMediaStoreIds: Set<Long>? = null,
+    ): List<MetadataMatch> {
         val bestByMediaId = LinkedHashMap<Long, MetadataMatch>()
         queries.filter { it.isNotBlank() }.take(6).forEach { query ->
-            searchMetadataRankedSingle(query, limit).forEach { match ->
+            searchMetadataRankedSingle(query, limit, allowedMediaStoreIds).forEach { match ->
                 val previous = bestByMediaId[match.media.mediaStoreId]
                 if (previous == null || match.score > previous.score) {
                     bestByMediaId[match.media.mediaStoreId] = match
@@ -1382,7 +1443,11 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .take(limit.coerceIn(1, MAX_SEARCH_RESULTS))
     }
 
-    private fun searchMetadataRankedSingle(query: String, limit: Int): List<MetadataMatch> {
+    private fun searchMetadataRankedSingle(
+        query: String,
+        limit: Int,
+        allowedMediaStoreIds: Set<Long>? = null,
+    ): List<MetadataMatch> {
         val terms = metadataTerms(query)
         if (terms.isEmpty()) return emptyList()
         val selection = terms.joinToString(" AND ") {
@@ -1392,11 +1457,12 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             val pattern = "%$term%"
             listOf(pattern, pattern, pattern, pattern, pattern)
         }.toTypedArray()
-        return queryMedia(
+        return queryMediaScoped(
             selection = selection,
             selectionArgs = args,
             orderBy = "date_modified_seconds DESC",
             limit = limit.coerceIn(1, MAX_SEARCH_RESULTS).toString(),
+            allowedMediaStoreIds = allowedMediaStoreIds,
         ).map { media ->
             MetadataMatch(media, metadataScore(media, terms))
         }.sortedWith(compareByDescending<MetadataMatch> { it.score }.thenByDescending { it.media.dateModifiedSeconds })
@@ -1447,6 +1513,41 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         val ordered = ArrayList<GalleryMedia>(ids.size)
         for (id in ids) byId[id]?.let(ordered::add)
         return ordered
+    }
+
+    /** Applies a large ID allowlist without relying on SQLite's bind limit. */
+    private fun queryMediaScoped(
+        selection: String? = null,
+        selectionArgs: Array<String>? = null,
+        orderBy: String? = null,
+        limit: String? = null,
+        allowedMediaStoreIds: Set<Long>?,
+    ): List<GalleryMedia> {
+        if (allowedMediaStoreIds == null) {
+            return queryMedia(selection, selectionArgs, orderBy, limit)
+        }
+        if (allowedMediaStoreIds.isEmpty()) return emptyList()
+        val rows = allowedMediaStoreIds.toList().chunked(SQLITE_ID_CHUNK).flatMap { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val scopedSelection = listOfNotNull(
+                selection?.takeIf(String::isNotBlank)?.let { "($it)" },
+                "media_store_id IN ($placeholders)",
+            ).joinToString(" AND ")
+            queryMedia(
+                selection = scopedSelection,
+                selectionArgs = (selectionArgs.orEmpty().toList() + chunk.map(Long::toString)).toTypedArray(),
+                orderBy = orderBy,
+            )
+        }
+        return rows
+            .distinctBy { it.mediaStoreId }
+            .sortedWith(
+                when (orderBy) {
+                    "date_modified_seconds DESC" -> compareByDescending<GalleryMedia> { it.dateModifiedSeconds }
+                    else -> compareBy { it.mediaStoreId }
+                },
+            )
+            .let { if (limit == null) it else it.take(limit.toInt()) }
     }
 
     private fun queryMedia(

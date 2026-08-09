@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.ClipData
@@ -9,12 +10,14 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.net.Uri
 import android.provider.CalendarContract
+import android.util.Log
 import android.util.LruCache
 import android.text.InputType
 import android.view.Gravity
@@ -81,8 +84,31 @@ class MainActivity : Activity() {
     private var activeSearchResponse: SearchResponse? = null
     private var followUpInFlight = false
     private var deferredFreshQuery: String? = null
+    private var deferredPreserveConversation = false
+    private var deferredDisplayQuestion: String? = null
     private var timeStatsSummary = "Timing…"
     private val handler = Handler(Looper.getMainLooper())
+
+    private sealed class SearchResultItem {
+        data class Gallery(
+            val media: GalleryMedia,
+            val cosineScore: Float?,
+        ) : SearchResultItem()
+
+        data class Document(
+            val match: DocumentMatch,
+        ) : SearchResultItem()
+    }
+    private val documentIndexReleasedListener: () -> Unit = {
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) {
+                // A launch-time warmup can be skipped while the document
+                // worker owns the GPU gate. Retry only after that gate opens.
+                launchPlannerWarmupRequested = false
+                refreshPreparation()
+            }
+        }
+    }
     private val refresh = object : Runnable {
         override fun run() {
             // Poll only while WorkManager is preparing the gallery/model.
@@ -98,6 +124,7 @@ class MainActivity : Activity() {
         PreparationNotifier.createChannel(this)
         galleryIndexer = GalleryIndexer(this)
         setContentView(createContent())
+        DocumentIndexRuntimeGate.addReleaseListener(documentIndexReleasedListener)
         GemmaRuntime.setPlannerWarmupStateListener {
             runOnUiThread {
                 if (!isFinishing && !isDestroyed) {
@@ -105,9 +132,19 @@ class MainActivity : Activity() {
                     val deferredQuery = deferredFreshQuery
                     if (GemmaRuntime.isPlannerReady() && !deferredQuery.isNullOrBlank()) {
                         deferredFreshQuery = null
+                        val preserveConversation = deferredPreserveConversation
+                        val displayQuestion = deferredDisplayQuestion
+                        deferredPreserveConversation = false
+                        deferredDisplayQuestion = null
                         query.setText(deferredQuery)
                         query.setSelection(query.text.length)
-                        query.post { search() }
+                        query.post {
+                            search(
+                                queryOverride = deferredQuery,
+                                preserveConversation = preserveConversation,
+                                displayQuestion = displayQuestion,
+                            )
+                        }
                     }
                 }
             }
@@ -121,18 +158,25 @@ class MainActivity : Activity() {
     }
 
     private fun startBackgroundMaintenance() {
+        // Gallery preparation is resumable and intentionally does not rerun
+        // after completion. Keep deletions made later in the phone gallery
+        // from becoming stale searchable records with this cheap identity
+        // reconciliation pass.
+        galleryIndexer.reconcileStaleRecordsAsync { result ->
+            result.onFailure { error ->
+                Log.w("AskGalaxy", "Gallery stale-record reconciliation failed", error)
+            }
+        }
         GemmaDownloadScheduler.enqueueIfNeeded(this)
         // Personal indexing owns its public EmbeddingGemma download. This
         // also recovers when the gallery preparation worker completed before
         // personal-source indexing was enabled.
         val personalReader = DocumentSourceReader(this)
         if (DocumentSource.entries.any(personalReader::isAvailable)) {
-            val filesProgress = IndexProgressStore(this).read(IndexProgressStage.DOCUMENT_FILES)
-            if (!ModelCatalog.embeddingGemma.isInstalled(this) || filesProgress.error.isNotBlank()) {
-                DocumentIndexScheduler.restart(this)
-            } else {
-                DocumentIndexScheduler.enqueue(this)
-            }
+            // Do not cancel/restart a failed or active pass on every app
+            // launch. The worker records the error and Settings provides an
+            // explicit retry action, preventing an endless WorkManager loop.
+            DocumentIndexScheduler.enqueue(this)
         }
         val preparation = PreparationStore(this).read()
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
@@ -189,6 +233,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        DocumentIndexRuntimeGate.removeReleaseListener(documentIndexReleasedListener)
         GemmaRuntime.setPlannerWarmupStateListener(null)
         if (::resultGrid.isInitialized) {
             resultGrid.adapter = null
@@ -430,7 +475,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         qpOutputLabel = TextView(this).apply {
-            text = "QP output • planning"
+            text = "QP op • planning"
             textSize = 12f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.rgb(71, 75, 94))
@@ -529,7 +574,7 @@ class MainActivity : Activity() {
             setPadding(dp(6), 0, dp(6), dp(8))
         }
         nextBriefPanel.addView(TextView(this).apply {
-            text = "Next Brief"
+            text = "Actions"
             textSize = 13f
             setTextColor(Color.rgb(91, 95, 110))
             setTypeface(typeface, Typeface.BOLD)
@@ -603,7 +648,7 @@ class MainActivity : Activity() {
         }
         resultPanel.addView(resultCount, matchWrap())
         resultGrid = GridView(this).apply {
-            numColumns = 2
+            numColumns = 4
             horizontalSpacing = dp(8)
             verticalSpacing = dp(6)
             stretchMode = GridView.STRETCH_COLUMN_WIDTH
@@ -616,10 +661,9 @@ class MainActivity : Activity() {
             resultGrid,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(456)),
         )
-        // Keep the full search browser ahead of the bounded answer context.
-        // The 4 records selected for Gemma must never look like a replacement
-        // for the user-visible result set.
-        resultPanel.addView(sourcePanel, matchWrap())
+        // Answer context belongs directly below the answer, before follow-up
+        // queries and actions. The broad result grid is never shown there.
+        resultPanel.addView(sourcePanel, 2, matchWrap())
         searchPanel.addView(resultPanel, matchWrap())
         root.addView(searchPanel, matchWrap())
 
@@ -697,14 +741,13 @@ class MainActivity : Activity() {
             searchReady = true
             SigLipTextEncoder.preloadAsync(this)
             NativeVectorIndex.preloadAsync(this)
+            DocumentVectorIndex.preloadAsync(this)
         } else if (!ready) {
             searchReady = false
         }
         if (ready && !launchPlannerWarmupRequested) {
-            // Gemma occupies several GiB of mapped/native state on the target
-            // device. Do not make it compete with the one-time OCR migration.
-            // This is the only launch-time QP system prefill; subsequent
-            // planner warmups are scheduled after the answer session closes.
+            // Warm Gemma before enabling the search bar. The runtime remains
+            // bounded to the mobile-safe 8K/four-image configuration.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
             if (pendingOcr == 0) {
@@ -728,9 +771,13 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun search() {
+    private fun search(
+        queryOverride: String? = null,
+        preserveConversation: Boolean = false,
+        displayQuestion: String? = null,
+    ) {
         if (!::query.isInitialized) return
-        val requestedText = query.text?.toString().orEmpty().trim()
+        val requestedText = (queryOverride ?: query.text?.toString().orEmpty()).trim()
         if (!GemmaRuntime.isPlannerReady()) {
             if (requestedText.isNotBlank()) {
                 // A typed fresh search intentionally trades the kept answer
@@ -739,6 +786,8 @@ class MainActivity : Activity() {
                 // planner preload refuses to run while it is reserved, which
                 // used to leave this fresh-search path stuck forever.
                 deferredFreshQuery = requestedText
+                deferredPreserveConversation = preserveConversation
+                deferredDisplayQuestion = displayQuestion
                 query.isEnabled = false
                 query.alpha = 0.62f
                 GemmaRuntime.preloadPlannerAfterAnswerAsync(
@@ -766,20 +815,25 @@ class MainActivity : Activity() {
         activeSearchResponse = null
         followUpInFlight = false
         // The consumed QP KV is now unavailable by design. Keep the field
-        // locked through QP, answer-prefix warmup, answer generation, then
-        // the next explicit planner warmup.
+        // locked through QP and retrieval, then warm the next planner turn.
         query.isEnabled = false
         query.alpha = 0.62f
-        // Keep Gemma 4 resident across planning and answer generation. The
-        // prewarmed planner conversation is intentionally claimed by this
+        // The prewarmed planner conversation is intentionally claimed by this
         // query so its system-preface KV cache is reused.
         SigLipTextEncoder.preloadAsync(this)
         NativeVectorIndex.preloadAsync(this)
+        DocumentVectorIndex.preloadAsync(this)
         resultPanel.visibility = View.VISIBLE
-        answer.visibility = View.VISIBLE
-        answer.text = "Searching your private gallery…"
-        conversationPanel.removeAllViews()
-        conversationPanel.visibility = View.GONE
+        // Search-result mode is intentionally answer-free while QP and the
+        // validator are being tuned.
+        answer.visibility = View.GONE
+        answer.text = ""
+        if (preserveConversation) {
+            appendConversationQuestion(displayQuestion ?: text)
+        } else {
+            conversationPanel.removeAllViews()
+            conversationPanel.visibility = View.GONE
+        }
         resultGrid.adapter = null
         resultAdapter?.dispose()
         resultAdapter = null
@@ -799,8 +853,11 @@ class MainActivity : Activity() {
             onMatches = { matches, totalMatches ->
                 runOnUiThread {
                     if (generation != searchGeneration || matches.isEmpty()) return@runOnUiThread
-                    renderResults(matches, generation, totalMatches)
-                    answer.text = "I found $totalMatches matching item${if (totalMatches == 1) "" else "s"}."
+                    renderResults(
+                        matches.map { it.toSearchResultItem() },
+                        generation,
+                        totalMatches,
+                    )
                 }
             },
             onProgress = { progress ->
@@ -818,11 +875,11 @@ class MainActivity : Activity() {
                             }
                             SearchStage.HYBRID_RETRIEVAL -> {
                                 renderTimeStats(progress.timings, "Search")
-                                "Blending image, OCR, and metadata matches…"
+                                "Search results ready."
                             }
                             SearchStage.DIVERSE_EVIDENCE -> {
                                 renderTimeStats(progress.timings, "Search")
-                                "Preparing answer context across ${progress.candidateCount} matches…"
+                                "Search results ready."
                             }
                         },
                     )
@@ -844,6 +901,8 @@ class MainActivity : Activity() {
                     } else {
                         "Search paused while the on-device index is unavailable."
                     }
+                    resultCount.text = answer.text
+                    resultCount.visibility = View.VISIBLE
                     return@runOnUiThread
                 }
                 renderQpOutput(response.effectivePlanJson)
@@ -853,108 +912,89 @@ class MainActivity : Activity() {
                     response.plannerSession?.close()
                     setModelLoading(false, "")
                     warmPlannerForNextSearch()
-                    answer.text = "I couldn't find matching gallery or personal records yet."
-                    return@runOnUiThread
-                }
-                if (response.gallery.isNotEmpty()) {
-                    renderResults(response.gallery, generation, response.totalGalleryMatches)
-                    answer.text = "I found ${response.totalGalleryMatches} matching item${if (response.totalGalleryMatches == 1) "" else "s"}."
-                } else if (response.documentMatches.isNotEmpty()) {
-                    answer.text = "I found ${response.documentMatches.size} matching personal record${if (response.documentMatches.size == 1) "" else "s"}."
-                }
-                if (!response.needsAnswer) {
-                    activeSearchResponse = null
-                    response.plannerSession?.close()
-                    setModelLoading(false, "")
-                    followUpPanel.visibility = View.GONE
-                    followUpRow.removeAllViews()
-                    nextBriefPanel.visibility = View.GONE
-                    nextBriefRow.removeAllViews()
-                    sourcePanel.visibility = View.GONE
-                    warmPlannerForNextSearch()
+                    resultGrid.visibility = View.GONE
+                    resultCount.text = "No matching records found."
+                    resultCount.visibility = View.VISIBLE
                     return@runOnUiThread
                 }
                 activeSearchResponse = response
-                val contextCount = response.answerContext?.items?.size
-                    ?: response.answerGallery.size.coerceAtMost(4)
-                val hasVisualContext = response.answerContext?.includeVisuals == true &&
-                    contextCount > 0
-                val visualCount = if (hasVisualContext) {
-                    contextCount.coerceAtMost(
-                        QueryCategoryContextPolicy.ANSWER_IMAGE_LIMIT,
+                val combinedResults = response.mergedResults
+                    .takeIf { it.isNotEmpty() }
+                    ?.map { it.toSearchResultItem(response.galleryCosineScores) }
+                    ?: buildList {
+                        response.gallery.forEach { media ->
+                            add(SearchResultItem.Gallery(media, response.galleryCosineScores[media.mediaStoreId]))
+                        }
+                        response.documentMatches.forEach { match ->
+                            add(SearchResultItem.Document(match))
+                        }
+                    }
+                renderResults(
+                    combinedResults,
+                    generation,
+                    maxOf(
+                        combinedResults.size,
+                        response.totalGalleryMatches + response.documentMatches.size,
+                    ),
+                )
+                answer.visibility = View.GONE
+                if (!preserveConversation) conversationPanel.visibility = View.GONE
+                followUpPanel.visibility = View.GONE
+                nextBriefPanel.visibility = View.GONE
+                sourcePanel.visibility = View.GONE
+                if (response.needsAnswer) {
+                    answer.visibility = View.VISIBLE
+                    answer.text = "Answering from the top 4 hybrid records…"
+                    if (!preserveConversation) appendConversationQuestion(text)
+                    setModelLoading(
+                        true,
+                        GemmaModelSelection.selected(this).displayName +
+                            " is answering from the top 4 records…",
+                    )
+                    galleryIndexer.answerAsync(
+                        query = text,
+                        response = response,
+                        onFinished = { answerResult ->
+                            runOnUiThread {
+                                if (generation != searchGeneration) return@runOnUiThread
+                                setModelLoading(false, "")
+                                answerResult.fold(
+                                    onSuccess = {
+                                        answer.visibility = View.GONE
+                                        appendConversationAnswer(
+                                            it.text.ifBlank { "I couldn't answer that yet." },
+                                        )
+                                        renderAnswerSources(it.sources.take(4), generation)
+                                        renderFollowUps(emptyList(), emptyList(), generation)
+                                        renderTimeStats(it.timings, "Answer")
+                                    },
+                                    onFailure = {
+                                        answer.text = "I couldn't answer that yet."
+                                        answer.visibility = View.VISIBLE
+                                    },
+                                )
+                            }
+                        },
+                        onFollowUps = { suggestions ->
+                            runOnUiThread {
+                                if (generation == searchGeneration && suggestions.isNotEmpty()) {
+                                    renderFollowUpsAfterAnswer(suggestions, generation)
+                                }
+                            }
+                        },
+                        onNextBriefs = { suggestions ->
+                            runOnUiThread {
+                                if (generation == searchGeneration && suggestions.isNotEmpty()) {
+                                    renderNextBriefsAfterAnswer(suggestions, generation)
+                                }
+                            }
+                        },
                     )
                 } else {
-                    0
+                    setModelLoading(false, "")
+                    response.plannerSession?.close()
+                    warmPlannerForNextSearch()
                 }
-                setModelLoading(
-                    true,
-                    if (hasVisualContext) {
-                        "${GemmaModelSelection.selected(this).displayName} is joining $visualCount downscaled scenery images with $contextCount text records…"
-                    } else {
-                        "${GemmaModelSelection.selected(this).displayName} is reading $contextCount scoped OCR/metadata record${if (contextCount == 1) "" else "s"}…"
-                    },
-                )
-                galleryIndexer.answerAsync(
-                    query = text,
-                    response = response,
-                    onFinished = { answerResult ->
-                        runOnUiThread {
-                            if (generation != searchGeneration) return@runOnUiThread
-                            setModelLoading(false, "")
-                            answerResult.fold(
-                                onSuccess = {
-                                    answer.visibility = View.GONE
-                                    appendConversationTurn(
-                                        question = text,
-                                        answerText = it.text.ifBlank {
-                                            "I couldn't find enough photos or details to answer that yet."
-                                        },
-                                    )
-                                    // Replace the broad search browser with the
-                                    // exact four gallery records used for this
-                                    // answer. This makes the answer auditable at
-                                    // a glance without exposing an unrelated
-                                    // tail of search results.
-                                    renderAnswerEvidence(it.sources, generation)
-                                    sourcePanel.visibility = View.GONE
-                                    sourceRow.removeAllViews()
-                                    sourceDetails.removeAllViews()
-                                    renderFollowUps(emptyList(), emptyList(), generation)
-                                    renderNextBriefs(emptyList(), generation)
-                                    renderQpOutput(it.effectivePlanJson)
-                                    renderTimeStats(it.timings, "Total")
-                                    refreshPreparation()
-                                },
-                                onFailure = {
-                                    followUpPanel.visibility = View.GONE
-                                    followUpRow.removeAllViews()
-                                    nextBriefPanel.visibility = View.GONE
-                                    nextBriefRow.removeAllViews()
-                                    sourcePanel.visibility = View.GONE
-                                    renderTimeStats(response.timings, "Search")
-                                    answer.visibility = View.VISIBLE
-                                    answer.text = "I found matching photos, but couldn't generate an answer on this device yet."
-                                },
-                            )
-                        }
-                    },
-                    onFollowUps = { suggestions ->
-                        runOnUiThread {
-                            if (generation == searchGeneration && suggestions.isNotEmpty()) {
-                                renderFollowUpsAfterAnswer(suggestions, generation)
-                            }
-                        }
-                    },
-                    onNextBriefs = { suggestions ->
-                        runOnUiThread {
-                            if (generation == searchGeneration && suggestions.isNotEmpty()) {
-                                renderNextBriefsAfterAnswer(suggestions, generation)
-                            }
-                        }
-                    },
-                    warmPlannerAfterAnswer = false,
-                    warmAnswerAfterAnswer = true,
-                )
             }
         }
     }
@@ -979,7 +1019,7 @@ class MainActivity : Activity() {
 
     private fun showQueryPlanningTelemetry() {
         timeStatsPanel.visibility = View.VISIBLE
-        qpOutputLabel.text = "QP output • planning"
+        qpOutputLabel.text = "QP op • planning"
         qpOutputText.text = "Planning the executable query…"
         timeStatsDetails.visibility = View.GONE
         timeStatsDetails.removeAllViews()
@@ -990,14 +1030,14 @@ class MainActivity : Activity() {
     private fun renderQpOutput(effectivePlanJson: String) {
         if (effectivePlanJson.isBlank()) return
         timeStatsPanel.visibility = View.VISIBLE
-        qpOutputLabel.text = "QP output • ready"
+        qpOutputLabel.text = "QP op • ready"
         qpOutputText.text = effectivePlanJson
     }
 
     private fun renderQpFailure() {
         timeStatsPanel.visibility = View.VISIBLE
         if (qpOutputLabel.text.toString().contains("planning", ignoreCase = true)) {
-            qpOutputLabel.text = "QP output • unavailable"
+            qpOutputLabel.text = "QP op • unavailable"
             qpOutputText.text = "The executable query could not be prepared."
         }
         timeStatsSummary = "Stopped"
@@ -1101,49 +1141,79 @@ class MainActivity : Activity() {
     }
 
     private fun renderResults(
-        matches: List<GalleryMedia>,
+        items: List<SearchResultItem>,
         generation: Long,
-        totalMatches: Int = matches.size,
+        totalMatches: Int = items.size,
     ) {
-        // Keep small result sets compact; larger sets retain an internal
-        // scroll surface instead of pushing the rest of the page downward.
-        val visibleRows = ((matches.size + 1) / 2).coerceIn(1, 2)
+        // Search-result mode shows one bounded mixed window: at most sixteen
+        // gallery or private records in a four-column, four-row grid.
+        val visibleRows = ((items.size + 3) / 4).coerceIn(1, 4)
         resultGrid.layoutParams = resultGrid.layoutParams.apply {
-            height = dp(visibleRows * 219 + 4)
+            height = dp(visibleRows * 128 + 4)
         }
+        resultGrid.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
         val current = resultAdapter
-        if (current == null || current.generation != generation || !current.hasSameItems(matches)) {
+        if (
+            current == null ||
+            current.generation != generation ||
+            !current.hasSameItems(items)
+        ) {
             resultGrid.adapter = null
             current?.dispose()
-            resultAdapter = SearchResultAdapter(matches, generation).also {
+            resultAdapter = SearchResultAdapter(items, generation).also {
                 resultGrid.adapter = it
             }
         }
-        resultCount.text = if (totalMatches > matches.size) {
-            "Showing newest ${matches.size} of $totalMatches matches • scroll to browse"
+        resultCount.text = if (totalMatches > items.size) {
+            "Showing top ${items.size} of $totalMatches matches"
         } else {
-            "All ${matches.size} match${if (matches.size == 1) "" else "es"} • newest first • scroll to browse"
+            "Top ${items.size} match${if (items.size == 1) "" else "es"}"
         }
-        resultCount.visibility = if (matches.isEmpty()) View.GONE else View.VISIBLE
+        resultCount.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
     }
 
     /** Shows the answer's exact gallery inputs instead of the broad result set. */
     private fun renderAnswerEvidence(sources: List<AnswerSource>, generation: Long) {
-        val evidence = sources.mapNotNull { source ->
-            source.media?.takeIf { source.type == AnswerSourceType.GALLERY_IMAGE }
-        }.distinctBy { it.mediaStoreId }.take(4)
-        if (evidence.isEmpty()) return
-        renderResults(evidence, generation)
-        resultGrid.layoutParams = resultGrid.layoutParams.apply {
-            height = dp(219 * ((evidence.size + 1) / 2) + 4)
+        // Answer flows expose only the compact context chips. Full search
+        // results stay hidden; tapping a chip opens its complete record.
+        resultAdapter?.dispose()
+        resultAdapter = null
+        resultGrid.adapter = null
+        resultGrid.visibility = View.GONE
+        resultCount.visibility = View.GONE
+    }
+
+    private fun renderDocumentResults(matches: List<DocumentMatch>, generation: Long) {
+        (sourcePanel.getChildAt(0) as? TextView)?.text = "Personal records"
+        if (resultGrid.adapter == null) {
+            resultCount.text = "${matches.size} personal record${if (matches.size == 1) "" else "s"} from the private index"
+            resultCount.visibility = View.VISIBLE
         }
-        resultGrid.requestLayout()
-        resultCount.text = "Evidence used for this answer • ${evidence.size} selected photo${if (evidence.size == 1) "" else "s"}"
-        resultCount.visibility = View.VISIBLE
+        sourceRow.removeAllViews()
+        sourceDetails.removeAllViews()
+        expandedSourceId = null
+        sourcePanel.visibility = View.VISIBLE
+        matches.take(12).forEachIndexed { index, match ->
+            val chunk = match.chunk
+            sourceDetails.addView(TextView(this).apply {
+                val cosine = match.cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) }
+                    ?: "Cosine — (keyword match)"
+                text = "D${index + 1}  ${chunk.source.displayName} • ${chunk.title}\n" +
+                    "$cosine\n${chunk.text.trim()}"
+                textSize = 14f
+                setTextColor(Color.rgb(44, 46, 58))
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                background = roundedBackground(Color.WHITE, dp(12).toFloat())
+                contentDescription = "Personal record ${chunk.title}"
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(8) })
+        }
     }
 
     private inner class SearchResultAdapter(
-        private val matches: List<GalleryMedia>,
+        private val items: List<SearchResultItem>,
         val generation: Long,
     ) : BaseAdapter() {
         private val requested = HashSet<Long>()
@@ -1162,65 +1232,35 @@ class MainActivity : Activity() {
         }
         private var disposed = false
 
-        override fun getCount(): Int = matches.size
-        override fun getItem(position: Int): GalleryMedia = matches[position]
-        override fun getItemId(position: Int): Long = matches[position].mediaStoreId
+        override fun getCount(): Int = items.size
+        override fun getItem(position: Int): SearchResultItem = items[position]
+        override fun getItemId(position: Int): Long = when (val item = getItem(position)) {
+            is SearchResultItem.Gallery -> item.media.mediaStoreId
+            is SearchResultItem.Document -> item.match.chunk.stableId
+        }
+
+        override fun getViewTypeCount(): Int = 2
+
+        override fun getItemViewType(position: Int): Int = when (getItem(position)) {
+            is SearchResultItem.Gallery -> 0
+            is SearchResultItem.Document -> 1
+        }
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-            val holder: ResultViewHolder
-            val card: LinearLayout
-            if (convertView is LinearLayout && convertView.tag is ResultViewHolder) {
-                card = convertView
-                holder = convertView.tag as ResultViewHolder
-            } else {
-                val image = ImageView(this@MainActivity).apply {
-                    scaleType = ImageView.ScaleType.CENTER_CROP
-                    setBackgroundColor(Color.rgb(224, 226, 233))
-                }
-                val caption = TextView(this@MainActivity).apply {
-                    textSize = 12f
-                    setTextColor(Color.rgb(63, 65, 74))
-                    maxLines = 2
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setPadding(dp(7), dp(7), dp(7), 0)
-                }
-                holder = ResultViewHolder(image, caption)
-                card = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(dp(5), dp(5), dp(5), dp(8))
-                    background = roundedBackground(Color.rgb(247, 248, 251), dp(18).toFloat())
-                    addView(
-                        image,
-                        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(156)),
-                    )
-                    addView(
-                        caption,
-                        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42)),
-                    )
-                    tag = holder
-                }
-            }
-            val media = getItem(position)
-            holder.image.tag = media.mediaStoreId
-            holder.image.contentDescription = resultCaption(media)
-            holder.caption.text = resultCaption(media)
-            card.contentDescription = "Open ${resultCaption(media)}"
-            card.setOnClickListener {
-                startActivity(MediaDetailActivity.intent(this@MainActivity, media))
-            }
-            val cached = thumbnails.get(media.mediaStoreId)
-            if (cached != null && !cached.isRecycled) {
-                holder.image.setImageBitmap(cached)
-            } else {
-                holder.image.setImageDrawable(null)
-                requestThumbnail(media, holder.image)
+            val item = getItem(position)
+            val type = getItemViewType(position)
+            val holder = (convertView?.tag as? ResultViewHolder)
+                ?.takeIf { it.viewType == type }
+                ?: createResultCard(type)
+            val card = holder.card
+            when (item) {
+                is SearchResultItem.Gallery -> bindGalleryCard(holder, card, item)
+                is SearchResultItem.Document -> bindDocumentCard(holder, card, item.match)
             }
             return card
         }
 
-        fun hasSameItems(other: List<GalleryMedia>): Boolean =
-            matches.size == other.size &&
-                matches.indices.all { matches[it].mediaStoreId == other[it].mediaStoreId }
+        fun hasSameItems(other: List<SearchResultItem>): Boolean = items == other
 
         fun dispose() {
             disposed = true
@@ -1251,9 +1291,159 @@ class MainActivity : Activity() {
                 }
             }
         }
+
+        private fun createResultCard(type: Int): ResultViewHolder {
+            val thumbnail: View = if (type == 0) {
+                ImageView(this@MainActivity).apply {
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    setBackgroundColor(Color.rgb(224, 226, 233))
+                }
+            } else {
+                TextView(this@MainActivity).apply {
+                    gravity = Gravity.CENTER
+                    textSize = 10f
+                    maxLines = 4
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTextColor(Color.rgb(51, 57, 80))
+                    setPadding(dp(6), dp(4), dp(6), dp(4))
+                    background = roundedBackground(Color.rgb(232, 235, 249), dp(12).toFloat())
+                }
+            }
+            val caption = TextView(this@MainActivity).apply {
+                textSize = 11f
+                setTextColor(Color.rgb(63, 65, 74))
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(dp(6), dp(5), dp(6), 0)
+            }
+            val card = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(5), dp(5), dp(5), dp(7))
+                background = roundedBackground(Color.rgb(247, 248, 251), dp(18).toFloat())
+                addView(thumbnail, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(70),
+                ))
+                addView(caption, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(38),
+                ))
+            }
+            return ResultViewHolder(card, thumbnail, caption, type).also { card.tag = it }
+        }
+
+        private fun bindGalleryCard(
+            holder: ResultViewHolder,
+            card: LinearLayout,
+            item: SearchResultItem.Gallery,
+        ) {
+            val image = holder.thumbnail as ImageView
+            val media = item.media
+            val caption = resultCaption(media, item.cosineScore)
+            image.tag = media.mediaStoreId
+            image.contentDescription = caption
+            holder.caption.text = caption
+            card.contentDescription = "Open $caption"
+            card.setOnClickListener {
+                startActivity(MediaDetailActivity.intent(this@MainActivity, media))
+            }
+            val cached = thumbnails.get(media.mediaStoreId)
+            if (cached != null && !cached.isRecycled) {
+                image.setImageBitmap(cached)
+            } else {
+                image.setImageDrawable(null)
+                requestThumbnail(media, image)
+            }
+        }
+
+        private fun bindDocumentCard(
+            holder: ResultViewHolder,
+            card: LinearLayout,
+            match: DocumentMatch,
+        ) {
+            val thumbnail = holder.thumbnail as TextView
+            val chunk = match.chunk
+            val preview = chunk.text.replace(Regex("\\s+"), " ").trim()
+            thumbnail.text = "${documentIcon(chunk.source)}\n${chunk.title.take(30)}\n${preview.take(72)}"
+            val caption = documentCaption(match)
+            thumbnail.contentDescription = caption
+            holder.caption.text = caption
+            card.contentDescription = "Open $caption"
+            card.setOnClickListener { showDocumentPopup(match) }
+        }
     }
 
-    private fun resultCaption(media: GalleryMedia): String = buildString {
+    private data class ResultViewHolder(
+        val card: LinearLayout,
+        val thumbnail: View,
+        val caption: TextView,
+        val viewType: Int,
+    )
+
+    private fun HybridSearchResult.toSearchResultItem(
+        galleryCosineScores: Map<Long, Float> = emptyMap(),
+    ): SearchResultItem = when (this) {
+        is HybridSearchResult.Gallery ->
+            SearchResultItem.Gallery(media, galleryCosineScores[media.mediaStoreId])
+        is HybridSearchResult.Document -> SearchResultItem.Document(match)
+    }
+
+    private fun documentCaption(match: DocumentMatch): String = buildString {
+        append(match.cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) } ?: "Cosine —")
+        append("\n")
+        append(match.chunk.source.displayName)
+        append(" • ")
+        append(match.chunk.title.ifBlank { "Personal record" }.take(32))
+    }
+
+    private fun documentIcon(source: DocumentSource): String = when (source) {
+        DocumentSource.MESSAGES -> "💬 Messages"
+        DocumentSource.CALENDAR -> "📅 Calendar"
+        DocumentSource.CONTACTS -> "👤 Contact"
+        DocumentSource.CALL_LOGS -> "📞 Call log"
+        DocumentSource.FILES -> "📄 File"
+    }
+
+    private fun showDocumentPopup(match: DocumentMatch) {
+        val chunk = match.chunk
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(6), 0, dp(6), 0)
+            addView(TextView(this@MainActivity).apply {
+                text = documentCaption(match)
+                textSize = 13f
+                setTextColor(Color.rgb(62, 66, 86))
+                setPadding(0, 0, 0, dp(10))
+            }, matchWrap())
+            addView(TextView(this@MainActivity).apply {
+                text = chunk.text.trim().ifBlank { "No text content" }
+                textSize = 16f
+                setTextColor(Color.rgb(35, 38, 49))
+            }, matchWrap())
+            chunk.metadata.takeIf(String::isNotBlank)?.let { metadata ->
+                addView(TextView(this@MainActivity).apply {
+                    text = "\n$metadata"
+                    textSize = 13f
+                    setTextColor(Color.rgb(91, 95, 110))
+                }, matchWrap())
+            }
+        }
+        val scroll = ScrollView(this).apply {
+            addView(body, matchWrap())
+        }
+        AlertDialog.Builder(this)
+            .setTitle("${documentIcon(chunk.source)} • ${chunk.title.ifBlank { "Personal record" }}")
+            .setView(scroll)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
+    private fun resultCaption(media: GalleryMedia, cosineScore: Float? = null): String = buildString {
+        append(
+            cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) }
+                ?: "Cosine —",
+        )
+        append("\n")
         append(if (media.mimeType.startsWith("video/", ignoreCase = true)) "Video" else "Photo")
         val timestamp = media.dateTakenMs ?: media.dateModifiedSeconds.takeIf { it > 0L }?.times(1000L)
         timestamp?.let {
@@ -1279,15 +1469,13 @@ class MainActivity : Activity() {
         }
         sourcePanel.visibility = View.VISIBLE
         sources.forEach { source ->
-            val icon = when (source.type) {
-                AnswerSourceType.GALLERY_IMAGE -> "▣"
-            }
+            val icon = sourceIcon(source)
             val chip = TextView(this).apply {
-                text = "$icon ${source.label}"
-                textSize = 13f
+                text = icon
+                textSize = 22f
                 setTextColor(Color.rgb(50, 57, 99))
                 gravity = Gravity.CENTER
-                setPadding(dp(13), dp(8), dp(13), dp(8))
+                setPadding(dp(8), dp(4), dp(8), dp(4))
                 background = roundedBackground(Color.rgb(235, 238, 255), dp(18).toFloat())
                 contentDescription = "Expand source ${source.label}"
                 setOnClickListener {
@@ -1301,9 +1489,21 @@ class MainActivity : Activity() {
                 }
             }
             sourceRow.addView(chip, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                dp(38),
+                dp(48),
+                dp(48),
             ).apply { marginEnd = dp(7) })
+        }
+    }
+
+    private fun sourceIcon(source: AnswerSource): String = when (source.type) {
+        AnswerSourceType.GALLERY_IMAGE -> "🖼️"
+        AnswerSourceType.DOCUMENT_RECORD -> when (source.document?.source) {
+            DocumentSource.MESSAGES -> "💬"
+            DocumentSource.CALENDAR -> "📅"
+            DocumentSource.CONTACTS -> "👤"
+            DocumentSource.CALL_LOGS -> "📞"
+            DocumentSource.FILES -> "📄"
+            null -> "📄"
         }
     }
 
@@ -1355,65 +1555,18 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Runs a chip on the existing result set; it never enters query planning. */
+    /**
+     * Starts a fresh conversational search. The old result/evidence window is
+     * discarded before QP so follow-ups cannot retain its thumbnails, records,
+     * or answer context.
+     */
     private fun answerFollowUp(followUpQuery: String, generation: Long) {
         if (generation != searchGeneration || followUpInFlight) return
-        val currentResponse = activeSearchResponse ?: return
-        followUpInFlight = true
-        query.isEnabled = false
-        query.alpha = 0.62f
-        followUpPanel.visibility = View.GONE
-        followUpRow.removeAllViews()
-        answer.visibility = View.VISIBLE
-        answer.text = "Answering from the current search results…"
-        appendConversationQuestion(followUpQuery)
-        setModelLoading(true, "${GemmaModelSelection.selected(this).displayName} is selecting fresh answer context from the current results…")
-        galleryIndexer.answerFollowUpAsync(
-            query = followUpQuery,
-            currentResponse = currentResponse,
-            onFinished = { result ->
-                runOnUiThread {
-                    if (generation != searchGeneration) return@runOnUiThread
-                    followUpInFlight = false
-                    setModelLoading(false, "")
-                    result.fold(
-                        onSuccess = {
-                            answer.visibility = View.GONE
-                            appendConversationAnswer(
-                                it.text.ifBlank {
-                                    "I couldn't find enough details in the current results to answer that yet."
-                                },
-                            )
-                            renderAnswerEvidence(it.sources, generation)
-                            sourcePanel.visibility = View.GONE
-                            sourceRow.removeAllViews()
-                            sourceDetails.removeAllViews()
-                            renderFollowUps(emptyList(), emptyList(), generation)
-                            renderTimeStats(it.timings, "Follow-up")
-                        },
-                        onFailure = {
-                            answer.text = "I couldn't answer that from the current search results yet."
-                            answer.visibility = View.VISIBLE
-                            renderFollowUps(emptyList(), emptyList(), generation)
-                        },
-                    )
-                    refreshPreparation()
-                }
-            },
-            onFollowUps = { suggestions ->
-                runOnUiThread {
-                    if (generation == searchGeneration && !followUpInFlight && suggestions.isNotEmpty()) {
-                        renderFollowUpsAfterAnswer(suggestions, generation)
-                    }
-                }
-            },
-            onNextBriefs = { suggestions ->
-                runOnUiThread {
-                    if (generation == searchGeneration && !followUpInFlight && suggestions.isNotEmpty()) {
-                        renderNextBriefsAfterAnswer(suggestions, generation)
-                    }
-                }
-            },
+        query.setText(followUpQuery)
+        search(
+            queryOverride = followUpQuery,
+            preserveConversation = true,
+            displayQuestion = followUpQuery,
         )
     }
 
@@ -1618,17 +1771,32 @@ class MainActivity : Activity() {
     }
 
     private fun showExpandedSource(source: AnswerSource, generation: Long) {
-        sourceDetails.removeAllViews()
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(13), dp(12), dp(13), dp(12))
-            background = roundedBackground(Color.rgb(247, 248, 252), dp(16).toFloat())
+        val accent = when (source.type) {
+            AnswerSourceType.GALLERY_IMAGE -> Color.rgb(91, 95, 180)
+            AnswerSourceType.DOCUMENT_RECORD -> when (source.document?.source) {
+                DocumentSource.MESSAGES -> Color.rgb(44, 113, 185)
+                DocumentSource.CALENDAR -> Color.rgb(185, 76, 86)
+                DocumentSource.CONTACTS -> Color.rgb(46, 139, 96)
+                DocumentSource.CALL_LOGS -> Color.rgb(126, 83, 163)
+                DocumentSource.FILES, null -> Color.rgb(195, 119, 47)
+            }
         }
-        card.addView(TextView(this).apply {
-            text = source.label
-            textSize = 14f
-            setTextColor(Color.rgb(35, 38, 49))
+        val accentSurface = Color.rgb(
+            (Color.red(accent) * 0.10f + 245).toInt().coerceAtMost(255),
+            (Color.green(accent) * 0.10f + 245).toInt().coerceAtMost(255),
+            (Color.blue(accent) * 0.10f + 245).toInt().coerceAtMost(255),
+        )
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(4), dp(8), 0)
+            background = roundedBackground(accentSurface, dp(22).toFloat())
+        }
+        content.addView(TextView(this).apply {
+            text = "${sourceIcon(source)}  ${source.label}"
+            textSize = 17f
+            setTextColor(accent)
             setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(12), dp(12), dp(12), dp(8))
         }, matchWrap())
         if (source.type == AnswerSourceType.GALLERY_IMAGE && source.media != null) {
             val image = ImageView(this).apply {
@@ -1636,10 +1804,10 @@ class MainActivity : Activity() {
                 setBackgroundColor(Color.rgb(225, 227, 235))
                 contentDescription = "Source image ${source.label}"
             }
-            card.addView(image, LinearLayout.LayoutParams(
+            content.addView(image, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(130),
-            ).apply { topMargin = dp(9) })
+                dp(190),
+            ))
             galleryIndexer.loadThumbnailAsync(source.media) { result ->
                 val bitmap = result.getOrNull()
                 runOnUiThread {
@@ -1649,13 +1817,19 @@ class MainActivity : Activity() {
                 }
             }
         }
-        card.addView(TextView(this).apply {
+        content.addView(TextView(this).apply {
             text = source.detail.take(MAX_SOURCE_DETAIL_CHARS)
             textSize = 13f
             setTextColor(Color.rgb(76, 79, 91))
             setPadding(0, dp(9), 0, 0)
         }, matchWrap())
-        sourceDetails.addView(card, matchWrap())
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Answer context")
+            .setView(content)
+            .setPositiveButton("Close", null)
+            .show()
+        dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        dialog.window?.setLayout((resources.displayMetrics.widthPixels * 0.90f).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
     private fun refreshFacePrompt() {
@@ -1729,8 +1903,4 @@ class MainActivity : Activity() {
         private const val STALE_WORKER_TIMEOUT_MS = 2 * 60 * 1_000L
     }
 
-    private data class ResultViewHolder(
-        val image: ImageView,
-        val caption: TextView,
-    )
 }

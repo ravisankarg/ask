@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 enum class AnswerSourceType {
     GALLERY_IMAGE,
+    DOCUMENT_RECORD,
 }
 
 data class AnswerSource(
@@ -10,6 +11,7 @@ data class AnswerSource(
     val label: String,
     val detail: String,
     val media: GalleryMedia? = null,
+    val document: DocumentChunk? = null,
 )
 
 data class AnswerResult(
@@ -50,10 +52,17 @@ data class NextBriefCapability(
     val handlers: String,
 )
 
+sealed class HybridSearchResult {
+    data class Gallery(val media: GalleryMedia) : HybridSearchResult()
+    data class Document(val match: DocumentMatch) : HybridSearchResult()
+}
+
 data class SearchResponse(
     val gallery: List<GalleryMedia>,
     /** Full evaluated match count; [gallery] is the bounded UI browsing window. */
     val totalGalleryMatches: Int = gallery.size,
+    /** Raw gallery semantic cosine by media-store ID, when semantic retrieval contributed. */
+    val galleryCosineScores: Map<Long, Float> = emptyMap(),
     val answerGallery: List<GalleryMedia> = emptyList(),
     val answerContext: AnswerContextBundle? = null,
     /** One representative record per evidence-builder episode, when used. */
@@ -71,6 +80,8 @@ data class SearchResponse(
     val answerOcrKeywords: List<String> = emptyList(),
     val timings: PhaseTimings = PhaseTimings(),
     val documentMatches: List<DocumentMatch> = emptyList(),
+    /** The exact cross-source order used by the shared top-16 result window. */
+    val mergedResults: List<HybridSearchResult> = emptyList(),
 )
 
 /** Wall-clock durations shown to the user for one complete search answer. */

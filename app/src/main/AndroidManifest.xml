@@ -77,6 +77,9 @@
             android:name=".SettingsActivity"
             android:exported="false" />
         <activity
+            android:name=".EmbeddingGemmaAuthorizationActivity"
+            android:exported="false" />
+        <activity
             android:name=".FaceClustersActivity"
             android:exported="false" />
         <activity

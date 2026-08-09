@@ -10,12 +10,28 @@ enum class AnswerEvidenceKind {
 enum class QueryMediaType {
     PHOTOS,
     VIDEOS,
+    PDF,
+    DOC,
+    MESSAGES,
+    SMS,
+    CALENDAR,
+    CONTACTS,
+    CALL_LOGS,
+    FILES,
     ;
 
     companion object {
         fun fromToken(value: String): QueryMediaType? = when (value.trim().lowercase()) {
             "photos" -> PHOTOS
             "videos" -> VIDEOS
+            "pdf" -> PDF
+            "doc" -> DOC
+            "messages", "message" -> MESSAGES
+            "sms", "text", "texts" -> SMS
+            "calendar", "calendars", "appointment", "appointments" -> CALENDAR
+            "contacts", "contact" -> CONTACTS
+            "call", "calls", "call_logs", "call logs", "call log" -> CALL_LOGS
+            "files", "file" -> FILES
             else -> null
         }
     }
@@ -23,13 +39,51 @@ enum class QueryMediaType {
     fun label(): String = when (this) {
         PHOTOS -> "photos"
         VIDEOS -> "videos"
+        PDF -> "pdf"
+        DOC -> "doc"
+        MESSAGES -> "messages"
+        SMS -> "sms"
+        CALENDAR -> "calendar"
+        CONTACTS -> "contacts"
+        CALL_LOGS -> "call_logs"
+        FILES -> "files"
     }
 
-    fun mimePrefix(): String = when (this) {
+    fun isGalleryType(): Boolean = this == PHOTOS || this == VIDEOS
+
+    fun mimePrefix(): String? = when (this) {
         PHOTOS -> "image/"
         VIDEOS -> "video/"
+        else -> null
+    }
+
+    fun documentSources(): Set<DocumentSource> = when (this) {
+        PHOTOS, VIDEOS -> emptySet()
+        PDF, DOC, FILES -> setOf(DocumentSource.FILES)
+        MESSAGES, SMS -> setOf(DocumentSource.MESSAGES)
+        CALENDAR -> setOf(DocumentSource.CALENDAR)
+        CONTACTS -> setOf(DocumentSource.CONTACTS)
+        CALL_LOGS -> setOf(DocumentSource.CALL_LOGS)
     }
 }
+
+internal fun QueryMediaType.matchesDocumentChunk(chunk: DocumentChunk): Boolean {
+    if (chunk.source !in documentSources()) return false
+    if (this == QueryMediaType.FILES) return true
+    if (chunk.source != DocumentSource.FILES) return true
+    val title = chunk.title.lowercase()
+    return when (this) {
+        QueryMediaType.PDF -> title.endsWith(".pdf")
+        QueryMediaType.DOC -> title.endsWithAny(
+            ".doc", ".docx", ".odt", ".txt", ".md", ".csv", ".json", ".xml",
+            ".yaml", ".yml", ".html", ".rtf", ".kt", ".java", ".js", ".ts",
+            ".sql", ".ini", ".properties", ".log",
+        )
+        else -> true
+    }
+}
+
+private fun String.endsWithAny(vararg suffixes: String): Boolean = suffixes.any(::endsWith)
 
 /**
  * Primary answer intent emitted by Gemma with every execution spec.
@@ -236,6 +290,7 @@ data class AnswerEvidenceScope(
 /** Small, bounded routing result produced before gallery retrieval. */
 data class QueryPlan(
     val semanticQueries: List<String>,
+    val keywordTerms: List<String> = emptyList(),
     val metadataQueries: List<String>,
     val personNames: List<String>,
     val ocrTerms: List<String>,
@@ -274,6 +329,9 @@ data class QueryPlan(
             )
             hasPositiveBranch = true
         }
+        keywordTerms.filter(String::isNotBlank).forEach { term ->
+            add(QueryOperation(QueryOperationKind.INTERSECT, "keyword", term))
+        }
         ocrTerms.filter(String::isNotBlank).forEach { term ->
             add(
                 QueryOperation(
@@ -311,32 +369,18 @@ data class QueryPlan(
 
     fun canonicalExecutionSpec(): QueryExecutionSpec? {
         executionSpec?.let { return it }
-        val answerPredicate = ExecutionNode.Predicate(
-            ExecutionField.ANSWER_NEEDED,
-            needsAnswer.toString(),
-        )
-        val categoryPredicate = ExecutionNode.Predicate(
-            ExecutionField.QUERY_CATEGORY,
-            queryCategory.wireName,
-        )
         val hardPredicates = buildList<ExecutionNode> {
             personNames.filter(String::isNotBlank).forEach {
                 add(ExecutionNode.Predicate(ExecutionField.PERSON, it))
             }
-            mediaType?.let {
-                add(ExecutionNode.Predicate(ExecutionField.MIME_TYPE, it.label()))
-            }
-            fromDate.takeIf(String::isNotBlank)?.let {
-                add(ExecutionNode.Predicate(ExecutionField.FROM_DATE, it))
-            }
-            toDate.takeIf(String::isNotBlank)?.let {
-                add(ExecutionNode.Predicate(ExecutionField.TO_DATE, it))
-            }
             locationHint.takeIf(String::isNotBlank)?.let {
                 add(ExecutionNode.Predicate(ExecutionField.LOCATION, it))
             }
-            onlyPersonNames.filter(String::isNotBlank).takeIf { it.isNotEmpty() }?.let {
-                add(ExecutionNode.Predicate(ExecutionField.PEOPLE_ONLY, it.joinToString(",")))
+            mediaType?.let {
+                add(ExecutionNode.Predicate(ExecutionField.MIME_TYPE, it.label()))
+            }
+            timeHint.takeIf(String::isNotBlank)?.let {
+                add(ExecutionNode.Predicate(ExecutionField.TIME, it))
             }
         }
         val retrievalPredicates: List<ExecutionNode> = semanticQueries
@@ -344,10 +388,17 @@ data class QueryPlan(
             .distinctBy { it.lowercase() }
             .map { ExecutionNode.Predicate(ExecutionField.SEMANTIC, it) }
             .plus(
-                ocrTerms
-                    .filter(String::isNotBlank)
-                    .distinctBy { it.lowercase() }
-                    .map { ExecutionNode.Predicate(ExecutionField.OCR, it) },
+                emptyList<ExecutionNode>(),
+            )
+            .plus(
+                keywordTerms.filter(String::isNotBlank)
+                    .takeIf { it.isNotEmpty() }
+                    ?.let {
+                        // One lexical predicate is an AND group: every QP
+                        // keyword must occur in the same indexed record.
+                        listOf(ExecutionNode.Predicate(ExecutionField.KEYWORD, it.joinToString(" ")))
+                    }
+                    .orEmpty(),
             )
         val retrievalNode = retrievalPredicates.reduceOrNull { left, right ->
             ExecutionNode.Binary(left, ExecutionBinaryOperator.ADD, right)
@@ -366,12 +417,6 @@ data class QueryPlan(
                 .forEach {
                     add(ExecutionNode.Predicate(ExecutionField.SEMANTIC, it))
                 }
-            excludedOcrTerms
-                .filter(String::isNotBlank)
-                .distinctBy { it.lowercase() }
-                .forEach {
-                    add(ExecutionNode.Predicate(ExecutionField.OCR, it))
-                }
         }
         if (root == null && negativeNodes.isNotEmpty()) {
             root = ExecutionNode.Predicate(
@@ -387,15 +432,6 @@ data class QueryPlan(
             )
         }
         if (root != null) {
-            root = ExecutionNode.Binary(
-                answerPredicate,
-                ExecutionBinaryOperator.INTERSECT,
-                ExecutionNode.Binary(
-                    categoryPredicate,
-                    ExecutionBinaryOperator.INTERSECT,
-                    root,
-                ),
-            )
         }
         if (recentFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
         if (sortByLocation && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)
@@ -593,6 +629,19 @@ data class QueryPlan(
                 QueryMediaType.PHOTOS
             Regex("(?i)\\b(video|videos|movie|movies|clip|clips)\\b").containsMatchIn(query) ->
                 QueryMediaType.VIDEOS
+            Regex("(?i)\\b(sms|text|texts)\\b").containsMatchIn(query) -> QueryMediaType.SMS
+            Regex("(?i)\\b(messages?|message)\\b").containsMatchIn(query) -> QueryMediaType.MESSAGES
+            Regex("(?i)\\bpdf\\b").containsMatchIn(query) -> QueryMediaType.PDF
+            // "document" describes searchable content and may be an OCR
+            // document photographed in the gallery. Only the explicit "doc"
+            // format token creates a hard file-type scope.
+            Regex("(?i)\\bdoc\\b").containsMatchIn(query) -> QueryMediaType.DOC
+            Regex("(?i)\\b(calendar|calendars|appointment|appointments)\\b").containsMatchIn(query) ->
+                QueryMediaType.CALENDAR
+            Regex("(?i)\\bcontacts?\\b").containsMatchIn(query) -> QueryMediaType.CONTACTS
+            Regex("(?i)\\bcall_logs?\\b|\\bcall\\s+logs?\\b").containsMatchIn(query) ->
+                QueryMediaType.CALL_LOGS
+            Regex("(?i)\\bfiles?\\b").containsMatchIn(query) -> QueryMediaType.FILES
             // Ask Photos defaults to still images unless the query explicitly
             // requests video. OCR/document language still refers to photos of
             // those documents in the indexed gallery.

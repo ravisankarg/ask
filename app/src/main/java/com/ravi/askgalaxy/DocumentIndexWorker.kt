@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -13,6 +14,7 @@ class DocumentIndexWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val progress = IndexProgressStore(applicationContext)
         DocumentIndexRuntimeGate.begin()
+        var activeSource = DocumentSource.MESSAGES
         try {
             runCatching {
                 val reader = DocumentSourceReader(applicationContext)
@@ -30,15 +32,15 @@ class DocumentIndexWorker(
                 return@runCatching Result.success()
             }
 
-            val embeddingGemma = ModelCatalog.embeddingGemma
-            if (!embeddingGemma.isInstalled(applicationContext)) {
+            val embeddingArtifacts = listOf(ModelCatalog.embeddingGemma, ModelCatalog.embeddingGemmaTokenizer)
+            if (embeddingArtifacts.any { !it.isInstalled(applicationContext) }) {
                 progress.update(
                     IndexProgressStage.EMBEDDING_GEMMA,
-                    embeddingGemma.partFile(applicationContext).length(),
-                    embeddingGemma.expectedBytes,
+                    embeddingArtifacts.sumOf { it.partFile(applicationContext).length() },
+                    embeddingArtifacts.sumOf { it.expectedBytes },
                     phase = "starting download",
                 )
-                ModelInstaller(applicationContext).installArtifacts(listOf(embeddingGemma)) { install ->
+                ModelInstaller(applicationContext).installArtifacts(embeddingArtifacts) { install ->
                     progress.update(
                         IndexProgressStage.EMBEDDING_GEMMA,
                         install.bytesDownloaded,
@@ -47,66 +49,96 @@ class DocumentIndexWorker(
                     )
                 }
             }
-            check(embeddingGemma.isInstalled(applicationContext)) {
-                "EmbeddingGemma download did not complete"
+            check(embeddingArtifacts.all { it.isInstalled(applicationContext) }) {
+                "LiteRT EmbeddingGemma download did not complete"
             }
-            val batches = listOf(
-                DocumentSource.MESSAGES to reader.messages(),
-                DocumentSource.CALENDAR to reader.calendar(),
-                DocumentSource.FILES to reader.allFiles(),
-                DocumentSource.CONTACTS to reader.contacts(),
-                DocumentSource.CALL_LOGS to reader.callLogs(),
-            ).mapNotNull { (source, records) ->
-                val stage = source.progressStage()
-                if (!reader.isAvailable(source)) {
-                    progress.update(stage, 0L, 0L, completed = false, error = "Permission not granted", phase = "permission needed")
-                    return@mapNotNull null
-                }
-                val chunks = records.toList()
-                progress.update(stage, 0L, chunks.size.toLong(), completed = chunks.isEmpty(), error = "", phase = "queued")
-                source to chunks
+            val sourceReaders: List<Pair<DocumentSource, suspend () -> Sequence<DocumentChunk>>> = listOf(
+                DocumentSource.FILES to { reader.allFiles() },
+                DocumentSource.MESSAGES to { reader.messages() },
+                DocumentSource.CALENDAR to { reader.calendar() },
+                DocumentSource.CONTACTS to { reader.contacts() },
+                DocumentSource.CALL_LOGS to { reader.callLogs() },
+            )
+            var documentCurrent = 0L
+            var documentTotal = 0L
+            progress.update(IndexProgressStage.DOCUMENT, 0L, 0L, completed = false, phase = "starting")
+            // Clear stale errors from an interrupted/older worker before the
+            // current source pass starts. In particular, an old LiteRT setup
+            // failure must not keep forcing a restart on every app launch.
+            DocumentSource.entries.forEach { source ->
+                progress.update(source.progressStage(), 0L, 0L, completed = false, error = "", phase = "queued")
             }
-            val total = batches.sumOf { it.second.size }.toLong()
-            val completedBySource = batches.associate { it.first to 0 }.toMutableMap()
-            progress.update(IndexProgressStage.DOCUMENT, 0L, total, completed = total == 0L, phase = "starting")
             val index = DocumentVectorIndex(applicationContext)
             try {
-                index.indexAll(batches.map { (source, chunks) -> source to chunks.asSequence() }) { source, current, sourceTotal ->
-                    completedBySource[source] = current
-                    progress.update(source.progressStage(), current.toLong(), sourceTotal.toLong(), phase = "indexing")
-                    progress.update(
-                        IndexProgressStage.DOCUMENT,
-                        completedBySource.values.sum().toLong(),
-                        total,
-                        phase = source.wire,
-                    )
+                sourceReaders.forEach { (source, read) ->
+                    activeSource = source
+                    val stage = source.progressStage()
+                    if (!reader.isAvailable(source)) {
+                        progress.update(stage, 0L, 0L, completed = false, error = "Permission not granted", phase = "permission needed")
+                    } else {
+                        val records = timedRead("${source.wire}_read") { read() }
+                        val chunks = timedRead("${source.wire}_materialize") { records.toList() }
+                        val fileCount = if (source == DocumentSource.FILES) reader.supportedFileCount else null
+                        val queuedPhase = fileCount?.let { "queued ($it files)" } ?: "queued"
+                        val indexingPhase = fileCount?.let { "indexing $it files" } ?: "indexing"
+                        documentTotal += chunks.size
+                        progress.update(stage, 0L, chunks.size.toLong(), completed = chunks.isEmpty(), error = "", phase = queuedPhase)
+                        progress.update(IndexProgressStage.DOCUMENT, documentCurrent, documentTotal, phase = source.wire)
+                        var lastReportedAt = System.currentTimeMillis()
+                        index.index(source, chunks.asSequence()) { current, sourceTotal ->
+                            val now = System.currentTimeMillis()
+                            val isFinal = current >= sourceTotal
+                            // Avoid a SharedPreferences write and UI refresh
+                            // for every embedding. The screen already polls
+                            // once per second, so one persisted report per
+                            // second is sufficient and keeps indexing cooler.
+                            if (isFinal || now - lastReportedAt >= PROGRESS_REPORT_INTERVAL_MS) {
+                                progress.update(stage, current.toLong(), sourceTotal.toLong(), phase = indexingPhase)
+                                progress.update(IndexProgressStage.DOCUMENT, documentCurrent + current, documentTotal, phase = source.wire)
+                                lastReportedAt = now
+                            }
+                        }
+                        documentCurrent += chunks.size
+                    }
                 }
             } finally {
                 index.close()
             }
-            progress.update(IndexProgressStage.DOCUMENT, total, total, completed = true, phase = "complete")
-            batches.forEach { (source, chunks) ->
-                progress.update(source.progressStage(), chunks.size.toLong(), chunks.size.toLong(), completed = true, phase = "complete")
-            }
+            progress.update(IndexProgressStage.DOCUMENT, documentCurrent, documentTotal, completed = true, phase = "complete")
             Result.success()
             }.getOrElse { error ->
+                Log.e(TAG, "document indexing failed", error)
                 progress.update(
-                    IndexProgressStage.DOCUMENT_FILES,
+                    activeSource.progressStage(),
                     0L,
                     0L,
                     completed = false,
                     error = error.message.orEmpty().ifBlank { error.javaClass.simpleName },
                     phase = "extraction failed",
                 )
-                Result.retry()
+                // Stop deterministic GPU/setup or source failures here. The
+                // error is persisted for the UI; an explicit enqueue/restart
+                // can retry after the user or a later app update changes state.
+                Result.failure()
             }
         } finally {
             DocumentIndexRuntimeGate.end()
         }
     }
+
+    private suspend fun <T> timedRead(name: String, read: suspend () -> T): T {
+        val started = System.currentTimeMillis()
+        Log.i(TAG, "source_read_start=$name")
+        return read().also { Log.i(TAG, "source_read_done=$name ms=${System.currentTimeMillis() - started}") }
+    }
+
+    private companion object {
+        const val TAG = "AskGalaxyDocumentIndex"
+        const val PROGRESS_REPORT_INTERVAL_MS = 1_000L
+    }
 }
 
-private fun DocumentSource.progressStage(): IndexProgressStage = when (this) {
+internal fun DocumentSource.progressStage(): IndexProgressStage = when (this) {
     DocumentSource.MESSAGES -> IndexProgressStage.DOCUMENT_MESSAGES
     DocumentSource.CALENDAR -> IndexProgressStage.DOCUMENT_CALENDAR
     DocumentSource.FILES -> IndexProgressStage.DOCUMENT_FILES

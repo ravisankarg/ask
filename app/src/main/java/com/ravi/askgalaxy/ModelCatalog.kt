@@ -68,12 +68,22 @@ object GemmaModelSelection {
 object ModelCatalog {
     val embeddingGemma = ModelArtifact(
         name = "EmbeddingGemma 300M document encoder",
-        relativePath = "models/embeddinggemma-300M-Q8_0.gguf",
-        runtime = "llama.cpp CPU embeddings",
+        relativePath = "models/embeddinggemma-300M_seq512_mixed-precision.tflite",
+        runtime = "LiteRT GPU (512 tokens, 768-D)",
         required = false,
-        downloadUrl = "https://huggingface.co/ggml-org/embeddinggemma-300M-GGUF/resolve/0f741b5a6585bd53aeb15cd1372c56f2a0f65e12/embeddinggemma-300M-Q8_0.gguf?download=true",
-        expectedBytes = 333_590_944L,
-        sourceLabel = "Public revision-pinned GGUF; no Hugging Face credential required",
+        downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq512_mixed-precision.tflite?download=true",
+        expectedBytes = 179132472L,
+        sourceLabel = "Hugging Face Gemma license; browser download and import",
+    )
+
+    val embeddingGemmaTokenizer = ModelArtifact(
+        name = "EmbeddingGemma SentencePiece tokenizer",
+        relativePath = "models/embeddinggemma-sentencepiece.model",
+        runtime = "SentencePiece",
+        required = false,
+        downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/sentencepiece.model?download=true",
+        expectedBytes = 4_683_319L,
+        sourceLabel = "Hugging Face Gemma license; browser download and import",
     )
 
     val siglipVision = ModelArtifact(
@@ -154,9 +164,10 @@ object ModelCatalog {
             .filter { it.name.contains("E2B", ignoreCase = true) }
             .forEach { if (it.isDirectory) it.deleteRecursively() else it.delete() }
         File(modelsDir, "lfm2.5-vl").deleteRecursively()
-        context.deleteDatabase("personal_context.db")
-        context.deleteSharedPreferences("ask_galaxy_kv_index")
-        context.deleteSharedPreferences("personal_context_settings")
+        // Do not delete persisted personal/document data during normal app
+        // startup. Reinstalling/updating the APK must preserve indexed
+        // messages, files, and their resumable progress. Retired model
+        // artifacts are safe to remove; user data is not.
         context.getSharedPreferences("ask_galaxy_model_selection", Context.MODE_PRIVATE)
             .edit().putString("gemma_variant", GemmaModelVariant.E4B.preferenceValue).apply()
     }
@@ -169,6 +180,7 @@ object ModelCatalog {
         faceEmbedder,
         gemma(context),
         embeddingGemma,
+        embeddingGemmaTokenizer,
     )
 
     fun installedCount(context: Context): Int = all(context).count { it.isInstalled(context) }

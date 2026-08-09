@@ -3,500 +3,91 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#0a1020">
-  <meta name="description" content="Ask Galaxy — a local-first multimodal gallery search and answer engine for Android.">
-  <title>Ask Galaxy — Architecture</title>
-  <script>document.documentElement.classList.add("js")</script>
+  <meta name="description" content="Ask Galaxy high-level search and answer design.">
+  <title>Ask Galaxy · Search design</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <div class="ambient ambient-one" aria-hidden="true"></div>
-  <div class="ambient ambient-two" aria-hidden="true"></div>
-  <header class="site-header">
-    <a class="brand" href="#top" aria-label="Ask Galaxy home">
-      <span class="brand-mark" aria-hidden="true">
-        <svg viewBox="0 0 40 40" role="img">
-          <path d="M20 3.5 24.1 15l12.4 5-12.4 5L20 36.5 15.9 25 3.5 20l12.4-5L20 3.5Z"/>
-          <circle cx="30.5" cy="8.5" r="2.5"/>
-        </svg>
-      </span>
-      <span>Ask Galaxy</span>
-    </a>
-    <nav class="desktop-nav" aria-label="Primary navigation">
-      <a href="#architecture">Architecture</a>
-      <a href="#indexing">Indexing</a>
-      <a href="#query-flow">Query flow</a>
-      <a href="#context-picker">Evidence</a>
-      <a href="#validation">Validation</a>
+  <header class="topbar">
+    <a class="brand" href="#top"><span class="mark">✦</span> Ask Galaxy</a>
+    <nav aria-label="Page navigation">
+      <a href="#flow">Search flow</a>
       <a href="#modules">Modules</a>
+      <a href="#boundaries">Boundaries</a>
+      <a class="source" href="https://github.com/ravisankarg/ask">Source ↗</a>
     </nav>
-    <a class="header-link" href="https://github.com/ravisankarg/ask">View source <span>↗</span></a>
   </header>
 
   <main id="top">
-    <section class="hero shell">
-      <div class="hero-copy" data-reveal>
-        <p class="eyebrow"><span></span> On-device multimodal RAG</p>
-        <h1>Your gallery,<br><em>understood locally.</em></h1>
-        <p class="hero-lede">
-          Ask Galaxy turns photos, faces, text, places, and time into one private,
-          inspectable search system—then answers with only the context the question needs.
-        </p>
-        <div class="hero-actions">
-          <a class="button button-primary" href="#architecture">Explore the system <span>↓</span></a>
-          <a class="button button-quiet" href="https://github.com/ravisankarg/ask/blob/main/ARCHITECTURE.md">Read the spec</a>
-        </div>
-        <dl class="hero-proof" aria-label="Key product constraints">
-          <div><dt>200</dt><dd>visible results</dd></div>
-          <div><dt>8</dt><dd>max evidence records</dd></div>
-          <div><dt>4-bit</dt><dd>native vectors</dd></div>
-          <div><dt>Local</dt><dd>query + answer</dd></div>
-        </dl>
-      </div>
-
-      <div class="device-scene" data-reveal>
-        <div class="orbit orbit-a" aria-hidden="true"></div>
-        <div class="orbit orbit-b" aria-hidden="true"></div>
-        <div class="phone">
-          <div class="phone-bar">
-            <span>9:41</span>
-            <span class="phone-sensors">● ◒ 5G</span>
-          </div>
-          <div class="app-title">
-            <span class="mini-mark">✦</span>
-            <div><strong>Ask Galaxy</strong><small>v0.2 · Private gallery intelligence</small></div>
-          </div>
-          <div class="demo-search">
-            <span>⌕</span>
-            <strong id="demo-query">How much was the Odyssey ticket?</strong>
-          </div>
-          <div class="qp-card">
-            <div class="qp-head">
-              <span>QP output <i>ready</i></span>
-              <span>◷ 14.0 s</span>
-            </div>
-            <code id="demo-plan">[query_category == doc] &amp;&amp; [[semantic == Odyssey movie ticket price] + [ocr == {Odyssey} &amp;&amp; {ticket}]]</code>
-          </div>
-          <div class="result-head">
-            <span><strong>1</strong> of 1 match</span>
-            <button id="cycle-demo" type="button">Try another plan ↻</button>
-          </div>
-          <div class="photo-grid" aria-label="Abstract gallery result preview">
-            <div class="photo p1"><span>Jul 23</span></div>
-            <div class="photo p2"><span>Jul 23</span></div>
-            <div class="photo p3"><span>Team outing</span></div>
-            <div class="photo p4"><span>Bengaluru</span></div>
-            <div class="photo p5"><span>Jul 21</span></div>
-            <div class="photo p6"><span>Ravi</span></div>
-          </div>
-        </div>
-        <div class="floating-note note-one"><b>8</b><span>grounded evidence<br>records, privately</span></div>
-        <div class="floating-note note-two"><b>0</b><span>photo pixels<br>sent to cloud</span></div>
-      </div>
-    </section>
-
-    <section class="statement shell" data-reveal>
-      <p>Search is the product. <span>The answer is a layer on top.</span></p>
+    <section class="hero wrap reveal">
       <div>
-        The user always gets the top 200 overall query matches in one smooth grid.
-        A separate Context Picker privately distills at most 8 category-eligible records for Gemma—never
-        replacing the results the user can browse.
+        <p class="kicker">Private search, designed as a system</p>
+        <h1>Ask your life<br><em>one question at a time.</em></h1>
+        <p class="lead">Ask Galaxy joins personal sources into one inspectable search flow. The answer is grounded in the same records the user can see.</p>
+        <a class="button" href="#flow">See the flow ↓</a>
+      </div>
+      <div class="hero-card" aria-label="Search flow summary">
+        <span class="card-label">ONE QUESTION</span>
+        <strong>“When did I last call Sreevatsa?”</strong>
+        <div class="mini-flow">
+          <span>understand</span><i>→</i><span>scope</span><i>→</i><span>retrieve</span><i>→</i><span>answer</span>
+        </div>
+        <small>Every stage has a visible responsibility and a bounded output.</small>
       </div>
     </section>
 
-    <section id="architecture" class="section shell">
-      <div class="section-heading" data-reveal>
-        <p class="eyebrow"><span></span> System architecture</p>
-        <h2>One pipeline. Clear boundaries.</h2>
-        <p>Kotlin owns lifecycle and UI. Native runtimes own model inference and vector search.
-          SQLite joins the worlds with durable, inspectable metadata.</p>
+    <section id="flow" class="section wrap">
+      <div class="section-head reveal">
+        <p class="kicker">Search-time flow</p>
+        <h2>From language to evidence.</h2>
+        <p>The pipeline preserves user intent while keeping hard scope decisions outside the answer writer.</p>
       </div>
-
-      <div class="architecture-map" data-reveal>
-        <div class="lane-label">Android orchestration</div>
-        <div class="architecture-lane lane-kotlin">
-          <article><span>01</span><b>MediaStore</b><small>Photos + videos</small></article>
-          <i>→</i>
-          <article><span>02</span><b>WorkManager</b><small>Resumable preparation</small></article>
-          <i>→</i>
-          <article><span>03</span><b>SQLite</b><small>Metadata + episodes</small></article>
-          <i>→</i>
-          <article><span>04</span><b>Android UI</b><small>Search + browsing</small></article>
-        </div>
-        <div class="architecture-bridge">
-          <span>JNI / LiteRT boundary</span>
-          <span>stable IDs • fixed dimensions • bounded buffers</span>
-        </div>
-        <div class="lane-label">Native intelligence</div>
-        <div class="architecture-lane lane-native">
-          <article><span>A</span><b>SigLIP2</b><small>768-D image + text</small></article>
-          <article><span>B</span><b>ML Kit OCR</b><small>Confidence-gated text</small></article>
-          <article><span>C</span><b>YuNet + FaceNet</b><small>Private identity</small></article>
-          <article><span>D</span><b>Gemma 4</b><small>Plan + answer</small></article>
-          <article><span>E</span><b>TurboQuant</b><small>Rust 4-bit search</small></article>
-        </div>
-      </div>
-
-      <div class="principle-grid">
-        <article class="principle-card" data-reveal>
-          <span class="principle-number">01</span>
-          <h3>Hard scopes stay hard</h3>
-          <p>A semantic score can never bypass category, person, date, location, or MIME constraints. The device-calibrated 0.10 confidence gate stays primary; an empty positive search falls back only to nearest neighbors inside those hard scopes.</p>
-        </article>
-        <article class="principle-card" data-reveal>
-          <span class="principle-number">02</span>
-          <h3>Precompute what is stable</h3>
-          <p>Places, faces, OCR, vectors, and episodes are resolved once during preparation.</p>
-        </article>
-        <article class="principle-card" data-reveal>
-          <span class="principle-number">03</span>
-          <h3>Bound what reaches Gemma</h3>
-          <p>At most 8 records. Document and scenery answers may attach at most four 512 px images; document tiles include their OCR text.</p>
-        </article>
-        <article class="principle-card" data-reveal>
-          <span class="principle-number">04</span>
-          <h3>Keep internals out of prose</h3>
-          <p>No G1/G2 evidence labels, planner boilerplate, filenames, or execution syntax in answers.</p>
-        </article>
+      <div class="flow-list">
+        <article class="flow-step reveal"><span class="number">01</span><div><h3>Question intake</h3><p class="io"><b>Input</b> natural language and conversation context</p><p class="io"><b>Output</b> a normalized request with the information need understood</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">02</span><div><h3>Query understanding</h3><p class="io"><b>Input</b> normalized request and available source capabilities</p><p class="io"><b>Output</b> intent category, source scope, people, places, time, media type, and requested fields</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">03</span><div><h3>Scope compilation</h3><p class="io"><b>Input</b> structured intent</p><p class="io"><b>Output</b> executable positive predicates and explicit exclusions</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">04</span><div><h3>Parallel source retrieval</h3><p class="io"><b>Input</b> compiled scope and independent source indexes</p><p class="io"><b>Output</b> lexical, semantic, and structured candidates from each eligible source</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">05</span><div><h3>Scope, fusion, and ranking</h3><p class="io"><b>Input</b> per-source candidates and hard predicates</p><p class="io"><b>Output</b> stale-free merged order shown to the user</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">06</span><div><h3>Evidence selection</h3><p class="io"><b>Input</b> merged results and the original question</p><p class="io"><b>Output</b> a bounded top evidence set with full available text, metadata, and relevant images</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">07</span><div><h3>Grounded answer</h3><p class="io"><b>Input</b> question, evidence, field/value relationships, and visual context</p><p class="io"><b>Output</b> concise answer, sources, and diverse follow-up questions</p></div><span class="arrow">↓</span></article>
+        <article class="flow-step reveal"><span class="number">08</span><div><h3>UI publication</h3><p class="io"><b>Input</b> stage state, timings, result order, and answer state</p><p class="io"><b>Output</b> transparent progress, query plan, results, answer, and recovery actions</p></div></article>
       </div>
     </section>
 
-    <section id="indexing" class="section section-ink">
-      <div class="shell">
-        <div class="section-heading heading-light" data-reveal>
-          <p class="eyebrow"><span></span> Index flow</p>
-          <h2>Do the expensive thinking once.</h2>
-          <p>Preparation is resumable, foreground, multithreaded, and incremental. Model download and independent index stages can progress concurrently, with durable checkpoints after every item.</p>
+    <section id="modules" class="section dark">
+      <div class="wrap">
+        <div class="section-head light reveal">
+          <p class="kicker">High-level modules</p>
+          <h2>Each boundary has a job.</h2>
+          <p>Inputs and outputs stay explicit so the system can evolve without hiding decisions inside a single retrieval or generation step.</p>
         </div>
-        <ol class="timeline">
-          <li data-reveal><span>01</span><div><b>Discover</b><p>Scan MediaStore images and videos using stable content IDs and change signatures.</p></div><small>MediaStore</small></li>
-          <li data-reveal><span>02</span><div><b>Enrich</b><p>With Android precise-photo-location consent, open original EXIF and cache human-readable place names with a privacy-rounded fallback.</p></div><small>Original EXIF + geocoder</small></li>
-          <li data-reveal><span>03</span><div><b>See</b><p>Encode images and first video frames into normalized 768-D SigLIP2 vectors with bounded parallel inference and atomic index replacement.</p></div><small>LiteRT</small></li>
-          <li data-reveal><span>04</span><div><b>Read</b><p>Decode images without aspect distortion, tile long screenshots, and store confidence-gated bundled ML Kit text.</p></div><small>OCR-only migration</small></li>
-          <li data-reveal><span>05</span><div><b>Recognize</b><p>Detect, align, and encrypt FaceNet-512 identity vectors; cluster anonymous people locally.</p></div><small>YuNet + FaceNet</small></li>
-          <li data-reveal><span>06</span><div><b>Remember episodes</b><p>Group the final gallery by time, people, and readable place; atomically persist memberships.</p></div><small>SQLite</small></li>
-          <li data-reveal><span>07</span><div><b>Review once</b><p>Merge and name face groups, and mark one exclusive “This is me” identity so I/me/my queries resolve locally.</p></div><small>Private UI</small></li>
-          <li data-reveal><span>08</span><div><b>Track + recover</b><p>Show separate model, OCR, SigLIP, location, face, and episode progress with ETA; Settings can clear or rebuild each index independently.</p></div><small>Ready</small></li>
-        </ol>
-      </div>
-    </section>
-
-    <section id="query-flow" class="section shell">
-      <div class="section-heading" data-reveal>
-        <p class="eyebrow"><span></span> Query + answer flow</p>
-        <h2>Inspectable before it is intelligent.</h2>
-        <p>Gemma 4 E4B is the sole planner. Its category and corrected execution spec become visible before retrieval starts.</p>
-      </div>
-
-      <div class="query-layout">
-        <div class="query-steps">
-          <article data-reveal>
-            <span>1</span><div><h3>Classify + correct</h3><p>Choose doc, scenary, person, location, or time; correct spelling, reject invented dates, and close exact-day queries with equal from/to boundaries.</p></div>
-          </article>
-          <article data-reveal>
-            <span>2</span><div><h3>Compile the QP spec</h3><p>Emit one query_category plus the canonical C-like AST and show it below the search bar immediately.</p></div>
-          </article>
-          <article data-reveal>
-            <span>3</span><div><h3>Execute hybrid retrieval</h3><p>For documents, every braced OCR word must occur in the same photo: {Ravi} AND {passport}. That complete conjunction is a perfect match above semantic-only fallback.</p></div>
-          </article>
-          <article data-reveal>
-            <span>4</span><div><h3>Publish results first</h3><p>Render up to 200 overall-relevance matches without re-sorting by date: semantic-first scenery, OCR-first documents, metadata-scoped people and places.</p></div>
-          </article>
-          <article data-reveal>
-            <span>5</span><div><h3>Distill answer context</h3><p>Join episode membership and choose no more than 8 records. Preserve full stored OCR and metadata without prompt truncation.</p></div>
-          </article>
-          <article data-reveal>
-            <span>6</span><div><h3>Answer naturally</h3><p>Document and scenery answers may attach up to four 512 px images to the clean Gemma conversation; document tiles include paired OCR text.</p></div>
-          </article>
-        </div>
-
-        <aside class="grammar-card" data-reveal>
-          <p class="card-kicker">Execution grammar</p>
-          <h3>Small language.<br>Precise behavior.</h3>
-          <div class="grammar-row"><code>SORT_DATE · SORT_LOC</code><span>highest</span></div>
-          <div class="grammar-row"><code>+ · -</code><span>fusion / subtract</span></div>
-          <div class="grammar-row"><code>&amp;&amp;</code><span>hard intersect</span></div>
-          <div class="grammar-row"><code>,</code><span>alternative union</span></div>
-          <div class="grammar-example">
-            <small>“Ravi without glasses”</small>
-            <code>[query_category == scenary] &amp;&amp; [[[person == Ravi] &amp;&amp; [mime type == photos]] - [semantic == glasses]]</code>
-          </div>
-          <div class="grammar-example">
-            <small>“Meghana photos from last team outing”</small>
-            <code>[query_category == scenary] &amp;&amp; [[person == Meghana] &amp;&amp; [semantic == team outing]] SORT_DATE</code>
-          </div>
-          <div class="grammar-example">
-            <small>“What is my passport number?” · Self person Ravi</small>
-            <code>[query_category == doc] &amp;&amp; [[semantic == passport identity document] + [ocr == {Ravi} &amp;&amp; {passport}]]</code>
-          </div>
-        </aside>
-      </div>
-    </section>
-
-    <section id="context-picker" class="section section-sand">
-      <div class="shell context-layout">
-        <div class="context-copy" data-reveal>
-          <p class="eyebrow"><span></span> Context Picker</p>
-          <h2>Maximum coverage.<br>Minimum repetition.</h2>
-          <p>
-            OCR indexing persists a simple media class: any image with text is doc;
-            everything else is scenary. The QP category scopes the full result set,
-            then episodes and relevance maximize answer coverage with minimal repetition.
-          </p>
-          <div class="objective">
-            <span>pick(x) =</span>
-            <code>relevance + coverage + novelty − duplicate cost</code>
-          </div>
-          <ul class="check-list">
-            <li><i>✓</i><span><b>Strict category gate</b> scopes both the result browser and private answer context.</span></li>
-            <li><i>✓</i><span><b>Text-first answer path</b> sends no pixels for document, person, location, or time queries.</span></li>
-            <li><i>✓</i><span><b>Scene diversity</b> uses persisted SigLIP vectors and episode coverage without loading images during selection.</span></li>
-            <li><i>✓</i><span><b>Strict budget</b> stops at 8 private records, regardless of result count.</span></li>
-          </ul>
-        </div>
-        <div class="picker-visual" data-reveal>
-          <div class="picker-head"><span>Candidate episodes</span><b>1,284 results → 8 records</b></div>
-          <div class="episode-row">
-            <span>E01 · Team outing</span>
-            <div class="episode-candidates"><i class="candidate c1 selected"></i><i class="candidate c2"></i><i class="candidate c3"></i><i class="candidate c4"></i></div>
-            <em>visual + people</em>
-          </div>
-          <div class="episode-row">
-            <span>E07 · Bengaluru</span>
-            <div class="episode-candidates"><i class="candidate c5"></i><i class="candidate c6 selected"></i><i class="candidate c7"></i></div>
-            <em>place + timeline</em>
-          </div>
-          <div class="episode-row">
-            <span>E13 · Whiteboard</span>
-            <div class="episode-candidates"><i class="candidate c8"></i><i class="candidate c9"></i><i class="candidate c10 selected"></i></div>
-            <em>OCR novelty</em>
-          </div>
-          <div class="picker-output">
-            <div class="output-label"><span>Private LLM context</span><b>8 / 8</b></div>
-            <div class="slot-grid">
-              <i class="c1"></i><i class="c6"></i><i class="c10"></i><i class="c11"></i>
-              <i class="c12"></i><i class="c13"></i><i class="c14"></i><i class="c15"></i>
-            </div>
-            <p>Never rendered as a second user-facing gallery.</p>
-          </div>
-        </div>
-      </div>
-
-      <div class="shell evidence-detail" data-reveal>
-        <div class="evidence-intro">
-          <p class="eyebrow"><span></span> Private evidence flow</p>
-          <h3>One retrieval. Two deliberately different outputs.</h3>
-          <p>The result browser and answer context share the corrected QP scope, then separate. The user sees up to 200 relevance-ranked matches immediately; Gemma receives a private, category-safe subset of at most eight records.</p>
-        </div>
-        <div class="evidence-pipeline" aria-label="Evidence Picker pipeline">
-          <article><span>01</span><b>Corrected QP spec</b><small>category + hard predicates</small></article>
-          <i>→</i>
-          <article><span>02</span><b>Scoped retrieval</b><small>overall relevance order</small></article>
-          <i>→</i>
-          <article class="pipeline-public"><span>03A</span><b>Public grid</b><small>up to 200 matches</small></article>
-          <i class="pipeline-split">↘</i>
-          <article class="pipeline-private"><span>03B</span><b>Private picker</b><small>up to 8 records</small></article>
-          <i>→</i>
-          <article><span>04</span><b>Gemma answer</b><small>category-safe context</small></article>
-        </div>
-
-        <div class="picker-rules">
-          <article>
-            <span>Gate</span>
-            <h4>Reject before ranking</h4>
-            <p>Every candidate must satisfy its category eligibility. If nothing is eligible, the evidence bundle is empty—unrelated results are never substituted.</p>
-          </article>
-          <article>
-            <span>Cover</span>
-            <h4>Spend five slots on breadth</h4>
-            <p>Anchor the strongest matches, then round-robin across people, places, OCR, months, and episodes before filling remaining slots by score.</p>
-          </article>
-          <article>
-            <span>Deduplicate</span>
-            <h4>Prefer a new reason to answer</h4>
-            <p>Stable media IDs prevent repeats. Episode membership suppresses near-duplicate moments; scenery also uses persisted SigLIP distance for visual novelty.</p>
-          </article>
-          <article>
-            <span>Decode late</span>
-            <h4>Selection stays text + vectors</h4>
-            <p>The picker loads no photo pixels. Only after selection may document or scenery answers decode at most four images, each reduced to a 512 px longest edge.</p>
-          </article>
-        </div>
-
-        <div class="policy-table-wrap">
-          <table class="policy-table">
-            <thead>
-              <tr>
-                <th>QP category</th>
-                <th>Hard eligibility</th>
-                <th>What wins inside the 8-record budget</th>
-                <th>Gemma receives</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th><code>doc</code></th>
-                <td><code>contentClass == DOC</code></td>
-                <td>Complete same-photo OCR conjunctions first, then text evidence, then original result rank.</td>
-                <td>Full OCR + metadata; text only, no pixels.</td>
-              </tr>
-              <tr>
-                <th><code>scenary</code></th>
-                <td>Not classified as a document</td>
-                <td>Semantic relevance, persisted SigLIP visual diversity, and episode coverage.</td>
-                <td>Metadata + up to four selected 512 px images.</td>
-              </tr>
-              <tr>
-                <th><code>person</code></th>
-                <td>At least one named <code>personLabel</code></td>
-                <td>Strong anchors plus coverage across as many as three distinct named people.</td>
-                <td>Names, time, place, OCR, and episode text; no pixels.</td>
-              </tr>
-              <tr>
-                <th><code>location</code></th>
-                <td>A readable <code>locationName</code></td>
-                <td>Strong anchors plus coverage across as many as three distinct places.</td>
-                <td>Place, time, people, OCR, and episode text; no pixels.</td>
-              </tr>
-              <tr>
-                <th><code>time</code></th>
-                <td>Capture date, or modified-time fallback</td>
-                <td>Strong anchors plus timeline breadth across as many as four distinct year-month buckets.</td>
-                <td>Dates, place, people, OCR, and episode text; no pixels.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <p class="episode-note"><b>Episode layer:</b> evidence construction inspects the top 100 retrieved candidates and may retain up to 32 episode representatives for context selection. Compact episode summaries are added to the final answer prompt only for event-noun plus count/list intent, capped at 12 episodes.</p>
-      </div>
-    </section>
-
-    <section id="validation" class="section shell">
-      <div class="section-heading" data-reveal>
-        <p class="eyebrow"><span></span> Validation snapshot</p>
-        <h2>50 planner cases.<br>Five intent families.</h2>
-        <p>This July 25 device audit measured Gemma planning, parsing, and validators—not gallery retrieval, Evidence Picker behavior, or answer generation. It is retained as a historical baseline; later OCR grammar and ranking changes were not rerun in this table.</p>
-      </div>
-      <div class="audit-grid">
-        <div class="audit-table-wrap" data-reveal>
-          <table class="audit-table">
-            <thead>
-              <tr>
-                <th>Category</th>
-                <th>Queries</th>
-                <th>Passed</th>
-                <th>Failed</th>
-                <th>Repair</th>
-                <th>Mean</th>
-                <th>Median</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><th><code>doc</code></th><td>10</td><td>10</td><td>0</td><td>0</td><td>41.2 s</td><td>40.6 s</td></tr>
-              <tr><th><code>scenary</code></th><td>10</td><td>10</td><td>0</td><td>1</td><td>43.1 s</td><td>40.8 s</td></tr>
-              <tr><th><code>person</code></th><td>10</td><td>10</td><td>0</td><td>0</td><td>40.7 s</td><td>40.7 s</td></tr>
-              <tr><th><code>location</code></th><td>10</td><td>10</td><td>0</td><td>4</td><td>56.4 s</td><td>51.6 s</td></tr>
-              <tr><th><code>time</code></th><td>10</td><td>10</td><td>0</td><td>2</td><td>46.4 s</td><td>40.9 s</td></tr>
-              <tr class="audit-total"><th>Total</th><td>50</td><td>50 · 100%</td><td>0</td><td>7</td><td>45.6 s</td><td>40.8 s</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <aside class="audit-summary" data-reveal>
-          <p class="card-kicker">Device audit</p>
-          <strong>37m 58s</strong>
-          <span>2,278.046 seconds total</span>
-          <dl>
-            <div><dt>50 / 50</dt><dd>accepted plans</dd></div>
-            <div><dt>7</dt><dd>queries repaired</dd></div>
-            <div><dt>2</dt><dd>needed second repair</dd></div>
-            <div><dt>0</dt><dd>final rejections</dd></div>
-          </dl>
-          <a href="https://github.com/ravisankarg/ask/blob/main/QP_ONLY_50_AUDIT_REPORT.md">Read all 50 cases and acceptance rules ↗</a>
-        </aside>
-      </div>
-    </section>
-
-    <section id="modules" class="section shell">
-      <div class="section-heading" data-reveal>
-        <p class="eyebrow"><span></span> Module map</p>
-        <h2>Every responsibility has a home.</h2>
-        <p>Filter the logical modules below. Each card links to the primary implementation files.</p>
-      </div>
-      <div class="module-filters" role="group" aria-label="Filter modules" data-reveal>
-        <button class="active" data-filter="all">All modules</button>
-        <button data-filter="index">Indexing</button>
-        <button data-filter="search">Search</button>
-        <button data-filter="answer">Answer</button>
-        <button data-filter="platform">Platform</button>
-      </div>
-      <div class="module-grid">
-        <article class="module-card" data-kind="platform" data-reveal><span>Platform</span><h3>Lifecycle + preparation</h3><p>Resumable Gemma download runs independently from foreground multithreaded indexing; each stage exposes durable progress and ETA.</p><a href="https://github.com/ravisankarg/ask/tree/main/app/src/main/java/com/ravi/askgalaxy">PreparationWorker · GemmaDownloadWorker · ProgressStore ↗</a></article>
-        <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Media + metadata</h3><p>Incremental MediaStore scan, stable signatures, capture dates, raw GPS, dimensions, video duration.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GalleryIndexer.kt">GalleryIndexer · MetadataReader ↗</a></article>
-        <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Location enrichment</h3><p>ACCESS_MEDIA_LOCATION + original photo EXIF, system geocoder first, serialized rounded-coordinate fallback, and a location-only migration.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/LocationIndexer.kt">MediaLocationAccess · LocationIndexer ↗</a></article>
-        <article class="module-card" data-kind="index search" data-reveal><span>Index + search</span><h3>Visual semantics</h3><p>Aligned SigLIP2 image/text towers, normalized 768-D vectors, device-calibrated 0.10 confidence gate, scoped non-empty fallback.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GallerySemanticIndexer.kt">SemanticIndexer · SigLIP encoders ↗</a></article>
-        <article class="module-card" data-kind="index search" data-reveal><span>Index + search</span><h3>OCR</h3><p>Bundled ML Kit OCR, aspect-preserving long-image tiles, full stored text, isolated rebuild, and same-photo all-word conjunctions.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/OcrIndexer.kt">OcrIndexer · MlKitOcrEngine ↗</a></article>
-        <article class="module-card" data-kind="index" data-reveal><span>Indexing</span><h3>Faces + identity</h3><p>YuNet landmarks, FaceNet-512, encrypted clusters, fixed finish/skip actions, and one exclusive “This is me” label.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/FaceClustersActivity.kt">FaceIndexer · Clusterer · Face UI ↗</a></article>
-        <article class="module-card" data-kind="index answer" data-reveal><span>Index + answer</span><h3>Episode index</h3><p>Precomputed event headers and memberships from time, place, and people for fast query-time coverage.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/EpisodeIndex.kt">EpisodeIndex · EvidenceBuilder ↗</a></article>
-        <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Query processor</h3><p>Gemma-only five-way routing, document-intent guards, self-name resolution, and one semantic + one OCR branch for every doc plan.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/QueryPlannerRuntime.kt">QueryPlannerRuntime · QueryPlan ↗</a></article>
-        <article class="module-card" data-kind="search" data-reveal><span>Search</span><h3>Structured executor</h3><p>Recursive hard scopes and category-aware overall ranking: semantic-first scenery, OCR-perfect documents, metadata-scoped people/places, then stable tie-breakers.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/StructuredSearchExecutor.kt">QueryExecutionSpec · Executor ↗</a></article>
-        <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Context Picker</h3><p>Strict indexed category eligibility, text-only metadata paths, and episode/SigLIP diversity under a hard 8-record budget.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerContextPicker.kt">AnswerContextPicker · DiversitySelector ↗</a></article>
-        <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Gemma runtime</h3><p>OCR text is paired with the top four document images; scenery also uses up to four 512 px images, with OOM recovery.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/GemmaRuntime.kt">GemmaRuntime · GalleryIndexer ↗</a></article>
-        <article class="module-card" data-kind="answer" data-reveal><span>Answer</span><h3>Response guardrails</h3><p>Duplicate-aware context, natural 2–3 sentences, reasoning/task/ID removal, and no synthetic filler.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/AnswerTextSanitizer.kt">AnswerTextSanitizer · AnswerModels ↗</a></article>
-        <article class="module-card" data-kind="platform search" data-reveal><span>Product UI</span><h3>Search + recovery</h3><p>v0.2 badge, live QP/timing telemetry, relevance-ranked top-200 grid, per-stage progress bars, and separate clear/rebuild controls for every index.</p><a href="https://github.com/ravisankarg/ask/blob/main/app/src/main/java/com/ravi/askgalaxy/MainActivity.kt">MainActivity · SettingsActivity ↗</a></article>
-        <article class="module-card" data-kind="platform search" data-reveal><span>Native core</span><h3>Rust TurboQuant</h3><p>4-bit persistent IdMap index, exact stable IDs, tokenizer JNI, atomic index replacement, arm64 ABI.</p><a href="https://github.com/ravisankarg/ask/blob/main/native/askgalaxy-native/src/lib.rs">native/askgalaxy-native ↗</a></article>
-      </div>
-    </section>
-
-    <section class="section privacy-section">
-      <div class="shell privacy-grid">
-        <div data-reveal>
-          <p class="eyebrow"><span></span> Privacy boundary</p>
-          <h2>Your memories do not become someone else’s dataset.</h2>
-        </div>
-        <div class="privacy-card" data-reveal>
-          <div><span class="privacy-icon">⌂</span><p><b>Stays on device</b>Photo pixels, OCR, face vectors, filenames, query text, vector search, QP, and answers.</p></div>
-          <div><span class="privacy-icon">◎</span><p><b>Optional network edge</b>Only GPS rounded to roughly 110 m can reach the fallback geocoder during indexing.</p></div>
-          <div><span class="privacy-icon">◇</span><p><b>Encrypted identities</b>Face vectors remain protected by a separate Android Keystore AES-GCM key.</p></div>
+        <div class="module-grid">
+          <article class="module reveal"><span>01</span><h3>Source ingestion</h3><p><b>Input:</b> personal records and source metadata</p><p><b>Output:</b> stable records, signatures, and ownership</p></article>
+          <article class="module reveal"><span>02</span><h3>Preparation</h3><p><b>Input:</b> new or changed records</p><p><b>Output:</b> searchable text, metadata, identities, representations, and checkpoints</p></article>
+          <article class="module reveal"><span>03</span><h3>Query understanding</h3><p><b>Input:</b> user language</p><p><b>Output:</b> intent and structured constraints</p></article>
+          <article class="module reveal"><span>04</span><h3>Retrieval</h3><p><b>Input:</b> constraints and source indexes</p><p><b>Output:</b> candidates with comparable scores</p></article>
+          <article class="module reveal"><span>05</span><h3>Fusion and scope</h3><p><b>Input:</b> candidate lists and exclusions</p><p><b>Output:</b> one trustworthy cross-source order</p></article>
+          <article class="module reveal"><span>06</span><h3>Evidence and answer</h3><p><b>Input:</b> question and bounded top records</p><p><b>Output:</b> concise answer with validated facts</p></article>
+          <article class="module reveal"><span>07</span><h3>Product surface</h3><p><b>Input:</b> progress, timings, results, and answer events</p><p><b>Output:</b> browseable, explainable interaction</p></article>
         </div>
       </div>
     </section>
 
-    <section id="roadmap" class="section shell">
-      <div class="section-heading" data-reveal>
-        <p class="eyebrow"><span></span> Next steps</p>
-        <h2>From strong system to effortless product.</h2>
+    <section id="boundaries" class="section wrap">
+      <div class="section-head reveal">
+        <p class="kicker">Design boundaries</p>
+        <h2>Trust is a pipeline property.</h2>
       </div>
-      <div class="roadmap-grid">
-        <article data-reveal><span>Done · v0.2</span><h3>Bound answer inputs</h3><p>Eight-record evidence, OCR-paired document images, bounded scenery images, and private-output sanitation.</p><b>Performance</b></article>
-        <article data-reveal><span>Now</span><h3>Expand live query matrix</h3><p>Automate category ranking, OCR conjunction, person/place scope, date, negation, event-count, typo, and empty-hard-scope checks on representative devices.</p><b>Quality</b></article>
-        <article data-reveal><span>Next</span><h3>Calibrate episode boundaries</h3><p>Measure event purity and coverage across travel days, dense bursts, multi-day outings, and sparse archives.</p><b>Retrieval</b></article>
-        <article data-reveal><span>Done</span><h3>Restore photo locations</h3><p>9,834 photos now carry readable indexed places through original EXIF; the isolated rebuild preserved every non-location index.</p><b>Metadata</b></article>
-        <article data-reveal><span>Then</span><h3>Production distribution</h3><p>Add product signing, model delivery policy, upgrade migrations, privacy copy, and release telemetry.</p><b>Release</b></article>
-        <article data-reveal><span>Then</span><h3>Evaluate richer follow-ups</h3><p>Use episode structure to suggest “who else,” “what happened that day,” and adjacent-event explorations.</p><b>Delight</b></article>
-      </div>
-    </section>
-
-    <section class="final-cta">
-      <div class="shell" data-reveal>
-        <p>Built for the gallery you already have.</p>
-        <h2>Search everything.<br>Share nothing.</h2>
-        <div>
-          <a class="button button-light" href="https://github.com/ravisankarg/ask">Explore the repository ↗</a>
-          <a class="text-link" href="https://github.com/ravisankarg/ask/blob/main/ASK_GALAXY_MODULE_REQUIREMENTS.md">Module requirements →</a>
-        </div>
+      <div class="boundary-grid">
+        <article class="boundary reveal"><strong>Hard scope first</strong><p>Person, place, time, source, media type, and exclusions constrain retrieval before relevance expansion.</p></article>
+        <article class="boundary reveal"><strong>One visible order</strong><p>The result grid and answer evidence originate from the same merged ranking, with stale records removed.</p></article>
+        <article class="boundary reveal"><strong>Labels stay attached</strong><p>A requested field is resolved through its own label, so nearby dates or numbers cannot silently replace it.</p></article>
+        <article class="boundary reveal"><strong>Local by default</strong><p>Personal records, query processing, retrieval, and answer generation remain on the device.</p></article>
       </div>
     </section>
   </main>
 
-  <footer>
-    <div class="shell">
-      <div class="brand footer-brand"><span class="brand-mark">✦</span><span>Ask Galaxy</span></div>
-      <p>Local-first Android gallery intelligence.</p>
-      <p>Architecture snapshot · July 2026</p>
-    </div>
-  </footer>
-
+  <footer class="footer wrap"><span>Ask Galaxy</span><span>Private search for personal context</span><a href="https://github.com/ravisankarg/ask">github.com/ravisankarg/ask ↗</a></footer>
   <script src="app.js"></script>
 </body>
 </html>

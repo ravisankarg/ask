@@ -39,6 +39,7 @@ name = "askgalaxy-native"
 version = "0.1.0"
 dependencies = [
  "jni",
+ "sentencepiece-rs",
  "tokenizers",
  "turbovec",
 ]
@@ -1273,6 +1274,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "sentencepiece-rs"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bc4483945bfd66b8727ed59005af1543d3d966ca92f9bc065bfef532de1d7e8"
 
 [[package]]
 name = "seq-macro"

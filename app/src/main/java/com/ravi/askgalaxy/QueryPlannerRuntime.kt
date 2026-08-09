@@ -28,7 +28,11 @@ object QueryPlannerRuntime {
         "photo", "photos", "picture", "pictures", "image", "images",
         "video", "videos",
     )
-    private val isoDateToken = Regex("\\b\\d{4}(?:-\\d{2}(?:-\\d{2})?)?\\b")
+    /** Words that describe the requested answer, not the record to retrieve. */
+    private val answerAttributeWords = setOf(
+        "cost", "price", "amount", "total", "spent", "spend", "paid", "payment",
+        "number", "numbers", "count", "many", "date", "time", "when",
+    )
     private val explicitOcrAndSyntax = Regex(
         "(?i)\\[ocr\\s*==\\s*\\{[^{}\\]]+\\}\\s*&&\\s*\\{[^{}\\]]+\\}",
     )
@@ -41,6 +45,7 @@ object QueryPlannerRuntime {
             "query_category\\s*==\\s*(doc|scenary|person|location|time)\\s*&&\\s*" +
             "(\\[.*])\\]\\s*$",
     )
+    private val isoDateToken = Regex("\\b\\d{4}(?:-\\d{2}(?:-\\d{2})?)?\\b")
 
     data class PlannedQuery(
         val plan: QueryPlan,
@@ -79,6 +84,7 @@ object QueryPlannerRuntime {
         selfPersonLabel: String? = null,
     ): PlannedQuery {
         val appContext = context.applicationContext
+        val planningQuery = normalizePlannerQuery(query)
         check(isModelInstalled(appContext)) {
             "A selected Gemma 4 model is required for query planning"
         }
@@ -89,7 +95,7 @@ object QueryPlannerRuntime {
                 ?: GemmaRuntime.shared(appContext).createPlannerConversation(plannerSystemInstruction())
             val generationProfiles = ArrayList<GemmaRuntime.GenerationProfile>()
             var candidateRaw = session.generate(
-                plannerUserPrompt(query, knownPersonLabels, selfPersonLabel),
+                plannerUserPrompt(planningQuery, knownPersonLabels, selfPersonLabel),
             )
                 .trim()
                 .take(MAX_OUTPUT_CHARS)
@@ -101,7 +107,7 @@ object QueryPlannerRuntime {
                 try {
                     parsed = compileGemmaPlan(
                         candidateRaw,
-                        query,
+                        planningQuery,
                         knownPersonLabels,
                         selfPersonLabel,
                     )
@@ -127,7 +133,7 @@ object QueryPlannerRuntime {
                     )
                     candidateRaw = session.generate(
                         plannerRepairPrompt(
-                            query = query,
+                            query = planningQuery,
                             invalidOutput = candidateRaw,
                             error = validationError,
                             repairAttempt = repairAttempt,
@@ -139,7 +145,7 @@ object QueryPlannerRuntime {
             Log.i(
                 TAG,
                 "Gemma-only plan accepted: category=${parsed.queryCategory.wireName}, " +
-                    "semantic=${parsed.semanticQueries.size}, ocr=${parsed.ocrTerms.size}, " +
+                    "semantic=${parsed.semanticQueries.size}, " +
                     "people=${parsed.personNames.size}, " +
                     "excludedPeople=${parsed.excludedPersonNames.size}, " +
                     "negative=${parsed.negativeSemanticQueries.size}, recent=${parsed.recentFirst}, " +
@@ -168,41 +174,38 @@ object QueryPlannerRuntime {
     fun effectivePlanJson(plan: QueryPlan): String = canonicalExecutionSpec(plan)
 
     private val COMPACT_PLANNER_SYSTEM_INSTRUCTION = """
-        You are Ask Galaxy's private query compiler. For PLANNER_TASK return ONLY one balanced execution expression: no prose, Markdown, JSON, labels, or explanation.
-
-        Every response starts exactly with one routing header:
-        [answer_needed == true|false] && [query_category == CATEGORY] &&
-        CATEGORY is exactly doc, scenary, person, location, or time.
-
-        Category: doc/OCR always includes insurance, tax/property tax, receipt, bill, invoice, sale deed, government ID/identification, coupon, ticket, marks/mark sheet, certificate, passport, licence, screenshot, card, code, password, total, amount, number, DOB, or expiry. Never classify these documents as scenary. person answers who/whose/which people. location answers where/which place. time answers when/which date/day/time. scenary always includes visible actions or things such as dancing, sleeping, running, playing, hiking, mountains, animals, vehicles, and ordinary objects. A date printed on a document is doc, not time.
-        answer_needed is true for a requested fact or answer; false when the requested result is only photos/videos.
-
-        Use only: people_only, person, mime type, from_date, to_date, location, semantic, ocr. The field is person, never people. Each ordinary bracket is exactly [field == value]. Operators join complete brackets only: && intersection, + document hybrid, - subtraction, comma union. The only exception is document OCR: [ocr == {word1} && {word2}].
-
-        Use [mime type == photos] for explicit photos/images/pictures and videos for explicit videos/clips. Use [person == ExactKnownName] only for a named person's presence; Known people correct spelling only. For self presence, use self_person. Never use a face/person predicate for document ownership; put the owner name in OCR. For only/alone, add people_only with the complete allowed set. Keep one explicit place in location. Use ISO dates only when requested. Use SORT_DATE for time/latest/earliest and SORT_LOC for plural places or north-to-south.
-
-        semantic is one compact visual/document phrase. Every doc plan has exactly one fused hybrid: [[semantic == document phrase] + [ocr == {essential} && {words}]]. OCR is doc-only, has 2-6 co-occurring words, and never uses self/me/my/owner aliases. Complete subtraction before a final sort. Maximum eight retrieval predicates.
-
-        Valid examples (all follow the required header):
-        beach photos => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [semantic == beach]]
-        photos of Ravi only => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ravi] && [people_only == Ravi]]
-        Ramani only photos last week => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ramani] && [people_only == Ramani] && [from_date == 2026-07-20] && [to_date == 2026-07-26]]
-        how many places Ramani visited last year => [answer_needed == true] && [query_category == location] && [[person == Ramani] && [from_date == 2025-01-01] && [to_date == 2025-12-31]] SORT_LOC
-        when is Ramani birthday => [answer_needed == true] && [query_category == time] && [[person == Ramani] && [semantic == birthday]] SORT_DATE
-        Ramani dancing => [answer_needed == false] && [query_category == scenary] && [[person == Ramani] && [semantic == dancing]]
-        Ravi and Ramani => [answer_needed == false] && [query_category == scenary] && [[person == Ravi] && [person == Ramani]]
-        Ravi and Ramani in 2015 => [answer_needed == false] && [query_category == scenary] && [[person == Ravi] && [person == Ramani] && [from_date == 2015-01-01] && [to_date == 2015-12-31]]
-        Ravi and Ramani alone at the beach => [answer_needed == false] && [query_category == scenary] && [[mime type == photos] && [person == Ravi] && [person == Ramani] && [people_only == "Ravi, Ramani"] && [semantic == beach]]
-        who is in these beach photos => [answer_needed == true] && [query_category == person] && [[mime type == photos] && [semantic == beach]]
-        where was the lighthouse photo taken => [answer_needed == true] && [query_category == location] && [[mime type == photos] && [semantic == lighthouse]]
-        when did I visit Goa => [answer_needed == true] && [query_category == time] && [location == Goa] SORT_DATE
-        who was with me at dinner on 5 October 2025 => [answer_needed == true] && [query_category == person] && [[person == Ravi] && [from_date == 2025-10-05] && [to_date == 2025-10-05] && [semantic == dinner]]
-        Ravi passport number => [answer_needed == true] && [query_category == doc] && [[semantic == passport identity document] + [ocr == {Ravi} && {passport}]]
-        how much is Odyssey movie => [answer_needed == true] && [query_category == doc] && [[semantic == Odyssey movie ticket] + [ocr == {Odyssey} && {ticket}]]
-        what date is printed on my Odyssey movie ticket => [answer_needed == true] && [query_category == doc] && [[semantic == Odyssey movie ticket printed date] + [ocr == {Odyssey} && {ticket}]]
-        how much did I spend last month => [answer_needed == true] && [query_category == doc] && [[from_date == LAST_MONTH_START] && [to_date == LAST_MONTH_END] && [[semantic == purchase receipts] + [ocr == {total} && {amount}]]]
-        what bike did I have => [answer_needed == true] && [query_category == scenary] && [semantic == motorcycle bike]
-        show the clearest national park photo excluding selfies => [answer_needed == false] && [query_category == scenary] && [[[mime type == photos] && [semantic == clear national park landscape]] - [semantic == selfie]]
+        You are Ask Galaxy's private query compiler. For PLANNER_TASK return ONLY one balanced expression: no prose, Markdown, JSON, labels, or explanation.
+        Emit only these query fields: person, location, time, semantic, keyword, and optional mime type. Do not emit query_category, answer_needed, ocr, people_only, metadata, dates, or any other field. Emit mime type when the user explicitly requests photos, videos, pdf, doc (the file format), messages, sms, calendar, contacts, call logs, or files, or when the user clearly asks about calling/speaking/phone history or texting/message history. Never infer it from the content word document/documents. A document may be a photographed gallery image and must remain searchable there. Use the canonical values photos, videos, pdf, doc, messages, sms, calendar, contacts, call_logs, or files.
+        semantic is the meaningful searchable source/evidence concept, rewritten or typo-corrected from the user's intent. It must describe what record, object, document, scene, or event should be searched—not the attribute the user wants extracted. Remove question words, requested attributes such as cost/price/amount/number, time/date words, locations, person names, and MIME words because those have no semantic meaning there; put structured values in their own fields. For example, "SFO to London flight time" means [semantic == flight ticket], not "flight time". A document is searched through its semantic document meaning; do not create an OCR predicate. Natural questions about calling, speaking, phoning, or call history must use [mime type == call_logs] and a call-history semantic. Natural questions about texting, messages, SMS, or what someone wrote must use [mime type == messages] and a message-conversation semantic; never put the sender name in that semantic because sender identity is a hard sender scope.
+        time is the actual temporal constraint: an ISO date, date range, relative period such as last week, year/month, or time of day. Never use event verbs or generic labels such as time, date, when, visit, went, happened, or recent as the value of time.
+        keyword is mandatory whenever the query contains searchable content. Extract every unique meaningful content word or entity from the user's intent, including nouns, verbs, adjectives, compound-term components, corrected misspellings, explicit person names, and locations. Do not put generic record/container descriptors such as ticket, receipt, bill, invoice, document, file, message, calendar, contact, call log, record, event, or booking in keyword; keep those in semantic context. Person and location words must remain in keyword: gallery retrieval uses them as hybrid lexical evidence alongside structured person/location predicates, while other app sources have no equivalent metadata predicates. Do not put requested answer attributes such as cost, price, amount, total, spent, paid, count, or number in keyword; they are references to information to extract, not record text. Do not put a bare number-reference word in keyword. Exclude question scaffolding, dates/numbers, and MIME words represented by a mime type predicate. Correct split or misspelled proper names when possible: "spyde man" refers to the entity "spiderman", so use {spiderman}, not {spyde} and {man}. Write each keyword as its own brace; keyword is never a phrase: [keyword == {word1} && {word2} && {word3}].
+        Possessive and relationship words must resolve to structured identity/media fields. "my photos", "photos of me", or "self photos" means [person == the exact self_person label supplied in PLANNER_TASK] plus [mime type == photos]; if self_person is Ravi, emit [person == Ravi], never literal Self. Apply the same self replacement for my/me/mine/myself and equivalent relationship wording wherever it means the user's identity. Never put photos, videos, pdf, or doc in keyword.
+        Relationship queries such as "sister photos", "my sister photos", "brother videos", or "photos of my mother" must emit the corrected relationship as a symbolic replaceable person value: [person == {_sister_}], [person == {_brother_}], or [person == {_mother_}]. Do not resolve or validate relationship words against known_people in QP; a later search layer replaces the symbolic relationship token with the real person label. Correct close misspellings before wrapping the relationship, so "my mon number" becomes {_mom_}.
+        Use && for intersection, + for additive/fused intent, - for exclusion, and comma for alternatives. Operators join complete predicates or groups only. Every without, with out, excluding, exclude, except, but not, not, or no clause must be a subtraction group: without Ravi subtracts [person == Ravi], without glasses subtracts [semantic == glasses], not from 2022 subtracts the 2022 time range, and not from Goa subtracts [location == Goa]. Do not leave a negative value in positive semantic or keyword.
+        Examples:
+        beach photos => [[mime type == photos] && [semantic == beach] && [keyword == {beach}]]
+        spyde man move cost => [[semantic == spider man movie ticket] && [keyword == {spiderman} && {movie}]]
+        my photos (self_person=Ravi) => [[person == Ravi] && [mime type == photos]]
+        sister photos => [[person == {_sister_}] && [mime type == photos]]
+        my sister photos => [[person == {_sister_}] && [mime type == photos]]
+        my mon number => [person == {_mom_}] && [semantic == mom contact]
+        Ravi dancing in Goa => [[[semantic == dancing] && [keyword == {Ravi} && {dancing} && {Goa}]] && [person == Ravi] && [location == Goa]]
+        who is in beach photos => [semantic == beach] && [keyword == {beach}]
+        where was the lighthouse photo taken => [location == lighthouse] && [semantic == lighthouse] && [keyword == {lighthouse}]
+        when did I visit Goa on 5 October 2025 => [location == Goa] && [time == 2025-10-05]
+        photos from last week => [time == last week] && [mime type == photos]
+        messages from Ravi => [[mime type == messages] && [person == Ravi]]
+        when did I call Ravi last time => [[mime type == call_logs] && [semantic == call history] && [keyword == {Ravi}]]
+        what did Vanraj text me last week => [[mime type == messages] && [semantic == message conversation] && [keyword == {Vanraj}] && [time == last week]]
+        without Ravi => [semantic == all] - [person == Ravi]
+        excluding Ramani => [semantic == all] - [person == Ramani]
+        without glasses => [semantic == all] - [semantic == glasses]
+        not from 2022 => [semantic == all] - [[time == 2022-01-01] && [time == 2022-12-31]]
+        not from Goa => [semantic == all] - [location == Goa]
+        Ravi passport number => [semantic == passport identity document] && [keyword == {Ravi} && {passport}]
+        what is my Aadhaar number => [semantic == Aadhaar identity document] && [keyword == {Aadhaar}]
+        SFO to London flight time => [[location == SFO] && [location == London] && [semantic == flight ticket] && [keyword == {SFO} && {London} && {flight}]]
+        show photos excluding selfies => [mime type == photos] - [semantic == selfie]
     """.trimIndent()
 
     /** Stable preface placed in the conversation KV cache before a query arrives. */
@@ -331,9 +334,7 @@ object QueryPlannerRuntime {
             validator_error=$safeError
             invalid_expression=$safeOutput
             Return only a new balanced expression. Do not copy the invalid expression.
-            Required header exactly:
-            [answer_needed == ${AnswerIntentPolicy.expected(query)}] && [query_category == ${QueryCategoryConstraintPolicy.expectedCategory(query).wireName}] &&
-            Ordinary brackets contain one field == value; operators appear only between complete brackets. Use person, never people. OCR alone may use [ocr == {word1} && {word2}]. A doc plan needs [[semantic == phrase] + [ocr == {word1} && {word2}]]. Keep the concrete visible object/action in scenary semantic.
+            Return only a balanced expression. Ordinary brackets contain one field == value; operators appear only between complete brackets. Use only semantic, location, person, time, keyword, and optional mime type. Emit mime type only when explicitly requested; allowed values are photos, videos, pdf, doc (the file format), messages, sms, calendar, contacts, call_logs, and files. The content words document/documents never create a MIME scope because a document may be a photographed gallery image. Keyword must retain explicit person and location names because gallery uses `(semantic OR keyword) AND person AND location AND time`, while other app sources use `(semantic OR keyword)` without separate metadata fields. Exclude requested attributes such as cost, price, amount, total, spent, paid, count, and number, plus stopwords, question scaffolding, dates/numbers, and represented MIME words. Use one brace per word, never a phrase. Never emit query_category, answer_needed, ocr, or people_only. Every without, excluding, not, or no clause must use `-`, for example without glasses => [semantic == all] - [semantic == glasses] and not from Goa => [semantic == all] - [location == Goa]. Keep the concrete visible object/action in semantic and remove requested answer attributes and numbers from semantic. For "spyde man move cost", return semantic "spider man movie ticket" and keywords {spiderman}, {movie}, {ticket}. For "my photos" with self_person Ravi, return person Ravi and mime type photos.
         """.trimIndent()
     }
 
@@ -356,6 +357,55 @@ object QueryPlannerRuntime {
 
     private fun cleanQuery(query: String): String =
         query.replace(Regex("[\\r\\n]+"), " ").trim().take(MAX_QUERY_CHARS)
+
+    private fun normalizePlannerQuery(query: String): String =
+        query.trim()
+            .replace(Regex("(?i)\\bwith\\s+out\\b"), "without")
+            .replace(Regex("\\s+"), " ")
+
+    /** Removes natural-language exclusion spans before extracting positive scopes. */
+    private fun removeNaturalNegativeClauses(query: String): String {
+        val normalized = normalizePlannerQuery(query)
+        val marker = Regex(
+            "(?i)\\b(?:without|excluding|exclude|except|but\\s+not|not|no)\\b",
+        )
+        val boundary = Regex(
+            "(?i)\\b(?:in|at|from|during|on|for|with|while|where|that|show|find|display)\\b|" +
+                "\\b(?:and|but)\\b",
+        )
+        val ranges = ArrayList<IntRange>()
+        var cursor = 0
+        while (cursor < normalized.length) {
+            val match = marker.find(normalized, cursor) ?: break
+            val markerText = match.value.lowercase()
+            var valueStart = match.range.last + 1
+            // Keep the preposition inside "not from/in/at ..." so the date or
+            // place after it cannot be mistaken for a positive constraint.
+            if (markerText == "not" || markerText == "no") {
+                Regex("(?i)^\\s+(?:from|in|at|during|on)\\b")
+                    .find(normalized, valueStart)
+                    ?.let { valueStart = it.range.last + 1 }
+            }
+            val nextMarker = marker.find(normalized, valueStart)?.range?.first
+            val nextBoundary = boundary.find(normalized, valueStart)?.range?.first
+            val end = listOfNotNull(nextMarker, nextBoundary)
+                .filter { it > valueStart }
+                .minOrNull()
+                ?: normalized.length
+            ranges += match.range.first until end
+            cursor = end
+        }
+        if (ranges.isEmpty()) return normalized
+        return buildString {
+            var previousEnd = 0
+            ranges.forEach { range ->
+                append(normalized, previousEnd, range.first)
+                append(' ')
+                previousEnd = range.last + 1
+            }
+            append(normalized, previousEnd, normalized.length)
+        }.replace(Regex("\\s+"), " ").trim()
+    }
 
     private fun singleLineForLog(value: String): String =
         value.replace(Regex("[\\r\\n]+"), " ")
@@ -383,6 +433,7 @@ object QueryPlannerRuntime {
             Log.w(TAG, "Recovered one missing planner envelope bracket: ${singleLineForLog(candidate)}")
         }
         val modelSpec = QueryExecutionSpec.parse(repairedEnvelope)
+        validatePlannerFields(modelSpec.root)
         val normalizedSpec = normalizeFiniteConstraints(
             modelSpec,
             query,
@@ -390,7 +441,13 @@ object QueryPlannerRuntime {
             selfPersonLabel,
         )
         validatePlannerOcrSyntax(normalizedSpec.render())
-        val plan = ExecutionSpecCompiler.compile(normalizedSpec)
+        val plan = ExecutionSpecCompiler.compile(normalizedSpec).copy(
+            // Category is derived from the user's requested result type. It
+            // is routing metadata, not a planner-authored retrieval field.
+            queryCategory = QueryCategoryConstraintPolicy.expectedCategory(query),
+            needsAnswer = AnswerIntentPolicy.expected(query),
+            answerIntentExplicit = AnswerIntentPolicy.expected(query),
+        )
         validateCompiledPlan(query, knownPersonLabels, plan, selfPersonLabel)
         return plan
     }
@@ -422,20 +479,32 @@ object QueryPlannerRuntime {
             .toMutableList()
         // A printed name identifies a document through OCR; it is not a face
         // constraint. Keep that distinction before adding scene/person fields.
+        val mentionedExcludedPeople = mentionedKnownPeople.filter {
+            QueryStructuredIntentPolicy.isNegatedMention(query, it)
+        }
         val namedPeople = if (expectedCategory == QueryCategory.DOC) {
             mutableListOf()
         } else {
-            mentionedKnownPeople
+            mentionedKnownPeople.filterNot { it in mentionedExcludedPeople }.toMutableList()
         }
+        val excludedNamedPeople = mentionedExcludedPeople.toMutableList()
         if (
             SelfPersonQueryPolicy.referencesSelfAsPerson(query) &&
             !selfPersonLabel.isNullOrBlank() &&
-            namedPeople.none { it.equals(selfPersonLabel, ignoreCase = true) }
+            namedPeople.none { it.equals(selfPersonLabel, ignoreCase = true) } &&
+            excludedNamedPeople.none { it.equals(selfPersonLabel, ignoreCase = true) }
         ) {
-            namedPeople += selfPersonLabel
+            if (SelfPersonQueryPolicy.isNegatedSelfReference(query)) {
+                excludedNamedPeople += selfPersonLabel
+            } else {
+                namedPeople += selfPersonLabel
+            }
         }
         val expectedMedia = QueryStructuredIntentPolicy.expectedMediaType(query)
-        val dateBounds = QueryScopeParser.explicitDateBoundsFromQuery(query)
+        // A negated year/month must never become the positive scope as well.
+        // "photos not from 2022" means all matching photos minus 2022.
+        val positiveConstraintQuery = removeNaturalNegativeClauses(query)
+        val dateBounds = QueryScopeParser.explicitDateBoundsFromQuery(positiveConstraintQuery)
         val metadataOnly = QueryStructuredIntentPolicy.isMetadataOnlyIntent(query)
         val isDocumentQuery = expectedCategory == QueryCategory.DOC
         var retainedExpectedMedia = false
@@ -521,41 +590,86 @@ object QueryPlannerRuntime {
             return cleaned.takeIf { it.isNotBlank() } ?: ""
         }
 
-        fun retain(node: ExecutionNode): ExecutionNode? = when (node) {
+        fun retain(node: ExecutionNode, subtract: Boolean = false): ExecutionNode? = when (node) {
             is ExecutionNode.Predicate -> when (node.field) {
-                ExecutionField.ANSWER_NEEDED,
                 ExecutionField.QUERY_CATEGORY,
                 ExecutionField.FROM_DATE,
                 ExecutionField.TO_DATE,
                 ExecutionField.PEOPLE_ONLY,
-                -> null
-                ExecutionField.PERSON -> if (namedPeople.isNotEmpty()) null else node
+                -> if (subtract && node.field != ExecutionField.PEOPLE_ONLY) node else null
+                ExecutionField.PERSON -> if (subtract) {
+                    node
+                } else if (
+                    namedPeople.isNotEmpty() ||
+                    excludedNamedPeople.any { it.equals(node.value, ignoreCase = true) }
+                ) {
+                    null
+                } else {
+                    node
+                }
                 ExecutionField.MIME_TYPE -> {
-                    if (expectedMedia == null || node.value == expectedMedia.label()) {
-                        retainedExpectedMedia = expectedMedia != null
+                    if (subtract) {
+                        node
+                    } else if (expectedMedia != null && node.value == expectedMedia.label()) {
+                        retainedExpectedMedia = true
                         node
                     } else {
                         null
                     }
                 }
                 ExecutionField.SEMANTIC -> {
-                    if (isDocumentQuery || metadataOnly) null else {
+                    if (subtract) {
+                        stripNamedPeople(node.value).takeIf(String::isNotBlank)?.let {
+                            node.copy(value = it)
+                        }
+                    } else if (isDocumentQuery || metadataOnly) null else {
                         stripNamedPeople(node.value).takeIf(String::isNotBlank)?.let {
                             node.copy(value = it)
                         }
                     }
                 }
-                ExecutionField.OCR -> if (isDocumentQuery) null else node
+                ExecutionField.OCR -> if (subtract) node else null
+                ExecutionField.TIME -> {
+                    // Relative and numeric date phrases are canonicalized from
+                    // the user's query below.  A model-authored TIME value can
+                    // be an incorrect endpoint (for example, 2026-12-31 for
+                    // "this year") and would intersect the real bounds into
+                    // an empty result set. Keep TIME only when no deterministic
+                    // date range was derived; subtraction predicates remain
+                    // untouched.
+                    if (subtract || dateBounds == null) node else null
+                }
+                // Person/location terms are deliberately retained in keyword.
+                // Gallery uses them as hybrid lexical evidence; private
+                // sources use them because they have no gallery metadata join.
+                ExecutionField.KEYWORD -> {
+                    if (subtract) {
+                        node
+                    } else {
+                        val kept = node.value
+                            .split(Regex("[^\\p{L}\\p{N}]+"))
+                            .filter { it.isNotBlank() && it.lowercase() !in SearchKeywordPolicy.genericRecordWords }
+                        kept.takeIf { it.isNotEmpty() }?.let {
+                            node.copy(value = it.joinToString(" "))
+                        }
+                    }
+                }
                 else -> node
             }
-            is ExecutionNode.Sorted -> retain(node.value)
+            is ExecutionNode.Sorted -> retain(node.value, subtract)?.let {
+                ExecutionNode.Sorted(it, node.sort)
+            }
             is ExecutionNode.Binary -> {
-                val left = retain(node.left)
-                val right = retain(node.right)
+                val left = retain(node.left, subtract)
+                val right = retain(
+                    node.right,
+                    subtract || node.operator == ExecutionBinaryOperator.SUBTRACT,
+                )
                 when {
                     left != null && right != null -> ExecutionNode.Binary(left, node.operator, right)
                     left != null -> left
-                    else -> right
+                    right != null && node.operator != ExecutionBinaryOperator.SUBTRACT -> right
+                    else -> null
                 }
             }
         }
@@ -565,15 +679,32 @@ object QueryPlannerRuntime {
 
         var root: ExecutionNode? = retain(modelSpec.root)
         if (isDocumentQuery) {
-            val fusedDocumentEvidence = ExecutionNode.Binary(
-                ExecutionNode.Predicate(ExecutionField.SEMANTIC, documentSemantic),
-                ExecutionBinaryOperator.ADD,
-                ExecutionNode.Predicate(ExecutionField.OCR, documentOcr),
-            )
-            root = intersect(root, fusedDocumentEvidence)
+            root = intersect(root, ExecutionNode.Predicate(ExecutionField.SEMANTIC, documentSemantic))
         }
         namedPeople.forEach { label ->
             root = intersect(root, ExecutionNode.Predicate(ExecutionField.PERSON, label))
+        }
+        fun hasSubtractedPerson(node: ExecutionNode?, label: String, subtract: Boolean = false): Boolean =
+            when (node) {
+                null -> false
+                is ExecutionNode.Predicate ->
+                    subtract && node.field == ExecutionField.PERSON &&
+                        node.value.equals(label, ignoreCase = true)
+                is ExecutionNode.Sorted -> hasSubtractedPerson(node.value, label, subtract)
+                is ExecutionNode.Binary ->
+                    hasSubtractedPerson(node.left, label, subtract) ||
+                        hasSubtractedPerson(
+                            node.right,
+                            label,
+                            subtract || node.operator == ExecutionBinaryOperator.SUBTRACT,
+                        )
+            }
+        excludedNamedPeople.filterNot { label -> hasSubtractedPerson(root, label) }.forEach { label ->
+            root = ExecutionNode.Binary(
+                requireNotNull(root),
+                ExecutionBinaryOperator.SUBTRACT,
+                ExecutionNode.Predicate(ExecutionField.PERSON, label),
+            )
         }
         if (QueryStructuredIntentPolicy.requiresExclusivePeople(query)) {
             namedPeople.forEach { label ->
@@ -587,21 +718,7 @@ object QueryPlannerRuntime {
             if (from.isNotBlank()) root = intersect(root, ExecutionNode.Predicate(ExecutionField.FROM_DATE, from))
             if (to.isNotBlank()) root = intersect(root, ExecutionNode.Predicate(ExecutionField.TO_DATE, to))
         }
-        root = intersect(
-            root,
-            ExecutionNode.Predicate(ExecutionField.QUERY_CATEGORY, expectedCategory.wireName),
-        )
-        root = ExecutionNode.Binary(
-            ExecutionNode.Predicate(ExecutionField.ANSWER_NEEDED, AnswerIntentPolicy.expected(query).toString()),
-            ExecutionBinaryOperator.INTERSECT,
-            root,
-        )
-        if (QuerySortConstraintPolicy.requiresDateSort(query, expectedCategory)) {
-            root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
-        } else if (QuerySortConstraintPolicy.requiresLocationSort(query)) {
-            root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)
-        }
-        return QueryExecutionSpec(root)
+        return QueryExecutionSpec(requireNotNull(root) { "QP must contain at least one field" })
     }
 
     /**
@@ -612,25 +729,37 @@ object QueryPlannerRuntime {
      * production validator still run after this recovery.
      */
     internal fun repairUnambiguousEnvelopeBracket(candidate: String): String {
-        // The planner can collapse both fixed routing predicates into a single
-        // opening bracket: `[answer_needed == false && query_category ==
-        // person && [people_only == Ravi]]`. Recover only that finite grammar
-        // shell, retaining the model-authored retrieval predicate untouched.
-        collapsedRoutingEnvelope.matchEntire(candidate)?.let { match ->
-            return "[answer_needed == ${match.groupValues[1]}] && " +
-                "[query_category == ${match.groupValues[2]}] && ${match.groupValues[3]}"
-        }
-        return missingEnvelopeBracket.replace(candidate) { match ->
-            "[${match.groupValues[1]} == ${match.groupValues[2]}] &&"
-        }
+        return candidate
     }
 
     internal fun validatePlannerOcrSyntax(candidate: String) {
-        if (Regex("(?i)\\[query_category\\s*==\\s*doc]").containsMatchIn(candidate)) {
-            require(explicitOcrAndSyntax.containsMatchIn(candidate)) {
-                "Doc OCR must use explicit AND syntax: [ocr == {word1} && {word2}]"
+        require(!Regex("(?i)\\[(?:answer_needed|ocr)\\s*==").containsMatchIn(candidate)) {
+            "answer_needed and ocr are not supported QP fields"
+        }
+    }
+
+    private fun validatePlannerFields(root: ExecutionNode) {
+        val allowed = setOf(
+            ExecutionField.PERSON,
+            ExecutionField.LOCATION,
+            ExecutionField.TIME,
+            ExecutionField.SEMANTIC,
+            ExecutionField.KEYWORD,
+            ExecutionField.MIME_TYPE,
+        )
+        fun visit(node: ExecutionNode) {
+            when (node) {
+                is ExecutionNode.Predicate -> require(node.field in allowed) {
+                    "Unsupported QP field '${node.field.wireName}'. Allowed fields: person, location, time, semantic, keyword, mime type"
+                }
+                is ExecutionNode.Sorted -> visit(node.value)
+                is ExecutionNode.Binary -> {
+                    visit(node.left)
+                    visit(node.right)
+                }
             }
         }
+        visit(root)
     }
 
     /** Re-runs every post-parse production validator against a compiled plan. */
@@ -640,14 +769,14 @@ object QueryPlannerRuntime {
         plan: QueryPlan,
         selfPersonLabel: String? = null,
     ) {
-        QueryCategoryConstraintPolicy.validate(query, plan)
         (plan.personNames + plan.excludedPersonNames).forEach { candidate ->
             val presentVerbatim = containsPhrase(query, candidate)
+            val symbolicRelationship = symbolicRelationshipAppearsInQuery(query, candidate)
             val knownCorrection = knownPersonLabels.any { it.equals(candidate, ignoreCase = true) } &&
                 QuerySpellingMatcher.isPlausibleCorrection(query, candidate)
             val selfAlias = selfPersonLabel?.equals(candidate, ignoreCase = true) == true &&
                 SelfPersonQueryPolicy.referencesSelfAsPerson(query)
-            require(presentVerbatim || knownCorrection || selfAlias) {
+            require(presentVerbatim || symbolicRelationship || knownCorrection || selfAlias) {
                 "Person '$candidate' is neither present in the query nor a close Known people correction"
             }
         }
@@ -659,17 +788,102 @@ object QueryPlannerRuntime {
                 "Location '$location' is not a spelling correction of a query value"
             }
         }
-        QueryStructuredIntentPolicy.validate(query, knownPersonLabels, plan, selfPersonLabel)
-        if (plan.answerIntentExplicit && plan.queryCategory == QueryCategory.DOC) {
-            require(plan.needsAnswer) { "Document questions require answer_needed == true" }
-        }
-        if (plan.answerIntentExplicit) require(plan.needsAnswer == AnswerIntentPolicy.expected(query)) {
-            "answer_needed does not match the query intent"
-        }
-        QueryDateConstraintPolicy.validate(query, plan)
-        QuerySortConstraintPolicy.validate(query, plan)
         validateSemanticValues(plan)
-        validateOcrKeywords(plan)
+        validateTimeValue(plan)
+        validateKeywordValues(plan)
+        validateRequestedAnswerAttributes(query, plan)
+
+        QueryStructuredIntentPolicy.expectedMediaType(query)?.let { expectedMedia ->
+            require(plan.mediaType == expectedMedia) {
+                "Explicit media request requires [mime type == ${expectedMedia.label()}]"
+            }
+        }
+        if (SelfPersonQueryPolicy.referencesSelfAsPerson(query)) {
+            require(!selfPersonLabel.isNullOrBlank()) {
+                "Self-media query requires a tagged self person"
+            }
+            require(plan.personNames.any { it.equals(selfPersonLabel, ignoreCase = true) }) {
+                "Self-media query must use the tagged self person '$selfPersonLabel'"
+            }
+        }
+    }
+
+    private fun validateTimeValue(plan: QueryPlan) {
+        val value = plan.timeHint.trim()
+        if (value.isBlank()) return
+        val actualTime = Regex(
+            "(?i)(?:\\b\\d{4}(?:-\\d{2}(?:-\\d{2})?)?\\b|\\b(?:today|yesterday|tomorrow|last|this|next|previous)\\b|" +
+                "\\b(?:morning|afternoon|evening|night|noon|midnight)\\b|\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)?\\b)",
+        )
+        require(actualTime.containsMatchIn(value)) {
+            "time must contain an actual date, period, or time of day, not '$value'"
+        }
+    }
+
+    private fun validateKeywordValues(plan: QueryPlan) {
+        val mimeWords = setOf(
+            "photo", "photos", "video", "videos", "pdf", "doc", "document", "documents",
+            "message", "messages", "sms", "text", "texts", "calendar", "calendars",
+            "appointment", "appointments", "contact", "contacts", "call", "calls",
+            "call_log", "call_logs", "file", "files",
+        )
+        plan.keywordTerms.forEach { value ->
+            val words = value.split(Regex("[^\\p{L}\\p{N}]+"))
+                .filter(String::isNotBlank)
+            require(words.isNotEmpty()) { "keyword must contain one or more words" }
+            require(words.none { it.lowercase() in mimeWords }) {
+                "keyword must not contain MIME type words"
+            }
+            require(words.none { it.lowercase() in setOf("number", "numbers", "num", "no") }) {
+                "keyword must not contain a number-reference word"
+            }
+        }
+    }
+
+    private fun validateRequestedAnswerAttributes(query: String, plan: QueryPlan) {
+        val normalized = query.lowercase()
+        val requestedAttributes = answerAttributeWords.filter { word ->
+            Regex("\\b${Regex.escape(word)}\\b").containsMatchIn(normalized)
+        }.toSet()
+        if (requestedAttributes.isEmpty()) return
+        val keywordWords = plan.keywordTerms
+            .flatMap { it.split(Regex("[^\\p{L}\\p{N}]+")) }
+            .filter(String::isNotBlank)
+            .map(String::lowercase)
+        require(keywordWords.none { it in requestedAttributes }) {
+            "keyword must describe the record, not requested answer attributes: " +
+                requestedAttributes.joinToString(", ")
+        }
+        val semanticWords = plan.semanticQueries
+            .flatMap { it.split(Regex("[^\\p{L}\\p{N}]+")) }
+            .filter(String::isNotBlank)
+            .map(String::lowercase)
+        require(semanticWords.none { it in requestedAttributes }) {
+            "semantic must describe the record, not requested answer attributes: " +
+                requestedAttributes.joinToString(", ")
+        }
+    }
+
+    private fun symbolicRelationshipAppearsInQuery(query: String, candidate: String): Boolean {
+        val symbol = candidate.trim()
+        if (!symbol.startsWith("{_") || !symbol.endsWith("_}")) return false
+        val relationship = symbol.removePrefix("{_").removeSuffix("_}").lowercase()
+        val aliases = mapOf(
+            "mom" to setOf("mom", "mother", "mon"),
+            "dad" to setOf("dad", "father", "dady", "daddy"),
+            "sister" to setOf("sister", "sis"),
+            "brother" to setOf("brother", "bro"),
+            "wife" to setOf("wife"),
+            "husband" to setOf("husband"),
+            "daughter" to setOf("daughter"),
+            "son" to setOf("son"),
+            "grandmother" to setOf("grandmother", "grandma", "granny"),
+            "grandfather" to setOf("grandfather", "grandpa"),
+        )
+        val normalizedQuery = query.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        return aliases[relationship].orEmpty().any { alias ->
+            Regex("\\b${Regex.escape(alias)}\\b").containsMatchIn(normalizedQuery)
+        }
     }
 
     internal fun validateSemanticValues(plan: QueryPlan) {
@@ -733,6 +947,18 @@ object QueryPlannerRuntime {
         return normalizedPhrase.isNotBlank() &&
             " $normalizedText ".contains(" $normalizedPhrase ")
     }
+}
+
+/** Generic container/record labels belong in semantic context, not lexical keywords. */
+internal object SearchKeywordPolicy {
+    val genericRecordWords = setOf(
+        "ticket", "tickets", "receipt", "receipts", "bill", "bills",
+        "invoice", "invoices", "document", "documents", "file", "files",
+        "message", "messages", "sms", "calendar", "calendars", "contact",
+        "contacts", "call", "calls", "log", "logs", "appointment",
+        "appointments", "record", "records", "event", "events", "booking",
+        "bookings",
+    )
 }
 
 /**
@@ -965,20 +1191,33 @@ internal object QueryStructuredIntentPolicy {
         val explicitLocations = explicitLocationCandidates(query, knownPersonLabels)
         if (explicitLocations.size == 1) {
             val expected = explicitLocations.single()
-            require(
-                plan.locationHint.isNotBlank() &&
-                    (
-                        plan.locationHint.equals(expected, ignoreCase = true) ||
-                            QuerySpellingMatcher.areClosePhrases(expected, plan.locationHint)
-                        ),
-            ) {
-                "Explicit place '$expected' requires a location predicate"
+            if (isNegatedValueMention(query, expected)) {
+                require(
+                    hasSubtractedPredicate(
+                        plan.executionSpec,
+                        ExecutionField.LOCATION,
+                        expected,
+                    ),
+                ) {
+                    "Negated place '$expected' requires a subtraction location predicate"
+                }
+            } else {
+                require(
+                    plan.locationHint.isNotBlank() &&
+                        (
+                            plan.locationHint.equals(expected, ignoreCase = true) ||
+                                QuerySpellingMatcher.areClosePhrases(expected, plan.locationHint)
+                            ),
+                ) {
+                    "Explicit place '$expected' requires a location predicate"
+                }
             }
         }
         if (NEGATION_MARKER.containsMatchIn(query)) {
             require(
                 plan.excludedPersonNames.isNotEmpty() ||
-                    plan.negativeSemanticQueries.isNotEmpty(),
+                    plan.negativeSemanticQueries.isNotEmpty() ||
+                    hasAnySubtraction(plan.executionSpec),
             ) {
                 "Explicit exclusion requires a subtraction predicate"
             }
@@ -998,6 +1237,7 @@ internal object QueryStructuredIntentPolicy {
     internal fun expectedMediaType(query: String): QueryMediaType? {
         val tokens = query.split(Regex("[^\\p{L}\\p{N}]+"))
             .filter(String::isNotBlank)
+            .map(String::lowercase)
         val asksPhotos = tokens.any { token ->
             listOf("photo", "photos", "picture", "pictures", "image", "images")
                 .any { canonical -> QuerySpellingMatcher.areClosePhrases(token, canonical) }
@@ -1006,9 +1246,27 @@ internal object QueryStructuredIntentPolicy {
             listOf("video", "videos", "clip", "clips")
                 .any { canonical -> QuerySpellingMatcher.areClosePhrases(token, canonical) }
         }
+        val asksSms = tokens.any { it in setOf("sms", "text", "texts") }
+        val asksMessages = tokens.any { it in setOf("message", "messages") }
+        val asksPdf = tokens.any { it == "pdf" }
+        // "document(s)" is content intent, not a hard file-format request;
+        // photographed documents must remain in the gallery search universe.
+        val asksDoc = tokens.any { it == "doc" }
+        val asksCalendar = tokens.any { it in setOf("calendar", "calendars", "appointment", "appointments") }
+        val asksContacts = tokens.any { it == "contact" || it == "contacts" }
+        val asksCallLogs = tokens.any { it == "call" || it == "calls" || it == "call_logs" }
+        val asksFiles = tokens.any { it == "file" || it == "files" }
         return when {
             asksPhotos && !asksVideos -> QueryMediaType.PHOTOS
             asksVideos && !asksPhotos -> QueryMediaType.VIDEOS
+            asksSms -> QueryMediaType.SMS
+            asksMessages -> QueryMediaType.MESSAGES
+            asksPdf -> QueryMediaType.PDF
+            asksDoc -> QueryMediaType.DOC
+            asksCalendar -> QueryMediaType.CALENDAR
+            asksContacts -> QueryMediaType.CONTACTS
+            asksCallLogs -> QueryMediaType.CALL_LOGS
+            asksFiles -> QueryMediaType.FILES
             else -> null
         }
     }
@@ -1047,13 +1305,52 @@ internal object QueryStructuredIntentPolicy {
             .toList()
     }
 
-    private fun isNegatedMention(query: String, label: String): Boolean {
+    internal fun isNegatedMention(query: String, label: String): Boolean {
         val words = Regex("[\\p{L}\\p{N}]+").findAll(query).toList()
         return words.any { word ->
             QuerySpellingMatcher.areClosePhrases(word.value, label) &&
                 query.substring(maxOf(0, word.range.first - 36), word.range.first)
-                    .matches(Regex("(?is).*\\b(?:without|excluding|except|not|no)\\b\\s*"))
+                    .matches(Regex("(?is).*\\b(?:without|with\\s+out|excluding|exclude|except|but\\s+not|not|no)\\b\\s*"))
         }
+    }
+
+    private fun isNegatedValueMention(query: String, value: String): Boolean {
+        val escaped = Regex.escape(value.trim())
+        return Regex(
+            "(?i)\\b(?:without|with\\s+out|excluding|exclude|except|but\\s+not|no)\\b\\s+(?:the\\s+)?$escaped\\b|" +
+                "\\bnot\\b\\s+(?:(?:from|in|at|to)\\s+)?$escaped\\b",
+        ).containsMatchIn(query)
+    }
+
+    private fun hasSubtractedPredicate(
+        spec: QueryExecutionSpec?,
+        field: ExecutionField,
+        value: String,
+    ): Boolean {
+        if (spec == null) return false
+        fun visit(node: ExecutionNode, subtract: Boolean): Boolean = when (node) {
+            is ExecutionNode.Predicate ->
+                subtract && node.field == field &&
+                    (node.value.equals(value, ignoreCase = true) ||
+                        QuerySpellingMatcher.areClosePhrases(node.value, value))
+            is ExecutionNode.Sorted -> visit(node.value, subtract)
+            is ExecutionNode.Binary ->
+                visit(node.left, subtract) ||
+                    visit(node.right, subtract || node.operator == ExecutionBinaryOperator.SUBTRACT)
+        }
+        return visit(spec.root, false)
+    }
+
+    private fun hasAnySubtraction(spec: QueryExecutionSpec?): Boolean {
+        if (spec == null) return false
+        fun visit(node: ExecutionNode): Boolean = when (node) {
+            is ExecutionNode.Predicate -> false
+            is ExecutionNode.Sorted -> visit(node.value)
+            is ExecutionNode.Binary ->
+                node.operator == ExecutionBinaryOperator.SUBTRACT ||
+                    visit(node.left) || visit(node.right)
+        }
+        return visit(spec.root)
     }
 
     private fun explicitlyRequestsFacePresence(query: String, label: String): Boolean {
@@ -1113,7 +1410,7 @@ internal object QueryStructuredIntentPolicy {
     }
 
     private val NEGATION_MARKER = Regex(
-        "(?i)\\b(?:without|excluding|exclude|except|but\\s+not)\\b",
+        "(?i)\\b(?:without|with\\s+out|excluding|exclude|except|but\\s+not|not|no)\\b",
     )
     private val EVENT_DISCOVERY_TERM = Regex(
         "(?i)\\b(?:outing|wedding|birthday|party|dinner|hiking|trek|camp|camping|" +
@@ -1167,6 +1464,7 @@ internal object SelfPersonQueryPolicy {
             ME_IN_SCENE.containsMatchIn(normalized) ||
             SELF_ACTION.containsMatchIn(normalized) ||
             MY_EVENT_OR_APPEARANCE.containsMatchIn(normalized) ||
+            MY_MEDIA.containsMatchIn(normalized) ||
             Regex("^(?:me|myself|i)\\s+(?:only|alone)$").containsMatchIn(normalized)
     }
 
@@ -1214,6 +1512,9 @@ internal object SelfPersonQueryPolicy {
     private val MY_EVENT_OR_APPEARANCE = Regex(
         "\\bmy\\s+(?:birthday|wedding|trip|vacation|holiday|outing|party|selfie|" +
             "selfies|portrait|portraits|outfit|appearance)\\b",
+    )
+    private val MY_MEDIA = Regex(
+        "\\bmy\\s+(?:photo|photos|picture|pictures|image|images|video|videos|clip|clips|selfie|selfies)\\b",
     )
 }
 

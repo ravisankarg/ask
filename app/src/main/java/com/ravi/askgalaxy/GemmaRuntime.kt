@@ -377,12 +377,11 @@ class GemmaRuntime private constructor(
             temperature = 0.35,
             seed = 29,
         )
-        // Gemma 4 E4B uses the proven 8K mobile configuration.
+        // The answer contract carries the complete selected top-four
+        // evidence block. Keep the graph capacity aligned with the product
+        // contract; request-level visual inputs remain capped at four.
         private const val E4B_MAX_CONTEXT_TOKENS = 8192
-        // LiteRT-LM's Gemma 4 graph must still be created with its compiled
-        // capacity of eight even though Ask Galaxy sends at most four
-        // downscaled scenery images in one answer request.
-        private const val MAX_IMAGES = 8
+        private const val MAX_IMAGES = 4
         private val residentLock = Any()
         private val prefilledPlannerLock = Any()
         private val prefilledAnswerLock = Any()

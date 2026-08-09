@@ -337,12 +337,12 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun ocr_keywords_require_complete_and_match_and_outrank_semantic_only() {
+    fun ocr_keyword_coverage_scales_hybrid_score_and_complete_matches_outrank() {
         val keywords = OcrKeywordPolicy.keywords("Ravi passport Ravi")
 
         assertEquals(listOf("ravi", "passport"), keywords)
-        assertEquals(0f, OcrKeywordPolicy.score("PASSPORT", keywords))
-        assertEquals(0f, OcrKeywordPolicy.score("Ravi", keywords))
+        assertEquals(0.5f, OcrKeywordPolicy.score("PASSPORT", keywords))
+        assertEquals(0.5f, OcrKeywordPolicy.score("Ravi", keywords))
         assertEquals(1.0f, OcrKeywordPolicy.score("Ravi Passport Number", keywords))
         assertFalse(OcrKeywordPolicy.matchesAll("PASSPORT", keywords))
         assertTrue(OcrKeywordPolicy.matchesAll("Ravi Passport Number", keywords))

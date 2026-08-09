@@ -1,0 +1,155 @@
+package com.ravi.askgalaxy
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Bundle
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+/** In-app HF license acceptance followed by a two-artifact authenticated download. */
+class EmbeddingGemmaAuthorizationActivity : Activity() {
+    private lateinit var webView: WebView
+    private lateinit var status: TextView
+    private lateinit var downloadButton: Button
+    private val executor: ExecutorService = Executors.newSingleThreadExecutor()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 24, 20, 20)
+        }
+        root.addView(TextView(this).apply {
+            text = "Sign in to Hugging Face, review and accept Google’s Gemma license, then confirm below. Ask Galaxy downloads only the 512-token TFLite encoder and its SentencePiece tokenizer."
+            textSize = 15f
+            setPadding(0, 0, 0, 12)
+        })
+        status = TextView(this).apply {
+            text = "Waiting for Hugging Face authorization…"
+            textSize = 13f
+            setPadding(0, 0, 0, 8)
+        }
+        root.addView(status)
+        webView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.allowFileAccess = false
+            settings.allowContentAccess = false
+            CookieManager.getInstance().setAcceptCookie(true)
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    ): Boolean {
+                        val host = request?.url?.host.orEmpty()
+                    return host.isNotBlank() && !isAllowedLoginHost(host)
+                    }
+                }
+            loadUrl(HUGGING_FACE_PAGE)
+        }
+        root.addView(webView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            0,
+            1f,
+        ))
+        downloadButton = Button(this).apply {
+            text = "I accepted the license — download the required files"
+            setAllCaps(false)
+            setOnClickListener { confirmDownload() }
+        }
+        root.addView(downloadButton)
+        setContentView(root)
+    }
+
+    private fun confirmDownload() {
+        val cookie = CookieManager.getInstance().getCookie(HUGGING_FACE_ORIGIN).orEmpty()
+        if (cookie.isBlank()) {
+            status.text = "Sign in to Hugging Face first, then accept the Gemma license."
+            Toast.makeText(this, "Hugging Face authorization is not available yet.", Toast.LENGTH_LONG).show()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Download EmbeddingGemma?")
+            .setMessage("Ask Galaxy will download about 184 MB over the current network. The existing gallery and personal index data will be preserved.")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Download") { _, _ -> startDownload(cookie) }
+            .show()
+    }
+
+    private fun startDownload(cookie: String) {
+        downloadButton.isEnabled = false
+        status.text = "Downloading the two required EmbeddingGemma files…"
+        executor.execute {
+            val result = runCatching {
+                val artifacts = listOf(ModelCatalog.embeddingGemma, ModelCatalog.embeddingGemmaTokenizer)
+                ModelInstaller(applicationContext).installArtifacts(artifacts, cookie) { progress ->
+                    val total = progress.bytesTotal
+                    runOnUiThread {
+                        if (!isFinishing) {
+                            status.text = "${progress.artifact.name}: " +
+                                "${formatBytes(progress.bytesDownloaded)} / ${formatBytes(total)}"
+                        }
+                    }
+                }
+                check(artifacts.all { it.isInstalled(applicationContext) }) {
+                    "EmbeddingGemma download did not complete"
+                }
+            }
+            runOnUiThread {
+                CookieManager.getInstance().removeAllCookies(null)
+                CookieManager.getInstance().flush()
+                result.fold(
+                    onSuccess = {
+                        IndexProgressStore(this).update(
+                            IndexProgressStage.EMBEDDING_GEMMA,
+                            ModelCatalog.embeddingGemma.expectedBytes,
+                            ModelCatalog.embeddingGemma.expectedBytes,
+                            completed = true,
+                            phase = "Installed",
+                        )
+                        status.text = "EmbeddingGemma is installed. Starting personal indexing…"
+                        DocumentIndexScheduler.restart(this)
+                        Toast.makeText(this, "Personal indexing started.", Toast.LENGTH_LONG).show()
+                    },
+                    onFailure = { error ->
+                        downloadButton.isEnabled = true
+                        status.text = "Download failed: ${error.message ?: error.javaClass.simpleName}"
+                        Toast.makeText(this, "EmbeddingGemma download failed.", Toast.LENGTH_LONG).show()
+                    },
+                )
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        executor.shutdownNow()
+        webView.destroy()
+        super.onDestroy()
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes < 1_024L * 1_024L -> "${bytes / 1_024L} KB"
+        bytes < 1_024L * 1_024L * 1_024L -> "%.1f MB".format(bytes / (1_024.0 * 1_024.0))
+        else -> "%.1f GB".format(bytes / (1_024.0 * 1_024.0 * 1_024.0))
+    }
+
+    private fun isAllowedLoginHost(host: String): Boolean =
+        host.equals("huggingface.co", ignoreCase = true) ||
+            host.endsWith(".huggingface.co", ignoreCase = true) ||
+            host.equals("accounts.google.com", ignoreCase = true) ||
+            host.equals("github.com", ignoreCase = true) ||
+            host.endsWith(".github.com", ignoreCase = true)
+
+    private companion object {
+        const val HUGGING_FACE_PAGE = "https://huggingface.co/litert-community/embeddinggemma-300m"
+        const val HUGGING_FACE_ORIGIN = "https://huggingface.co"
+    }
+}

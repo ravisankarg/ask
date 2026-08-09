@@ -13,6 +13,7 @@ use tokenizers::utils::truncation::{
     TruncationDirection, TruncationParams, TruncationStrategy,
 };
 use tokenizers::Tokenizer;
+use sentencepiece_rs::SentencePieceProcessor;
 use turbovec::{codebook, IdMapIndex};
 
 struct NativeIndex {
@@ -25,6 +26,10 @@ struct NativeIndex {
 
 struct NativeTokenizer {
     tokenizer: Tokenizer,
+}
+
+struct NativeSentencePiece {
+    processor: SentencePieceProcessor,
 }
 
 /// Minimal read-only view of the persisted TurboQuant payload used for
@@ -466,6 +471,76 @@ pub extern "system" fn Java_com_ravi_askgalaxy_NativeTokenizer_nativeClose(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_ravi_askgalaxy_NativeSentencePiece_nativeOpen(
+    mut env: JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jlong {
+    let path_text: String = match env.get_string(&path) {
+        Ok(value) => value.into(),
+        Err(error) => return error_object(&mut env, format!("Could not read tokenizer path: {error}")) as jlong,
+    };
+    let mut processor = match SentencePieceProcessor::open(&path_text) {
+        Ok(value) => value,
+        Err(error) => return error_object(&mut env, format!("Could not load SentencePiece model: {error}")) as jlong,
+    };
+    // Gemma tokenization adds BOS but not EOS. The LiteRT graph uses 0 as PAD.
+    if let Err(error) = processor.set_encode_extra_options("bos") {
+        return error_object(&mut env, format!("Could not configure Gemma tokenizer: {error}")) as jlong;
+    }
+    Box::into_raw(Box::new(NativeSentencePiece { processor })) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_ravi_askgalaxy_NativeSentencePiece_nativeEncode(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    text: JString,
+    max_length: jint,
+) -> jintArray {
+    if handle == 0 || max_length <= 0 {
+        return error_object(&mut env, "Invalid SentencePiece handle or length".to_string()) as jintArray;
+    }
+    let native = unsafe { &*(handle as *const NativeSentencePiece) };
+    let text: String = match env.get_string(&text) {
+        Ok(value) => value.into(),
+        Err(error) => return error_object(&mut env, format!("Could not read text: {error}")) as jintArray,
+    };
+    let ids = match native.processor.encode_to_ids(&text) {
+        Ok(value) => value,
+        Err(error) => return error_object(&mut env, format!("Could not tokenize EmbeddingGemma input: {error}")) as jintArray,
+    };
+    let length = max_length as usize;
+    let mut output_ids = vec![0_i32; length];
+    for (index, id) in ids.iter().take(length).enumerate() {
+        output_ids[index] = match i32::try_from(*id) {
+            Ok(value) => value,
+            Err(_) => return error_object(&mut env, format!("SentencePiece ID does not fit INT32: {id}")) as jintArray,
+        };
+    }
+    let output = match env.new_int_array(max_length) {
+        Ok(value) => value,
+        Err(error) => return error_object(&mut env, format!("Could not allocate token IDs: {error}")) as jintArray,
+    };
+    if let Err(error) = env.set_int_array_region(&output, 0, &output_ids) {
+        return error_object(&mut env, format!("Could not write token IDs: {error}")) as jintArray;
+    }
+    output.into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_ravi_askgalaxy_NativeSentencePiece_nativeClose(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    if handle != 0 {
+        drop(unsafe { Box::from_raw(handle as *mut NativeSentencePiece) });
+    }
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_ravi_askgalaxy_NativeVectorIndex_nativeCreate(
     mut env: JNIEnv,
     _class: JClass,
@@ -717,6 +792,70 @@ pub extern "system" fn Java_com_ravi_askgalaxy_NativeVectorIndex_nativeUpsertBat
     if let Err(error) = index.add_with_ids(&values, &ids) {
         throw(&mut env, format!("TurboQuant batch upsert failed: {error}"));
         return JNI_FALSE;
+    }
+    index.prepare();
+    if let Err(error) = persist(native, &index) {
+        throw(&mut env, error);
+        return JNI_FALSE;
+    }
+    if let Ok(updated) = QuantizedVectors::load(&native.path) {
+        if let Ok(mut quantized) = native.quantized.lock() {
+            *quantized = updated;
+        }
+    }
+    JNI_TRUE
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_ravi_askgalaxy_NativeVectorIndex_nativeRemoveBatch(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    ids: JLongArray,
+) -> jboolean {
+    let native = match unsafe { index_ref(handle) } {
+        Ok(value) => value,
+        Err(error) => {
+            throw(&mut env, error);
+            return JNI_FALSE;
+        }
+    };
+    let raw_ids = match read_longs(&mut env, &ids) {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) => {
+            throw(&mut env, "TurboQuant remove batch must contain at least one id");
+            return JNI_FALSE;
+        }
+        Err(error) => {
+            throw(&mut env, error);
+            return JNI_FALSE;
+        }
+    };
+    let mut ids = Vec::with_capacity(raw_ids.len());
+    let mut seen = std::collections::HashSet::with_capacity(raw_ids.len());
+    for id in raw_ids {
+        let id = match u64::try_from(id) {
+            Ok(value) => value,
+            Err(_) => {
+                throw(&mut env, "Vector id must be non-negative");
+                return JNI_FALSE;
+            }
+        };
+        if seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    let mut index = match native.index.lock() {
+        Ok(value) => value,
+        Err(_) => {
+            throw(&mut env, "Native index lock is poisoned");
+            return JNI_FALSE;
+        }
+    };
+    for id in ids {
+        if index.contains(id) {
+            index.remove(id);
+        }
     }
     index.prepare();
     if let Err(error) = persist(native, &index) {

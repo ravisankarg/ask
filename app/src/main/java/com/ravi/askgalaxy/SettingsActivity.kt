@@ -15,6 +15,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.text.util.Linkify
 import android.text.method.LinkMovementMethod
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -58,12 +59,10 @@ class SettingsActivity : Activity() {
         super.onResume()
         // Returning from Android's all-files access screen should immediately
         // start the same complete personal-source pass.
-        val filesProgress = IndexProgressStore(this).read(IndexProgressStage.DOCUMENT_FILES)
-        if (!ModelCatalog.embeddingGemma.isInstalled(this) || filesProgress.error.isNotBlank()) {
-            DocumentIndexScheduler.restart(this)
-        } else {
-            DocumentIndexScheduler.enqueue(this)
-        }
+        // KEEP is intentional here: returning to Settings must not restart a
+        // live pass or create a retry loop after a recorded failure. The
+        // personal-index action below is the explicit retry boundary.
+        DocumentIndexScheduler.enqueue(this)
         handler.post(refresh)
     }
 
@@ -168,6 +167,20 @@ class SettingsActivity : Activity() {
             setLineSpacing(5f, 1f)
         }
         root.addView(models, wrap())
+        root.addView(TextView(this).apply {
+            text = "EmbeddingGemma is gated by Google’s Gemma license. Ask Galaxy will show Hugging Face’s sign-in page, then download only the two files needed for personal indexing after you confirm."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+            setPadding(0, 10, 0, 6)
+        }, wrap())
+        root.addView(Button(this).apply {
+            text = "Authorize and download EmbeddingGemma"
+            setAllCaps(false)
+            setOnClickListener {
+                startActivity(Intent(this@SettingsActivity, EmbeddingGemmaAuthorizationActivity::class.java))
+            }
+        }, wrap())
 
         root.addView(TextView(this).apply {
             text = "Personal sources"
@@ -196,7 +209,7 @@ class SettingsActivity : Activity() {
                         DOCUMENT_PERMISSION_REQUEST,
                     )
                 } else {
-                    DocumentIndexScheduler.enqueue(this@SettingsActivity)
+                    DocumentIndexScheduler.restart(this@SettingsActivity)
                 }
             }
         }, wrap())
@@ -569,8 +582,17 @@ class SettingsActivity : Activity() {
         state: StageProgress,
         now: Long,
     ) {
-        bar.isIndeterminate = state.updatedAtMs > 0L && !state.completed && state.total <= 0L
-        bar.progress = state.percent
+        val isQueued = state.phase.startsWith("queued", ignoreCase = true)
+        // Queued stages are status-only. Do not animate or update a progress
+        // bar until that source actually starts indexing.
+        bar.visibility = if (isQueued || state.updatedAtMs == 0L) View.GONE else View.VISIBLE
+        if (bar.visibility == View.VISIBLE) {
+            bar.isIndeterminate = state.updatedAtMs > 0L && !state.completed && state.total <= 0L
+            bar.progress = state.percent
+        } else {
+            bar.isIndeterminate = false
+            bar.progress = 0
+        }
         label.text = "${stage.label}  ·  ${formatStageProgress(stage, state, now)}"
     }
 
@@ -593,6 +615,13 @@ class SettingsActivity : Activity() {
 
     private fun formatBytes(bytes: Long): String {
         if (bytes < 1_024L * 1_024L) return "${bytes / 1_024L} KB"
+        if (bytes < 1_024L * 1_024L * 1_024L) {
+            return String.format(
+                java.util.Locale.US,
+                "%.1f MB",
+                bytes / (1_024.0 * 1_024.0),
+            )
+        }
         return String.format(
             java.util.Locale.US,
             "%.1f GB",

@@ -14,16 +14,28 @@ class StructuredSearchExecutor(
 ) {
     private var activeQueryCategory: QueryCategory = QueryCategory.SCENARY
 
+    data class ScoredGalleryResults(
+        val media: List<GalleryMedia>,
+        val cosineScores: Map<Long, Float>,
+    )
+
     fun execute(
         spec: QueryExecutionSpec,
-    ): List<GalleryMedia> {
+    ): List<GalleryMedia> = executeScored(spec).media
+
+    fun executeScored(
+        spec: QueryExecutionSpec,
+    ): ScoredGalleryResults {
+        // query_category was removed from QP.  Keep the compatibility value
+        // for downstream answer policy, but retrieval starts with every
+        // gallery row and narrows only on fields actually emitted by QP.
         val queryCategory = spec.requiredQueryCategory()
         activeQueryCategory = queryCategory
-        val categoryAllowlist = database.mediaStoreIdsForQueryCategory(queryCategory)
-        if (categoryAllowlist.isEmpty()) return emptyList()
+        val categoryAllowlist = database.allMediaStoreIds()
+        if (categoryAllowlist.isEmpty()) return ScoredGalleryResults(emptyList(), emptyMap())
         val evaluated = evaluate(spec.root, categoryAllowlist)
         val scoreById = evaluated.scores.filterKeys { it in categoryAllowlist }
-        if (scoreById.isEmpty()) return emptyList()
+        if (scoreById.isEmpty()) return ScoredGalleryResults(emptyList(), emptyMap())
         val rows = database.findByMediaStoreIds(scoreById.keys.toLongArray())
         val comparator = when {
             queryCategory == QueryCategory.DOC -> documentComparator(
@@ -53,7 +65,13 @@ class StructuredSearchExecutor(
         // sets and can legitimately contain hundreds or thousands of rows.
         // Return the complete evaluated set; the UI virtualizes it and the
         // answer Context Picker independently chooses at most 8 items.
-        return rows.sortedWith(comparator)
+        val sorted = rows.sortedWith(comparator)
+        return ScoredGalleryResults(
+            media = sorted,
+            cosineScores = evaluated.cosineScores
+                .filterKeys { it in scoreById }
+                .filterValues { it.isFinite() },
+        )
     }
 
     /**
@@ -132,11 +150,19 @@ class StructuredSearchExecutor(
                     // A low-confidence nearest-neighbor fallback is useful for
                     // positive discovery, but unsafe for exclusions: it could
                     // subtract unrelated photos from an otherwise valid set.
-                    val right = evaluate(
-                        node.right,
-                        categoryAllowlist,
-                        allowSemanticFallback = false,
-                    )
+                    // The negative branch is also scoped to the positive set,
+                    // so "photos excluding selfies" does not search selfies
+                    // across an unrelated MIME/date/person universe first.
+                    val scopedIds = left.scores.keys.intersect(categoryAllowlist)
+                    val right = if (scopedIds.isEmpty()) {
+                        EvaluatedSet()
+                    } else {
+                        evaluate(
+                            node.right,
+                            scopedIds,
+                            allowSemanticFallback = false,
+                        )
+                    }
                     subtract(left, right)
                 }
                 ExecutionBinaryOperator.UNION,
@@ -155,10 +181,10 @@ class StructuredSearchExecutor(
     }
 
     /**
-     * Push a pure structured sibling into semantic retrieval. Besides making
-     * fallback candidates more relevant, this prevents a 512-neighbor search
-     * over the whole category from being emptied later by MIME/person/date
-     * intersection.
+     * Push a pure structured sibling into retrieval before lexical or semantic
+     * ranking. Besides making fallback candidates more relevant, this prevents
+     * a 512-neighbor search over the whole category from being emptied later
+     * by MIME/person/date/place intersection.
      */
     private fun evaluateIntersection(
         node: ExecutionNode.Binary,
@@ -170,27 +196,47 @@ class StructuredSearchExecutor(
         return when {
             !leftHasSemantic && rightHasSemantic -> {
                 val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
-                val narrowed = categoryAllowlist.intersect(left.scores.keys)
-                val right = evaluate(node.right, narrowed, allowSemanticFallback)
+                val scopedIds = left.scores.keys.intersect(categoryAllowlist)
+                // The hard scope is authoritative. Search both semantic and
+                // keyword channels inside it, instead of taking global top-K
+                // neighbours and intersecting them afterwards.
+                val right = if (scopedIds.isEmpty()) {
+                    EvaluatedSet()
+                } else {
+                    evaluate(node.right, scopedIds, allowSemanticFallback)
+                }
                 intersect(left, right)
             }
             leftHasSemantic && !rightHasSemantic -> {
                 val right = evaluate(node.right, categoryAllowlist, allowSemanticFallback)
-                val narrowed = categoryAllowlist.intersect(right.scores.keys)
-                val left = evaluate(node.left, narrowed, allowSemanticFallback)
+                val scopedIds = right.scores.keys.intersect(categoryAllowlist)
+                val left = if (scopedIds.isEmpty()) {
+                    EvaluatedSet()
+                } else {
+                    evaluate(node.left, scopedIds, allowSemanticFallback)
+                }
                 intersect(left, right)
             }
             else -> {
                 val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
                 val right = evaluate(node.right, categoryAllowlist, allowSemanticFallback)
-                intersect(left, right)
+                // semantic and keyword are the two hybrid channels. Their
+                // conjunction in canonical QP means “use both signals”, not
+                // “the same row must be found by both indexes”.
+                if (leftHasSemantic && rightHasSemantic) {
+                    union(left, right, fused = true)
+                } else {
+                    intersect(left, right)
+                }
             }
         }
     }
 
     private fun containsScoredRetrieval(node: ExecutionNode): Boolean = when (node) {
         is ExecutionNode.Predicate ->
-            node.field == ExecutionField.SEMANTIC || node.field == ExecutionField.OCR
+            node.field == ExecutionField.SEMANTIC ||
+                node.field == ExecutionField.KEYWORD ||
+                node.field == ExecutionField.OCR
         is ExecutionNode.Sorted -> containsScoredRetrieval(node.value)
         is ExecutionNode.Binary ->
             containsScoredRetrieval(node.left) || containsScoredRetrieval(node.right)
@@ -206,31 +252,42 @@ class StructuredSearchExecutor(
             ExecutionField.ANSWER_NEEDED -> hardSet(categoryAllowlist)
             ExecutionField.PERSON -> {
                 val labels = database.resolveNamedPersonLabels(listOf(predicate.value))
-                hardSet(database.mediaStoreIdsForPersonLabels(labels))
+                hardSet(database.mediaStoreIdsForPersonLabels(labels).intersect(categoryAllowlist))
             }
             ExecutionField.PEOPLE_ONLY -> {
                 val labels = database.resolveNamedPersonLabels(predicate.value.split(','))
-                hardSet(database.mediaStoreIdsForOnlyPersonLabels(labels))
+                hardSet(database.mediaStoreIdsForOnlyPersonLabels(labels).intersect(categoryAllowlist))
             }
             ExecutionField.MIME_TYPE -> {
                 val type = requireNotNull(QueryMediaType.fromToken(predicate.value)) {
                     "Invalid canonical MIME value '${predicate.value}'"
                 }
-                hardSet(database.mediaStoreIdsForMediaType(type))
+                hardSet(database.mediaStoreIdsForMediaType(type).intersect(categoryAllowlist))
             }
-            ExecutionField.FROM_DATE -> evaluateDate(fromDate = predicate.value)
-            ExecutionField.TO_DATE -> evaluateDate(toDate = predicate.value)
+            ExecutionField.FROM_DATE -> evaluateDate(
+                fromDate = predicate.value,
+                categoryAllowlist = categoryAllowlist,
+            )
+            ExecutionField.TO_DATE -> evaluateDate(
+                toDate = predicate.value,
+                categoryAllowlist = categoryAllowlist,
+            )
+            ExecutionField.TIME -> evaluateTime(predicate.value, categoryAllowlist)
             ExecutionField.LOCATION -> {
                 val ids = database.mediaStoreIdsMatchingLocation(predicate.value)
                     ?: metadataReader.mediaStoreIdsMatchingLocation(predicate.value)
                     ?: emptySet()
-                hardSet(ids)
+                hardSet(ids.intersect(categoryAllowlist))
             }
             ExecutionField.SEMANTIC -> evaluateSemantic(
                 predicate.value,
                 categoryAllowlist,
                 allowSemanticFallback,
                 queryCategory = activeQueryCategory,
+            )
+            ExecutionField.KEYWORD -> evaluateOcrKeywords(
+                predicate.value,
+                categoryAllowlist,
             )
             ExecutionField.OCR -> evaluateOcrKeywords(
                 predicate.value,
@@ -241,6 +298,7 @@ class StructuredSearchExecutor(
     private fun evaluateDate(
         fromDate: String = "",
         toDate: String = "",
+        categoryAllowlist: Set<Long>,
     ): EvaluatedSet {
         val scope = QueryScopeParser.parse(
             timeHint = "",
@@ -251,7 +309,21 @@ class StructuredSearchExecutor(
         val ids = database.mediaStoreIdsMatchingTime(scope)
             ?: metadataReader.mediaStoreIdsMatchingTime(scope)
             ?: emptySet()
-        return hardSet(ids)
+        return hardSet(ids.intersect(categoryAllowlist))
+    }
+
+    private fun evaluateTime(
+        value: String,
+        categoryAllowlist: Set<Long>,
+    ): EvaluatedSet {
+        val scope = QueryScopeParser.parse(
+            timeHint = value,
+            locationHint = "",
+        ).time ?: return EvaluatedSet()
+        val ids = database.mediaStoreIdsMatchingTime(scope)
+            ?: metadataReader.mediaStoreIdsMatchingTime(scope)
+            ?: emptySet()
+        return hardSet(ids.intersect(categoryAllowlist))
     }
 
     private fun evaluateSemantic(
@@ -271,7 +343,11 @@ class StructuredSearchExecutor(
         val strictSemantic = nearest.filter {
             GallerySemanticIndexer.isAcceptedSemanticScore(it.score)
         }
-        val metadata = database.searchMetadataRanked(value, SEMANTIC_CANDIDATE_LIMIT)
+        val metadata = database.searchMetadataRanked(
+            value,
+            SEMANTIC_CANDIDATE_LIMIT,
+            allowedMediaStoreIds = categoryAllowlist,
+        )
             .filter { it.media.mediaStoreId in categoryAllowlist }
         val semantic = SemanticFallbackPolicy.select(
             strictMatches = strictSemantic,
@@ -305,7 +381,8 @@ class StructuredSearchExecutor(
                 existing * SEMANTIC_WEIGHT + normalized * METADATA_WEIGHT
             }
         }
-        return EvaluatedSet(scores)
+        val cosineScores = semantic.associate { it.mediaStoreId to it.score }
+        return EvaluatedSet(scores = scores, cosineScores = cosineScores)
     }
 
     private fun evaluateOcrKeywords(
@@ -318,14 +395,15 @@ class StructuredSearchExecutor(
         val matches = database.searchOcrKeywordsRanked(
             keywords = keywords,
             limit = OCR_CANDIDATE_LIMIT,
+            allowedMediaStoreIds = categoryAllowlist,
         )
         val scores = LinkedHashMap<Long, Float>()
         matches.forEach { match ->
             if (match.media.mediaStoreId in categoryAllowlist) {
-                scores[match.media.mediaStoreId] = OcrKeywordPolicy.PERFECT_MATCH_SCORE
+                scores[match.media.mediaStoreId] = match.score
             }
         }
-        return EvaluatedSet(scores)
+        return EvaluatedSet(scores = scores, keywordCoverage = scores)
     }
 
     private fun hardSet(ids: Set<Long>): EvaluatedSet =
@@ -336,38 +414,74 @@ class StructuredSearchExecutor(
         right: EvaluatedSet,
         fused: Boolean,
     ): EvaluatedSet {
+        val keywordReference = (left.cosineScores.values + right.cosineScores.values)
+            .maxOrNull()
+            ?.coerceIn(0f, 1f)
+            ?: 1f
         val scores = LinkedHashMap(left.scores)
         right.scores.forEach { (id, score) ->
-            val prior = scores[id]
-            scores[id] = RetrievalScoreFusion.merge(prior, score, fused)
+            val prior = scores[id]?.let { left.keywordCoverage[id]?.let { coverage -> keywordReference * coverage } ?: it }
+            val incoming = right.keywordCoverage[id]?.let { coverage -> keywordReference * coverage } ?: score
+            scores[id] = RetrievalScoreFusion.merge(prior, incoming, fused)
         }
-        return EvaluatedSet(scores, left.sorts + right.sorts)
+        left.keywordCoverage.forEach { (id, coverage) ->
+            if (id !in right.scores) scores[id] = keywordReference * coverage
+        }
+        val cosineScores = LinkedHashMap(left.cosineScores)
+        right.cosineScores.forEach { (id, score) ->
+            cosineScores[id] = maxOf(cosineScores[id] ?: score, score)
+        }
+        val keywordCoverage = LinkedHashMap(left.keywordCoverage)
+        right.keywordCoverage.forEach { (id, coverage) ->
+            keywordCoverage[id] = maxOf(keywordCoverage[id] ?: 0f, coverage)
+        }
+        return EvaluatedSet(scores, left.sorts + right.sorts, cosineScores, keywordCoverage)
     }
 
     private fun intersect(left: EvaluatedSet, right: EvaluatedSet): EvaluatedSet {
+        val keywordReference = (left.cosineScores.values + right.cosineScores.values)
+            .maxOrNull()
+            ?.coerceIn(0f, 1f)
+            ?: 1f
         val scores = LinkedHashMap<Long, Float>()
         val smaller = if (left.scores.size <= right.scores.size) left.scores else right.scores
         smaller.forEach { (id, score) ->
             val leftScore = left.scores[id] ?: return@forEach
             val rightScore = right.scores[id] ?: return@forEach
+            val normalizedLeft = left.keywordCoverage[id]?.let { keywordReference * it } ?: leftScore
+            val normalizedRight = right.keywordCoverage[id]?.let { keywordReference * it } ?: rightScore
             scores[id] = when {
-                leftScore == HARD_SCOPE_SCORE -> rightScore
-                rightScore == HARD_SCOPE_SCORE -> leftScore
-                else -> leftScore + rightScore
+                leftScore == HARD_SCOPE_SCORE -> normalizedRight
+                rightScore == HARD_SCOPE_SCORE -> normalizedLeft
+                else -> normalizedLeft + normalizedRight
             }
         }
-        return EvaluatedSet(scores, left.sorts + right.sorts)
+        val cosineScores = scores.keys.mapNotNull { id ->
+            val score = listOf(
+                left.cosineScores[id] ?: Float.NEGATIVE_INFINITY,
+                right.cosineScores[id] ?: Float.NEGATIVE_INFINITY,
+            ).maxOrNull()?.takeIf { it.isFinite() }
+            score?.let { id to it }
+        }.toMap(LinkedHashMap())
+        val keywordCoverage = (left.keywordCoverage.keys + right.keywordCoverage.keys)
+            .filter { it in scores }
+            .associateWith { id -> maxOf(left.keywordCoverage[id] ?: 0f, right.keywordCoverage[id] ?: 0f) }
+        return EvaluatedSet(scores, left.sorts + right.sorts, cosineScores, keywordCoverage)
     }
 
     private fun subtract(left: EvaluatedSet, right: EvaluatedSet): EvaluatedSet =
         EvaluatedSet(
             left.scores.filterKeys { it !in right.scores }.toMap(LinkedHashMap()),
             left.sorts + right.sorts,
+            left.cosineScores.filterKeys { it !in right.scores },
+            left.keywordCoverage.filterKeys { it !in right.scores },
         )
 
     private data class EvaluatedSet(
         val scores: Map<Long, Float> = emptyMap(),
         val sorts: Set<ExecutionSort> = emptySet(),
+        val cosineScores: Map<Long, Float> = emptyMap(),
+        val keywordCoverage: Map<Long, Float> = emptyMap(),
     )
 
     private companion object {
@@ -399,14 +513,30 @@ internal object OcrKeywordPolicy {
         .filter { it.length >= 2 }
         .distinct()
 
-    fun score(ocrText: String, keywords: List<String>): Float {
-        return if (matchesAll(ocrText, keywords)) 1f else 0f
+    fun score(ocrText: String, keywords: List<String>): Float = coverage(ocrText, keywords)
+
+    fun coverage(ocrText: String, keywords: List<String>): Float {
+        if (keywords.isEmpty()) return 0f
+        val normalized = ocrText.lowercase()
+        val matched = keywords.count { keyword ->
+            normalized.contains(keyword) || when (keyword) {
+                "aadhar", "aadhaar" -> normalized.contains("aadhar") || normalized.contains("aadhaar")
+                else -> false
+            }
+        }
+        return matched.toFloat() / keywords.size.toFloat()
     }
 
     fun matchesAll(ocrText: String, keywords: List<String>): Boolean {
         if (keywords.isEmpty()) return false
         val normalized = ocrText.lowercase()
-        return keywords.all(normalized::contains)
+        return keywords.all { keyword ->
+            normalized.contains(keyword) || when (keyword) {
+                "aadhar", "aadhaar" ->
+                    normalized.contains("aadhar") || normalized.contains("aadhaar")
+                else -> false
+            }
+        }
     }
 
     const val MAX_KEYWORDS = 6

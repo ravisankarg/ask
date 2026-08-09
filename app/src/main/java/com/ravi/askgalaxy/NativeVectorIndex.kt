@@ -52,6 +52,15 @@ class NativeVectorIndex private constructor(
         }
     }
 
+    /** Removes the supplied IDs and persists the compact index in place. */
+    fun removeBatch(ids: LongArray) {
+        checkHandle()
+        require(ids.isNotEmpty()) { "Remove batch must contain at least one id" }
+        check(nativeRemoveBatch(nativeHandle, ids)) {
+            "Native TurboQuant batch removal failed"
+        }
+    }
+
     fun search(query: FloatArray, k: Int, allowlist: LongArray? = null): NativeSearchResult {
         checkHandle()
         require(query.size == dimension) {
@@ -183,6 +192,9 @@ class NativeVectorIndex private constructor(
             ids: LongArray,
             flattenedValues: FloatArray,
         ): Boolean
+
+        @JvmStatic
+        private external fun nativeRemoveBatch(handle: Long, ids: LongArray): Boolean
 
         @JvmStatic
         private external fun nativeSearch(

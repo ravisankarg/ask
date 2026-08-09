@@ -31,11 +31,15 @@ class ModelInstaller(context: Context) {
     private val appContext = context.applicationContext
 
     fun installAll(onProgress: (ModelInstallProgress) -> Unit): ModelInstallReport {
-        return installArtifacts(ModelCatalog.all(appContext).filter { it.required }, onProgress)
+        return installArtifacts(
+            artifacts = ModelCatalog.all(appContext).filter { it.required },
+            onProgress = onProgress,
+        )
     }
 
     fun installArtifacts(
         artifacts: List<ModelArtifact>,
+        authCookie: String? = null,
         onProgress: (ModelInstallProgress) -> Unit,
     ): ModelInstallReport {
         if (artifacts.isEmpty()) return ModelInstallReport(emptyList())
@@ -55,6 +59,7 @@ class ModelInstaller(context: Context) {
             download(
                 artifact = artifact,
                 url = url,
+                authCookie = authCookie,
                 artifactIndex = index + 1,
                 artifactTotal = artifacts.size,
                 onProgress = onProgress,
@@ -118,6 +123,7 @@ class ModelInstaller(context: Context) {
     private fun download(
         artifact: ModelArtifact,
         url: String,
+        authCookie: String?,
         artifactIndex: Int,
         artifactTotal: Int,
         onProgress: (ModelInstallProgress) -> Unit,
@@ -148,13 +154,13 @@ class ModelInstaller(context: Context) {
             existing = 0L
         }
 
-        var connection = openConnection(url, existing)
+        var connection = openConnection(url, existing, authCookie)
         var responseCode = connection.responseCode
         if (existing > 0L && responseCode != HttpURLConnection.HTTP_PARTIAL) {
             connection.disconnect()
             check(partial.delete()) { "Could not restart model download: ${partial.absolutePath}" }
             existing = 0L
-            connection = openConnection(url, 0L)
+            connection = openConnection(url, 0L, authCookie)
             responseCode = connection.responseCode
         }
         if (responseCode !in 200..299) {
@@ -168,7 +174,7 @@ class ModelInstaller(context: Context) {
                 connection.disconnect()
                 check(partial.delete()) { "Could not reset invalid partial model: ${partial.absolutePath}" }
                 existing = 0L
-                connection = openConnection(url, 0L)
+                connection = openConnection(url, 0L, authCookie)
                 responseCode = connection.responseCode
                 if (responseCode !in 200..299) {
                     connection.disconnect()
@@ -249,7 +255,7 @@ class ModelInstaller(context: Context) {
         output.flush()
     }
 
-    private fun openConnection(url: String, offset: Long): HttpURLConnection =
+    private fun openConnection(url: String, offset: Long, authCookie: String?): HttpURLConnection =
         (URL(url).openConnection() as HttpURLConnection).apply {
             instanceFollowRedirects = true
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -257,6 +263,7 @@ class ModelInstaller(context: Context) {
             useCaches = false
             setRequestProperty("Accept-Encoding", "identity")
             setRequestProperty("User-Agent", "AskGalaxy/0.1 Android")
+            if (!authCookie.isNullOrBlank()) setRequestProperty("Cookie", authCookie)
             if (offset > 0L) setRequestProperty("Range", "bytes=$offset-")
         }
 

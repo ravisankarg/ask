@@ -13,7 +13,7 @@ enum class IndexProgressStage(val wire: String, val label: String) {
     DOCUMENT("document", "All personal sources (overall)"),
     DOCUMENT_MESSAGES("document_messages", "Messages"),
     DOCUMENT_CALENDAR("document_calendar", "Calendar"),
-    DOCUMENT_FILES("document_files", "My Files"),
+    DOCUMENT_FILES("document_files", "My Files text chunks"),
     DOCUMENT_CONTACTS("document_contacts", "Contacts"),
     DOCUMENT_CALL_LOGS("document_call_logs", "Call logs"),
 }
