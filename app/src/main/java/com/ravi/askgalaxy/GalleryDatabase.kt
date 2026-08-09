@@ -446,6 +446,48 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         return result
     }
 
+    fun answerabilityRecordCount(): Int = readableDatabase.compileStatement(
+        "SELECT COUNT(*) FROM $TABLE_MEDIA",
+    ).simpleQueryForLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+
+    /** Rebuilds only derived answerability cards in bounded batches. */
+    fun rebuildAnswerabilityFacts(
+        onProgress: (completed: Int, total: Int) -> Unit = { _, _ -> },
+    ) {
+        val total = answerabilityRecordCount()
+        var completed = 0
+        var lastId = Long.MIN_VALUE
+        while (true) {
+            val batch = queryMedia(
+                selection = "media_store_id > ?",
+                selectionArgs = arrayOf(lastId.toString()),
+                orderBy = "media_store_id ASC",
+                limit = ANSWERABILITY_BATCH_SIZE.toString(),
+                projection = INDEXING_PROJECTION,
+            )
+            if (batch.isEmpty()) break
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                batch.forEach { media ->
+                    writeAnswerabilityFacts(
+                        db,
+                        media.mediaStoreId,
+                        listOf(media.displayName, media.ocrText)
+                            .filter(String::isNotBlank)
+                            .joinToString("\n"),
+                    )
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            completed += batch.size
+            lastId = batch.last().mediaStoreId
+            onProgress(completed.coerceAtMost(total), total)
+        }
+    }
+
     /** Backfills only missing derived cards for selected evidence rows. */
     fun ensureAnswerabilityFacts(mediaStoreIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
         val existing = answerabilityFacts(mediaStoreIds)
@@ -488,16 +530,32 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         )
         db.beginTransaction()
         try {
-            db.delete(TABLE_ANSWERABILITY_FACTS, "media_store_id = ?", arrayOf(mediaStoreId.toString()))
-            facts.forEach { fact ->
-                db.execSQL(
-                    "INSERT OR IGNORE INTO $TABLE_ANSWERABILITY_FACTS(media_store_id,label,value) VALUES(?,?,?)",
-                    arrayOf(mediaStoreId, fact.label, fact.value),
-                )
-            }
+            writeAnswerabilityFacts(db, mediaStoreId, facts)
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
+        }
+    }
+
+    private fun writeAnswerabilityFacts(db: SQLiteDatabase, mediaStoreId: Long, sourceText: String) {
+        writeAnswerabilityFacts(
+            db,
+            mediaStoreId,
+            AnswerFactGrounding.extractFactsForIndex(sourceText),
+        )
+    }
+
+    private fun writeAnswerabilityFacts(
+        db: SQLiteDatabase,
+        mediaStoreId: Long,
+        facts: List<AnswerFactGrounding.IndexedFact>,
+    ) {
+        db.delete(TABLE_ANSWERABILITY_FACTS, "media_store_id = ?", arrayOf(mediaStoreId.toString()))
+        facts.forEach { fact ->
+            db.execSQL(
+                "INSERT OR IGNORE INTO $TABLE_ANSWERABILITY_FACTS(media_store_id,label,value) VALUES(?,?,?)",
+                arrayOf(mediaStoreId, fact.label, fact.value),
+            )
         }
     }
 
@@ -1842,6 +1900,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         private const val TABLE_EPISODES = "photo_episodes"
         private const val TABLE_EPISODE_MEMBERS = "photo_episode_members"
         private const val TABLE_ANSWERABILITY_FACTS = "answerability_facts"
+        private const val ANSWERABILITY_BATCH_SIZE = 128
         const val LOCATION_PENDING = 0
         const val LOCATION_COMPLETE_NO_GPS = 1
         const val LOCATION_RESOLVED = 2

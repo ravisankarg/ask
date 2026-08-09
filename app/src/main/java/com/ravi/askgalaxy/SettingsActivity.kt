@@ -37,6 +37,9 @@ class SettingsActivity : Activity() {
     private lateinit var locationStatus: TextView
     private lateinit var fileAccessStatus: TextView
     private lateinit var locationPermissionButton: Button
+    private lateinit var answerabilityStatus: TextView
+    private lateinit var answerabilityProgress: ProgressBar
+    private lateinit var answerabilityButton: Button
     private lateinit var gemmaModelChoice: RadioGroup
     private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
     private val handler = Handler(Looper.getMainLooper())
@@ -260,6 +263,76 @@ class SettingsActivity : Activity() {
             root.addView(label, wrap())
             root.addView(bar, wrap())
         }
+
+        root.addView(TextView(this).apply {
+            text = "Answerability index"
+            textSize = 20f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 28, 0, 8)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Build labelled fact cards for every existing gallery OCR row and personal-source record. This uses no LLM and changes only the derived answerability index; OCR, vectors, faces, metadata, and documents are preserved."
+            textSize = 14f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        answerabilityStatus = TextView(this).apply {
+            text = "Ready to build on demand."
+            textSize = 13f
+            setTextColor(Color.rgb(90, 93, 103))
+            setPadding(0, 8, 0, 4)
+        }
+        root.addView(answerabilityStatus, wrap())
+        answerabilityProgress = ProgressBar(
+            this,
+            null,
+            android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            max = 100
+            visibility = View.GONE
+            setPadding(0, 2, 0, 4)
+        }
+        root.addView(answerabilityProgress, wrap())
+        answerabilityButton = Button(this).apply {
+            text = "Build answerability index for all records"
+            setAllCaps(false)
+            setOnClickListener {
+                if (!isEnabled) return@setOnClickListener
+                isEnabled = false
+                answerabilityProgress.visibility = View.VISIBLE
+                answerabilityStatus.text = "Preparing all indexed records…"
+                contextExecutor.execute {
+                    val result = runCatching {
+                        AnswerabilityIndexBuilder(this@SettingsActivity).rebuildBlocking { update ->
+                            runOnUiThread {
+                                if (isFinishing) return@runOnUiThread
+                                val percent = if (update.total <= 0) 100 else {
+                                    (update.completed * 100L / update.total).toInt().coerceIn(0, 100)
+                                }
+                                answerabilityProgress.progress = percent
+                                answerabilityStatus.text =
+                                    "${update.phase}: ${update.completed}/${update.total} records"
+                            }
+                        }
+                    }
+                    runOnUiThread {
+                        isEnabled = true
+                        answerabilityProgress.visibility = View.GONE
+                        answerabilityStatus.text = if (result.isSuccess) {
+                            "Answerability index is ready for all existing records."
+                        } else {
+                            "Answerability build paused safely; existing indexes were preserved. Tap again to resume."
+                        }
+                        Toast.makeText(
+                            this@SettingsActivity,
+                            if (result.isSuccess) "Answerability index is ready." else "Answerability build could not complete.",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            }
+        }
+        root.addView(answerabilityButton, wrap())
 
         root.addView(TextView(this).apply {
             text = "Index maintenance"

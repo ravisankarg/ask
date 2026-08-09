@@ -236,6 +236,46 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         return result
     }
 
+    fun answerabilityRecordCount(): Int = readableDatabase.compileStatement(
+        "SELECT COUNT(*) FROM chunks",
+    ).simpleQueryForLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+
+    /** Rebuilds only derived answerability cards in bounded batches. */
+    fun rebuildAnswerabilityFacts(
+        onProgress: (completed: Int, total: Int) -> Unit = { _, _ -> },
+    ) {
+        val total = answerabilityRecordCount()
+        var completed = 0
+        var lastId = Long.MIN_VALUE
+        while (true) {
+            val batch = ArrayList<DocumentChunk>(ANSWERABILITY_BATCH_SIZE)
+            readableDatabase.query(
+                "chunks",
+                null,
+                "stable_id > ?",
+                arrayOf(lastId.toString()),
+                null,
+                null,
+                "stable_id ASC",
+                ANSWERABILITY_BATCH_SIZE.toString(),
+            ).use { cursor ->
+                while (cursor.moveToNext()) batch += chunkFromCursor(cursor)
+            }
+            if (batch.isEmpty()) break
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                batch.forEach { chunk -> replaceAnswerabilityFacts(db, chunk) }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+            completed += batch.size
+            lastId = batch.last().stableId
+            onProgress(completed.coerceAtMost(total), total)
+        }
+    }
+
     /** Backfills only missing derived cards for selected evidence chunks. */
     fun ensureAnswerabilityFacts(stableIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
         val existing = answerabilityFacts(stableIds)
@@ -548,6 +588,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         const val EMBEDDING_DIMENSION = 768
         const val EMBEDDING_MODEL_REVISION = "litert-community/embeddinggemma-300m@main-sm8750-seq512"
         private const val TABLE_ANSWERABILITY_FACTS = "answerability_facts"
+        private const val ANSWERABILITY_BATCH_SIZE = 128
         private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
             .digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
     }
