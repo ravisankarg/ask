@@ -3,91 +3,189 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Ask Galaxy high-level search and answer design.">
-  <title>Ask Galaxy · Search design</title>
+  <meta name="description" content="Ask Galaxy: a private, on-device search and answer architecture.">
+  <title>Ask Galaxy · How it works</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="#top"><span class="mark">✦</span> Ask Galaxy</a>
     <nav aria-label="Page navigation">
-      <a href="#flow">Search flow</a>
-      <a href="#modules">Modules</a>
-      <a href="#boundaries">Boundaries</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#modules">Smart modules</a>
+      <a href="#trust">Trust</a>
       <a class="source" href="https://github.com/ravisankarg/ask">Source ↗</a>
     </nav>
   </header>
 
   <main id="top">
     <section class="hero wrap reveal">
-      <div>
-        <p class="kicker">Private search, designed as a system</p>
-        <h1>Ask your life<br><em>one question at a time.</em></h1>
-        <p class="lead">Ask Galaxy joins personal sources into one inspectable search flow. The answer is grounded in the same records the user can see.</p>
-        <a class="button" href="#flow">See the flow ↓</a>
-      </div>
-      <div class="hero-card" aria-label="Search flow summary">
-        <span class="card-label">ONE QUESTION</span>
-        <strong>“When did I last call Sreevatsa?”</strong>
-        <div class="mini-flow">
-          <span>understand</span><i>→</i><span>scope</span><i>→</i><span>retrieve</span><i>→</i><span>answer</span>
+      <div class="hero-copy">
+        <p class="kicker">Private intelligence for your phone</p>
+        <h1>One question.<br><em>Your whole digital life.</em></h1>
+        <p class="lead">Ask Galaxy turns photos, documents, messages, calls, contacts, and calendar records into one private search experience. Every answer begins with records the user can inspect.</p>
+        <div class="hero-actions">
+          <a class="button" href="#architecture">Explore the architecture ↓</a>
+          <span>Local-first · Inspectable · Incremental</span>
         </div>
-        <small>Every stage has a visible responsibility and a bounded output.</small>
+      </div>
+
+      <div class="hero-card" aria-label="Example query journey">
+        <span class="card-label">A NATURAL QUESTION</span>
+        <strong>“What is the expiry date on my driving licence?”</strong>
+        <div class="signal-row">
+          <span>document</span><span>owner</span><span>requested field</span>
+        </div>
+        <div class="mini-flow">
+          <span>understand</span><i>→</i><span>find</span><i>→</i><span>read</span><i>→</i><span>verify</span>
+        </div>
+        <small>The pipeline separates what to find from the value to answer.</small>
       </div>
     </section>
 
-    <section id="flow" class="section wrap">
+    <section id="architecture" class="section wrap">
       <div class="section-head reveal">
-        <p class="kicker">Search-time flow</p>
-        <h2>From language to evidence.</h2>
-        <p>The pipeline preserves user intent while keeping hard scope decisions outside the answer writer.</p>
+        <p class="kicker">The search loop</p>
+        <h2>Six decisions, one trustworthy answer.</h2>
+        <p>Each stage makes one bounded decision. No single black box owns the entire journey.</p>
       </div>
-      <div class="flow-list">
-        <article class="flow-step reveal"><span class="number">01</span><div><h3>Question intake</h3><p class="io"><b>Input</b> natural language and conversation context</p><p class="io"><b>Output</b> a normalized request with the information need understood</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">02</span><div><h3>Query understanding</h3><p class="io"><b>Input</b> normalized request and available source capabilities</p><p class="io"><b>Output</b> intent category, source scope, people, places, time, media type, and requested fields</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">03</span><div><h3>Scope compilation</h3><p class="io"><b>Input</b> structured intent</p><p class="io"><b>Output</b> executable positive predicates and explicit exclusions</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">04</span><div><h3>Parallel source retrieval</h3><p class="io"><b>Input</b> compiled scope and independent source indexes</p><p class="io"><b>Output</b> lexical, semantic, and structured candidates from each eligible source</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">05</span><div><h3>Scope, fusion, and ranking</h3><p class="io"><b>Input</b> per-source candidates and hard predicates</p><p class="io"><b>Output</b> stale-free merged order shown to the user</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">06</span><div><h3>Evidence selection</h3><p class="io"><b>Input</b> merged results and the original question</p><p class="io"><b>Output</b> a bounded top evidence set with full available text, metadata, and relevant images</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">07</span><div><h3>Grounded answer</h3><p class="io"><b>Input</b> question, evidence, field/value relationships, and visual context</p><p class="io"><b>Output</b> concise answer, sources, and diverse follow-up questions</p></div><span class="arrow">↓</span></article>
-        <article class="flow-step reveal"><span class="number">08</span><div><h3>UI publication</h3><p class="io"><b>Input</b> stage state, timings, result order, and answer state</p><p class="io"><b>Output</b> transparent progress, query plan, results, answer, and recovery actions</p></div></article>
+
+      <div class="architecture" aria-label="Ask Galaxy search architecture">
+        <article class="arch-step reveal">
+          <span class="number">01</span>
+          <div class="arch-icon">Aa</div>
+          <div><h3>Understand</h3><p>Resolve intent, typos, follow-up references, people, place, time, media, and the exact field being requested.</p></div>
+          <span class="arrow">→</span>
+        </article>
+        <article class="arch-step reveal">
+          <span class="number">02</span>
+          <div class="arch-icon">⌁</div>
+          <div><h3>Compile</h3><p>Turn language into explicit include, intersect, sort, and subtract rules that can be validated before search.</p></div>
+          <span class="arrow">→</span>
+        </article>
+        <article class="arch-step reveal">
+          <span class="number">03</span>
+          <div class="arch-icon">⌕</div>
+          <div><h3>Retrieve</h3><p>Search each eligible source in parallel using the kind of evidence that source can represent reliably.</p></div>
+          <span class="arrow">→</span>
+        </article>
+        <article class="arch-step reveal">
+          <span class="number">04</span>
+          <div class="arch-icon">≋</div>
+          <div><h3>Rank</h3><p>Apply hard scope first, remove stale records, then merge every source into the same order shown on screen.</p></div>
+          <span class="arrow">→</span>
+        </article>
+        <article class="arch-step reveal">
+          <span class="number">05</span>
+          <div class="arch-icon">◇</div>
+          <div><h3>Curate</h3><p>Select a small, diverse evidence window. Preserve complete page layout for documents and native text for record-only sources.</p></div>
+          <span class="arrow">→</span>
+        </article>
+        <article class="arch-step reveal">
+          <span class="number">06</span>
+          <div class="arch-icon">✓</div>
+          <div><h3>Answer</h3><p>Read all selected evidence together, bind labels to values, reject unsupported output, and respond briefly.</p></div>
+        </article>
+      </div>
+
+      <div class="architecture-note reveal">
+        <span>Question</span><i></i><strong>Structured intent</strong><i></i><strong>Visible result order</strong><i></i><span>Grounded answer</span>
       </div>
     </section>
 
     <section id="modules" class="section dark">
       <div class="wrap">
         <div class="section-head light reveal">
-          <p class="kicker">High-level modules</p>
-          <h2>Each boundary has a job.</h2>
-          <p>Inputs and outputs stay explicit so the system can evolve without hiding decisions inside a single retrieval or generation step.</p>
+          <p class="kicker">Smart by design</p>
+          <h2>Every module knows what not to do.</h2>
+          <p>Good local intelligence comes from disciplined boundaries: each module handles its own uncertainty and passes a clean contract forward.</p>
         </div>
+
         <div class="module-grid">
-          <article class="module reveal"><span>01</span><h3>Source ingestion</h3><p><b>Input:</b> personal records and source metadata</p><p><b>Output:</b> stable records, signatures, and ownership</p></article>
-          <article class="module reveal"><span>02</span><h3>Preparation</h3><p><b>Input:</b> new or changed records</p><p><b>Output:</b> searchable text, metadata, identities, representations, and checkpoints</p></article>
-          <article class="module reveal"><span>03</span><h3>Query understanding</h3><p><b>Input:</b> user language</p><p><b>Output:</b> intent and structured constraints</p></article>
-          <article class="module reveal"><span>04</span><h3>Retrieval</h3><p><b>Input:</b> constraints and source indexes</p><p><b>Output:</b> candidates with comparable scores</p></article>
-          <article class="module reveal"><span>05</span><h3>Fusion and scope</h3><p><b>Input:</b> candidate lists and exclusions</p><p><b>Output:</b> one trustworthy cross-source order</p></article>
-          <article class="module reveal"><span>06</span><h3>Evidence and answer</h3><p><b>Input:</b> question and bounded top records</p><p><b>Output:</b> concise answer with validated facts</p></article>
-          <article class="module reveal"><span>07</span><h3>Product surface</h3><p><b>Input:</b> progress, timings, results, and answer events</p><p><b>Output:</b> browseable, explainable interaction</p></article>
+          <article class="module feature reveal">
+            <span class="module-id">01 · MEMORY</span>
+            <h3>Incremental preparation</h3>
+            <p>Discovers only new phone records, resumes interrupted work, and appends to the right indexes without erasing previous knowledge.</p>
+            <b class="smart-move">Smart move · unchanged records stay untouched</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">02 · PLANNER</span>
+            <h3>Meaning before matching</h3>
+            <p>Separates content such as “sunset” from people, places, document types, requested fields, and conversational references.</p>
+            <b class="smart-move">Smart move · validates the plan before retrieval</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">03 · RETRIEVAL</span>
+            <h3>Source-aware search</h3>
+            <p>Visual memories can match by meaning and metadata; written records require semantic relevance plus same-record lexical proof.</p>
+            <b class="smart-move">Smart move · one rule does not weaken every source</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">04 · FUSION</span>
+            <h3>One honest result order</h3>
+            <p>Independent candidate streams are scoped, scored, deduplicated, and merged before the user or answer layer sees them.</p>
+            <b class="smart-move">Smart move · answer evidence comes from that same order</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">05 · EVIDENCE</span>
+            <h3>Layout-preserving context</h3>
+            <p>Photos stay visual, document pages retain columns and tables, while calls and messages keep their precise native text.</p>
+            <b class="smart-move">Smart move · evidence format follows the record</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">06 · ANSWER GUARD</span>
+            <h3>Field-aware verification</h3>
+            <p>Numbers and dates must stay attached to the requested label, preventing a nearby identifier or timestamp from becoming the answer.</p>
+            <b class="smart-move">Smart move · uncertainty becomes refusal, not invention</b>
+          </article>
+          <article class="module reveal">
+            <span class="module-id">07 · EXPERIENCE</span>
+            <h3>Visible state and control</h3>
+            <p>Users see preparation, query-plan, search, and answer progress—and can pause background indexing to search immediately.</p>
+            <b class="smart-move">Smart move · useful before preparation is complete</b>
+          </article>
         </div>
       </div>
     </section>
 
-    <section id="boundaries" class="section wrap">
+    <section class="section wrap memory-loop">
       <div class="section-head reveal">
-        <p class="kicker">Design boundaries</p>
-        <h2>Trust is a pipeline property.</h2>
+        <p class="kicker">The memory loop</p>
+        <h2>New information joins without starting over.</h2>
       </div>
-      <div class="boundary-grid">
-        <article class="boundary reveal"><strong>Hard scope first</strong><p>Person, place, time, source, media type, and exclusions constrain retrieval before relevance expansion.</p></article>
-        <article class="boundary reveal"><strong>One visible order</strong><p>The result grid and answer evidence originate from the same merged ranking, with stale records removed.</p></article>
-        <article class="boundary reveal"><strong>Labels stay attached</strong><p>A requested field is resolved through its own label, so nearby dates or numbers cannot silently replace it.</p></article>
-        <article class="boundary reveal"><strong>Local by default</strong><p>Personal records, query processing, retrieval, and answer generation remain on the device.</p></article>
+      <div class="memory-track reveal">
+        <div><span>1</span><strong>Discover</strong><p>Find records not yet indexed.</p></div>
+        <i>→</i>
+        <div><span>2</span><strong>Enrich</strong><p>Extract searchable visual, textual, identity, place, and time signals.</p></div>
+        <i>→</i>
+        <div><span>3</span><strong>Append</strong><p>Add only new representations and preserve prior labels and vectors.</p></div>
+        <i>→</i>
+        <div><span>4</span><strong>Checkpoint</strong><p>Keep progress resumable and existing search available.</p></div>
+      </div>
+    </section>
+
+    <section id="trust" class="section trust-section">
+      <div class="wrap trust-layout">
+        <div class="section-head light reveal">
+          <p class="kicker">Trust boundaries</p>
+          <h2>Privacy is not a final step.</h2>
+          <p>It shapes ingestion, indexing, planning, retrieval, evidence, and the answer itself.</p>
+        </div>
+        <div class="trust-grid">
+          <article class="trust reveal"><strong>On-device by default</strong><p>Personal records and their searchable representations stay under the user’s control.</p></article>
+          <article class="trust reveal"><strong>Hard scope before relevance</strong><p>People, place, time, media, source, and exclusions are enforced rather than suggested.</p></article>
+          <article class="trust reveal"><strong>Inspectable failures</strong><p>If a query plan is rejected, its actual output and validation reason are visible.</p></article>
+          <article class="trust reveal"><strong>No hidden evidence swap</strong><p>The answer receives a bounded window derived from the same ranked results shown to the user.</p></article>
+        </div>
       </div>
     </section>
   </main>
 
-  <footer class="footer wrap"><span>Ask Galaxy</span><span>Private search for personal context</span><a href="https://github.com/ravisankarg/ask">github.com/ravisankarg/ask ↗</a></footer>
+  <footer class="footer wrap">
+    <span>Ask Galaxy</span>
+    <span>Private search for personal context</span>
+    <a href="https://github.com/ravisankarg/ask">github.com/ravisankarg/ask ↗</a>
+  </footer>
   <script src="app.js"></script>
 </body>
 </html>
