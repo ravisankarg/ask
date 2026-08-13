@@ -65,7 +65,20 @@ class GallerySemanticIndexer(
         }
     }
 
-    fun indexBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress {
+    fun indexBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress =
+        indexBlocking(refreshDerivedGrouping = true, onProgress = onProgress)
+
+    /**
+     * Adds pending per-record indexes and appends new face assignments without
+     * replacing prior clusters or photo-episode rows.
+     */
+    fun indexAdditionsBlocking(onProgress: (EmbeddingProgress) -> Unit = {}): EmbeddingProgress =
+        indexBlocking(refreshDerivedGrouping = false, onProgress = onProgress)
+
+    private fun indexBlocking(
+        refreshDerivedGrouping: Boolean,
+        onProgress: (EmbeddingProgress) -> Unit,
+    ): EmbeddingProgress {
         val locationProgress = locationIndexer.indexBlocking { update ->
             onProgress(
                 EmbeddingProgress(
@@ -120,6 +133,31 @@ class GallerySemanticIndexer(
                     locationRetryable = locationProgress.retryable,
                 ),
             )
+        }
+        if (!refreshDerivedGrouping) {
+            val clusterCount = faceClusterer.appendUnclusteredBlocking()
+            return EmbeddingProgress(
+                completed = imageProgress.completed,
+                total = imageProgress.total,
+                skipped = imageProgress.skipped + ocrProgress.skipped + faceProgress.skipped,
+                stage = EmbeddingStage.FACE,
+                ocrCompleted = ocrProgress.completed,
+                ocrTotal = ocrProgress.total,
+                ocrFound = ocrProgress.textFound,
+                faceCompleted = faceProgress.completed,
+                faceTotal = faceProgress.total,
+                facesFound = faceProgress.facesFound,
+                clusterCount = clusterCount,
+                needsFaceTags = database.hasUnnamedFaceClusters(),
+                clusteringComplete = true,
+                locationCompleted = locationProgress.completed,
+                locationTotal = locationProgress.total,
+                locationsWithGps = locationProgress.withGps,
+                locationsResolved = locationProgress.resolved,
+                locationRetryable = locationProgress.retryable,
+                episodeCount = 0,
+                episodeIndexComplete = false,
+            ).also(onProgress)
         }
         onProgress(
             EmbeddingProgress(

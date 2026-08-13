@@ -12,8 +12,6 @@ class StructuredSearchExecutor(
     private val semanticIndexer: GallerySemanticIndexer,
     private val metadataReader: GalleryMetadataReader,
 ) {
-    private var activeQueryCategory: QueryCategory = QueryCategory.SCENARY
-
     data class ScoredGalleryResults(
         val media: List<GalleryMedia>,
         val cosineScores: Map<Long, Float>,
@@ -21,46 +19,26 @@ class StructuredSearchExecutor(
 
     fun execute(
         spec: QueryExecutionSpec,
-    ): List<GalleryMedia> = executeScored(spec).media
+        allowOcrlessPhotoKeywordBypass: Boolean,
+    ): List<GalleryMedia> = executeScored(spec, allowOcrlessPhotoKeywordBypass).media
 
     fun executeScored(
         spec: QueryExecutionSpec,
+        allowOcrlessPhotoKeywordBypass: Boolean,
     ): ScoredGalleryResults {
-        // query_category was removed from QP.  Keep the compatibility value
-        // for downstream answer policy, but retrieval starts with every
-        // gallery row and narrows only on fields actually emitted by QP.
-        val queryCategory = spec.requiredQueryCategory()
-        activeQueryCategory = queryCategory
+        // query_category is deterministic answer-routing metadata, not a
+        // search predicate. Retrieval narrows only on fields emitted by QP.
         val categoryAllowlist = database.allMediaStoreIds()
         if (categoryAllowlist.isEmpty()) return ScoredGalleryResults(emptyList(), emptyMap())
-        val evaluated = evaluate(spec.root, categoryAllowlist)
+        val evaluated = evaluate(
+            spec.root,
+            categoryAllowlist,
+            allowOcrlessPhotoKeywordBypass = allowOcrlessPhotoKeywordBypass,
+        )
         val scoreById = evaluated.scores.filterKeys { it in categoryAllowlist }
         if (scoreById.isEmpty()) return ScoredGalleryResults(emptyList(), emptyMap())
         val rows = database.findByMediaStoreIds(scoreById.keys.toLongArray())
-        val comparator = when {
-            queryCategory == QueryCategory.DOC -> documentComparator(
-                scoreById = scoreById,
-                sorts = evaluated.sorts,
-            )
-            queryCategory == QueryCategory.SCENARY ||
-                queryCategory == QueryCategory.PERSON ||
-                queryCategory == QueryCategory.LOCATION ->
-                relevanceFirstComparator(
-                    scoreById = scoreById,
-                    sorts = evaluated.sorts,
-                )
-            ExecutionSort.DATE in evaluated.sorts ->
-                compareByDescending<GalleryMedia> {
-                    it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
-                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
-            ExecutionSort.LOCATION in evaluated.sorts ->
-                compareBy<GalleryMedia> {
-                    (it.locationName ?: it.location).orEmpty().lowercase()
-                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
-            else ->
-                compareByDescending<GalleryMedia> { scoreById[it.mediaStoreId] ?: 0f }
-                    .thenByDescending { it.dateTakenMs ?: it.dateModifiedSeconds * 1000L }
-        }
+        val comparator = relevanceFirstComparator(scoreById, evaluated.sorts)
         // Hard predicates (people, dates, places, MIME type) are exact index
         // sets and can legitimately contain hundreds or thousands of rows.
         // Return the complete evaluated set; the UI virtualizes it and the
@@ -103,50 +81,44 @@ class StructuredSearchExecutor(
         }
     }
 
-    /**
-     * Document results have two strict tiers. A complete OCR-keyword match is
-     * always above semantic-only retrieval; requested sorting and relevance
-     * operate only within each tier.
-     */
-    private fun documentComparator(
-        scoreById: Map<Long, Float>,
-        sorts: Set<ExecutionSort>,
-    ): Comparator<GalleryMedia> {
-        val tier = compareByDescending<GalleryMedia> {
-            (scoreById[it.mediaStoreId] ?: 0f) >= OcrKeywordPolicy.PERFECT_MATCH_SCORE
-        }
-        return when {
-            ExecutionSort.DATE in sorts ->
-                tier.thenByDescending {
-                    it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
-                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
-            ExecutionSort.LOCATION in sorts ->
-                tier.thenBy {
-                    (it.locationName ?: it.location).orEmpty().lowercase()
-                }.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
-            else ->
-                tier.thenByDescending { scoreById[it.mediaStoreId] ?: 0f }
-                    .thenByDescending { it.dateTakenMs ?: it.dateModifiedSeconds * 1000L }
-        }
-    }
-
     private fun evaluate(
         node: ExecutionNode,
         categoryAllowlist: Set<Long>,
         allowSemanticFallback: Boolean = true,
+        allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet = when (node) {
         is ExecutionNode.Predicate ->
-            evaluatePredicate(node, categoryAllowlist, allowSemanticFallback)
+            evaluatePredicate(
+                node,
+                categoryAllowlist,
+                allowSemanticFallback,
+                allowOcrlessPhotoKeywordBypass,
+            )
         is ExecutionNode.Sorted ->
-            evaluate(node.value, categoryAllowlist, allowSemanticFallback).let {
+            evaluate(
+                node.value,
+                categoryAllowlist,
+                allowSemanticFallback,
+                allowOcrlessPhotoKeywordBypass,
+            ).let {
                 it.copy(sorts = it.sorts + node.sort)
             }
         is ExecutionNode.Binary -> {
             when (node.operator) {
                 ExecutionBinaryOperator.INTERSECT ->
-                    evaluateIntersection(node, categoryAllowlist, allowSemanticFallback)
+                    evaluateIntersection(
+                        node,
+                        categoryAllowlist,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
                 ExecutionBinaryOperator.SUBTRACT -> {
-                    val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
+                    val left = evaluate(
+                        node.left,
+                        categoryAllowlist,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
                     // A low-confidence nearest-neighbor fallback is useful for
                     // positive discovery, but unsafe for exclusions: it could
                     // subtract unrelated photos from an otherwise valid set.
@@ -161,6 +133,7 @@ class StructuredSearchExecutor(
                             node.right,
                             scopedIds,
                             allowSemanticFallback = false,
+                            allowOcrlessPhotoKeywordBypass = allowOcrlessPhotoKeywordBypass,
                         )
                     }
                     subtract(left, right)
@@ -168,8 +141,18 @@ class StructuredSearchExecutor(
                 ExecutionBinaryOperator.UNION,
                 ExecutionBinaryOperator.ADD,
                 -> {
-                    val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
-                    val right = evaluate(node.right, categoryAllowlist, allowSemanticFallback)
+                    val left = evaluate(
+                        node.left,
+                        categoryAllowlist,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
+                    val right = evaluate(
+                        node.right,
+                        categoryAllowlist,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
                     union(
                         left,
                         right,
@@ -190,12 +173,18 @@ class StructuredSearchExecutor(
         node: ExecutionNode.Binary,
         categoryAllowlist: Set<Long>,
         allowSemanticFallback: Boolean,
+        allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet {
         val leftHasSemantic = containsScoredRetrieval(node.left)
         val rightHasSemantic = containsScoredRetrieval(node.right)
         return when {
             !leftHasSemantic && rightHasSemantic -> {
-                val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
+                val left = evaluate(
+                    node.left,
+                    categoryAllowlist,
+                    allowSemanticFallback,
+                    allowOcrlessPhotoKeywordBypass,
+                )
                 val scopedIds = left.scores.keys.intersect(categoryAllowlist)
                 // The hard scope is authoritative. Search both semantic and
                 // keyword channels inside it, instead of taking global top-K
@@ -203,31 +192,52 @@ class StructuredSearchExecutor(
                 val right = if (scopedIds.isEmpty()) {
                     EvaluatedSet()
                 } else {
-                    evaluate(node.right, scopedIds, allowSemanticFallback)
+                    evaluate(
+                        node.right,
+                        scopedIds,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
                 }
                 intersect(left, right)
             }
             leftHasSemantic && !rightHasSemantic -> {
-                val right = evaluate(node.right, categoryAllowlist, allowSemanticFallback)
+                val right = evaluate(
+                    node.right,
+                    categoryAllowlist,
+                    allowSemanticFallback,
+                    allowOcrlessPhotoKeywordBypass,
+                )
                 val scopedIds = right.scores.keys.intersect(categoryAllowlist)
                 val left = if (scopedIds.isEmpty()) {
                     EvaluatedSet()
                 } else {
-                    evaluate(node.left, scopedIds, allowSemanticFallback)
+                    evaluate(
+                        node.left,
+                        scopedIds,
+                        allowSemanticFallback,
+                        allowOcrlessPhotoKeywordBypass,
+                    )
                 }
                 intersect(left, right)
             }
             else -> {
-                val left = evaluate(node.left, categoryAllowlist, allowSemanticFallback)
-                val right = evaluate(node.right, categoryAllowlist, allowSemanticFallback)
-                // semantic and keyword are the two hybrid channels. Their
-                // conjunction in canonical QP means “use both signals”, not
-                // “the same row must be found by both indexes”.
-                if (leftHasSemantic && rightHasSemantic) {
-                    union(left, right, fused = true)
-                } else {
-                    intersect(left, right)
-                }
+                val left = evaluate(
+                    node.left,
+                    categoryAllowlist,
+                    allowSemanticFallback,
+                    allowOcrlessPhotoKeywordBypass,
+                )
+                val right = evaluate(
+                    node.right,
+                    categoryAllowlist,
+                    allowSemanticFallback,
+                    allowOcrlessPhotoKeywordBypass,
+                )
+                // The gallery hybrid contract is a true intersection: the
+                // same row must be found by both semantic and keyword search.
+                // A row matching only one channel must not be published.
+                intersect(left, right)
             }
         }
     }
@@ -246,6 +256,7 @@ class StructuredSearchExecutor(
         predicate: ExecutionNode.Predicate,
         categoryAllowlist: Set<Long>,
         allowSemanticFallback: Boolean,
+        allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet =
         when (predicate.field) {
             ExecutionField.QUERY_CATEGORY -> hardSet(categoryAllowlist)
@@ -283,15 +294,16 @@ class StructuredSearchExecutor(
                 predicate.value,
                 categoryAllowlist,
                 allowSemanticFallback,
-                queryCategory = activeQueryCategory,
             )
             ExecutionField.KEYWORD -> evaluateOcrKeywords(
                 predicate.value,
                 categoryAllowlist,
+                relaxForImagesWithoutOcr = allowOcrlessPhotoKeywordBypass,
             )
             ExecutionField.OCR -> evaluateOcrKeywords(
                 predicate.value,
                 categoryAllowlist,
+                relaxForImagesWithoutOcr = false,
             )
         }
 
@@ -330,7 +342,6 @@ class StructuredSearchExecutor(
         value: String,
         categoryAllowlist: Set<Long>,
         allowSemanticFallback: Boolean,
-        queryCategory: QueryCategory,
     ): EvaluatedSet {
         if (categoryAllowlist.isEmpty()) return EvaluatedSet()
         val nearest = runCatching {
@@ -388,8 +399,12 @@ class StructuredSearchExecutor(
     private fun evaluateOcrKeywords(
         value: String,
         categoryAllowlist: Set<Long>,
+        relaxForImagesWithoutOcr: Boolean,
     ): EvaluatedSet {
-        if (categoryAllowlist.isEmpty()) return EvaluatedSet()
+        if (categoryAllowlist.isEmpty()) return EvaluatedSet(
+            hasRelaxableKeywordPredicate = relaxForImagesWithoutOcr,
+            hasStrictOcrPredicate = !relaxForImagesWithoutOcr,
+        )
         val keywords = OcrKeywordPolicy.keywords(value)
         if (keywords.isEmpty()) return EvaluatedSet()
         val matches = database.searchOcrKeywordsRanked(
@@ -403,11 +418,19 @@ class StructuredSearchExecutor(
                 scores[match.media.mediaStoreId] = match.score
             }
         }
-        return EvaluatedSet(scores = scores, keywordCoverage = scores)
+        return EvaluatedSet(
+            scores = scores,
+            keywordCoverage = scores,
+            hasRelaxableKeywordPredicate = relaxForImagesWithoutOcr,
+            hasStrictOcrPredicate = !relaxForImagesWithoutOcr,
+        )
     }
 
     private fun hardSet(ids: Set<Long>): EvaluatedSet =
-        EvaluatedSet(ids.associateWithTo(LinkedHashMap()) { HARD_SCOPE_SCORE })
+        EvaluatedSet(
+            scores = ids.associateWithTo(LinkedHashMap()) { HARD_SCOPE_SCORE },
+            mandatoryScopeIds = ids,
+        )
 
     private fun union(
         left: EvaluatedSet,
@@ -435,7 +458,15 @@ class StructuredSearchExecutor(
         right.keywordCoverage.forEach { (id, coverage) ->
             keywordCoverage[id] = maxOf(keywordCoverage[id] ?: 0f, coverage)
         }
-        return EvaluatedSet(scores, left.sorts + right.sorts, cosineScores, keywordCoverage)
+        return EvaluatedSet(
+            scores,
+            left.sorts + right.sorts,
+            cosineScores,
+            keywordCoverage,
+            left.hasRelaxableKeywordPredicate || right.hasRelaxableKeywordPredicate,
+            left.hasStrictOcrPredicate || right.hasStrictOcrPredicate,
+            null,
+        )
     }
 
     private fun intersect(left: EvaluatedSet, right: EvaluatedSet): EvaluatedSet {
@@ -444,6 +475,11 @@ class StructuredSearchExecutor(
             ?.coerceIn(0f, 1f)
             ?: 1f
         val scores = LinkedHashMap<Long, Float>()
+        val mandatoryScopeIds = when {
+            left.mandatoryScopeIds == null -> right.mandatoryScopeIds
+            right.mandatoryScopeIds == null -> left.mandatoryScopeIds
+            else -> left.mandatoryScopeIds.intersect(right.mandatoryScopeIds)
+        }
         val smaller = if (left.scores.size <= right.scores.size) left.scores else right.scores
         smaller.forEach { (id, score) ->
             val leftScore = left.scores[id] ?: return@forEach
@@ -456,6 +492,31 @@ class StructuredSearchExecutor(
                 else -> normalizedLeft + normalizedRight
             }
         }
+        val relaxedSemanticSide = when {
+            right.isRelaxableKeywordGate() && left.cosineScores.isNotEmpty() -> left
+            left.isRelaxableKeywordGate() && right.cosineScores.isNotEmpty() -> right
+            else -> null
+        }
+        if (relaxedSemanticSide != null) {
+            val semanticCandidates = relaxedSemanticSide.cosineScores.keys
+                .intersect(relaxedSemanticSide.scores.keys)
+                .let { candidates ->
+                    mandatoryScopeIds?.let(candidates::intersect) ?: candidates
+                }
+            val noOcrPhotoIds = GalleryKeywordIntersectionPolicy.eligibleWithoutKeywordMatch(
+                semanticCandidateIds = semanticCandidates,
+                records = database.findByMediaStoreIds(semanticCandidates.toLongArray()),
+            )
+            noOcrPhotoIds.forEach { id ->
+                relaxedSemanticSide.scores[id]?.let { scores.putIfAbsent(id, it) }
+            }
+            if (noOcrPhotoIds.isNotEmpty()) {
+                Log.i(
+                    TAG,
+                    "Keyword AND bypassed only for ${noOcrPhotoIds.size} semantic photo candidates without OCR",
+                )
+            }
+        }
         val cosineScores = scores.keys.mapNotNull { id ->
             val score = listOf(
                 left.cosineScores[id] ?: Float.NEGATIVE_INFINITY,
@@ -466,7 +527,15 @@ class StructuredSearchExecutor(
         val keywordCoverage = (left.keywordCoverage.keys + right.keywordCoverage.keys)
             .filter { it in scores }
             .associateWith { id -> maxOf(left.keywordCoverage[id] ?: 0f, right.keywordCoverage[id] ?: 0f) }
-        return EvaluatedSet(scores, left.sorts + right.sorts, cosineScores, keywordCoverage)
+        return EvaluatedSet(
+            scores,
+            left.sorts + right.sorts,
+            cosineScores,
+            keywordCoverage,
+            left.hasRelaxableKeywordPredicate || right.hasRelaxableKeywordPredicate,
+            left.hasStrictOcrPredicate || right.hasStrictOcrPredicate,
+            mandatoryScopeIds,
+        )
     }
 
     private fun subtract(left: EvaluatedSet, right: EvaluatedSet): EvaluatedSet =
@@ -475,6 +544,9 @@ class StructuredSearchExecutor(
             left.sorts + right.sorts,
             left.cosineScores.filterKeys { it !in right.scores },
             left.keywordCoverage.filterKeys { it !in right.scores },
+            left.hasRelaxableKeywordPredicate,
+            left.hasStrictOcrPredicate,
+            left.mandatoryScopeIds,
         )
 
     private data class EvaluatedSet(
@@ -482,7 +554,13 @@ class StructuredSearchExecutor(
         val sorts: Set<ExecutionSort> = emptySet(),
         val cosineScores: Map<Long, Float> = emptyMap(),
         val keywordCoverage: Map<Long, Float> = emptyMap(),
-    )
+        val hasRelaxableKeywordPredicate: Boolean = false,
+        val hasStrictOcrPredicate: Boolean = false,
+        val mandatoryScopeIds: Set<Long>? = null,
+    ) {
+        fun isRelaxableKeywordGate(): Boolean =
+            hasRelaxableKeywordPredicate && !hasStrictOcrPredicate && cosineScores.isEmpty()
+    }
 
     private companion object {
         const val TAG = "AskGalaxySearch"
@@ -501,6 +579,24 @@ class StructuredSearchExecutor(
     }
 }
 
+/**
+ * OCR-less photos may bypass keyword matching only for visual/metadata intents.
+ * A document answer must remain semantic AND keyword across every candidate.
+ */
+internal object GalleryKeywordIntersectionPolicy {
+    fun allowsOcrlessPhotoBypass(queryCategory: QueryCategory): Boolean =
+        queryCategory != QueryCategory.DOC
+
+    fun eligibleWithoutKeywordMatch(
+        semanticCandidateIds: Set<Long>,
+        records: List<GalleryMedia>,
+    ): Set<Long> = records.asSequence()
+        .filter { it.mediaStoreId in semanticCandidateIds }
+        .filter { it.mimeType.startsWith("image/", ignoreCase = true) }
+        .filter { it.ocrText.isBlank() }
+        .mapTo(LinkedHashSet()) { it.mediaStoreId }
+}
+
 internal object OcrKeywordPolicy {
     fun keywords(value: String): List<String> = tokenize(value).take(MAX_KEYWORDS)
 
@@ -511,6 +607,7 @@ internal object OcrKeywordPolicy {
         .split(Regex("[^\\p{L}\\p{N}]+"))
         .map(String::trim)
         .filter { it.length >= 2 }
+        .filterNot { it in SearchKeywordPolicy.forbiddenScaffoldingWords }
         .distinct()
 
     fun score(ocrText: String, keywords: List<String>): Float = coverage(ocrText, keywords)

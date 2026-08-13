@@ -1,14 +1,23 @@
 import org.gradle.api.tasks.Exec
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
 
-val androidNdk = file(
-    System.getenv("ANDROID_NDK_HOME")
-        ?: "/home/ravi/AG/Android_SDK/android-sdk/ndk/27.2.12479018"
-)
+val localProperties = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use(::load)
+}
+val androidSdkPath = System.getenv("ANDROID_SDK_ROOT")
+    ?: System.getenv("ANDROID_HOME")
+    ?: localProperties.getProperty("sdk.dir")
+val androidNdkPath = System.getenv("ANDROID_NDK_HOME")
+    ?: System.getenv("ANDROID_NDK_ROOT")
+    ?: localProperties.getProperty("ndk.dir")
+    ?: androidSdkPath?.let { "$it/ndk/27.2.12479018" }
+    ?: error("Set ANDROID_NDK_HOME, ANDROID_SDK_ROOT, or sdk.dir in local.properties")
+val androidNdk = file(androidNdkPath)
 val rustProject = rootProject.file("native/askgalaxy-native")
 val rustTargetDir = rootProject.file(".native-target")
 val generatedJniDir = layout.buildDirectory.dir("generated/rust/jniLibs")
@@ -23,8 +32,8 @@ android {
         applicationId = "com.ravi.askgalaxy"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.8"
+        versionCode = 10
+        versionName = "0.10"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
@@ -51,6 +60,9 @@ android {
     sourceSets["main"].assets.srcDirs(
         rootProject.file("model-artifacts/siglip2"),
         rootProject.file("model-artifacts/face"),
+        // Optional locally downloaded EmbeddingGemma assets. Keep the HF
+        // credential host-side; only the model binaries are packaged.
+        rootProject.file("model-artifacts/embeddinggemma"),
     )
 
     androidResources {
@@ -100,7 +112,7 @@ dependencies {
     // available for the other fixed-shape app models.
     implementation("com.google.ai.edge.litert:litert:2.1.0")
     // LiteRT-LM provides the native Gemma session runtime; the .litertlm file
-    // is installed separately because the E4B artifact is too large to bundle.
+    // is installed separately because the E2B artifact is too large to bundle.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.14.0")
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
     testImplementation("junit:junit:4.13.2")

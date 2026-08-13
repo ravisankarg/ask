@@ -27,6 +27,12 @@ object DocumentIndexScheduler {
                 store.read(source.progressStage()).error.isNotBlank()
             }
         ) return
+        // A gated EmbeddingGemma authorization failure is an explicit user
+        // action, not a reason to launch an anonymous request on every app
+        // resume. AuthorizationActivity calls restart() after approval.
+        if (!embeddingGemmaInstalled(context) &&
+            store.read(IndexProgressStage.EMBEDDING_GEMMA).error.isNotBlank()
+        ) return
         val appContext = context.applicationContext
         val migrated = migrateToNetworkFreeWork(appContext)
         enqueueInternal(appContext, replaceExisting = migrated)
@@ -36,7 +42,7 @@ object DocumentIndexScheduler {
         val constraints = Constraints.Builder().apply {
             // EmbeddingGemma is the only network-dependent part. Once the
             // two artifacts are present, extraction and indexing are local;
-            // keeping CONNECTED here lets Wi-Fi changes stop a valid pass.
+            // CONNECTED permits Wi-Fi, cellular, or hotspot connectivity.
             if (!embeddingGemmaInstalled(context)) {
                 setRequiredNetworkType(NetworkType.CONNECTED)
             }

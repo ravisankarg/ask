@@ -12,8 +12,8 @@ import java.time.LocalDate
 data class QueryExecutionSpec(val root: ExecutionNode) {
     fun render(): String = ExecutionSpecRenderer.render(root)
 
-    /** Validates that Gemma emitted exactly one supported category predicate. */
-    fun requiredQueryCategory(): QueryCategory {
+    /** Reads an optional legacy/internal category envelope. Compact QP never emits it. */
+    fun queryCategoryOrNull(): QueryCategory? {
         val categories = ArrayList<ExecutionNode.Predicate>(1)
         fun collectCategories(node: ExecutionNode) {
             when (node) {
@@ -28,7 +28,7 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
             }
         }
         collectCategories(root)
-        if (categories.isEmpty()) return QueryCategory.SCENARY
+        if (categories.isEmpty()) return null
         require(categories.size == 1) { "Planner spec may contain at most one query_category" }
         val categoryPredicate = categories.single()
         return requireNotNull(QueryCategory.fromWireName(categoryPredicate.value)) {
@@ -36,8 +36,10 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
     }
 
-    /** Validates that every new planner result explicitly declares answer routing. */
-    fun requiredAnswerNeeded(): Boolean {
+    fun requiredQueryCategory(): QueryCategory = queryCategoryOrNull() ?: QueryCategory.SCENARY
+
+    /** Reads an optional legacy/internal answer-routing envelope. */
+    fun answerNeededOrNull(): Boolean? {
         val answers = ArrayList<ExecutionNode.Predicate>(1)
         fun collect(node: ExecutionNode) {
             when (node) {
@@ -50,21 +52,26 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
             }
         }
         collect(root)
-        return answers.singleOrNull()?.value == "true" || answers.isEmpty()
+        require(answers.size <= 1) { "Planner spec may contain at most one answer_needed" }
+        return answers.singleOrNull()?.value?.let { value ->
+            require(value == "true" || value == "false") {
+                "answer_needed must be true or false"
+            }
+            value == "true"
+        }
     }
+
+    fun requiredAnswerNeeded(): Boolean = answerNeededOrNull() ?: true
 
     /**
      * Normalizes Gemma's routing predicate without planning any user intent.
      * All non-category predicates and operators remain model-authored.
      */
     fun canonicalizeCategoryEnvelope(): QueryExecutionSpec {
-        val category = findCategory(root)
-        var answerNeeded: ExecutionNode.Predicate? = null
         fun withoutCategory(node: ExecutionNode): ExecutionNode? = when (node) {
             is ExecutionNode.Predicate -> if (node.field == ExecutionField.QUERY_CATEGORY) {
                 null
             } else if (node.field == ExecutionField.ANSWER_NEEDED) {
-                answerNeeded = node
                 null
             } else {
                 node
@@ -85,12 +92,6 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
         val retrieval = requireNotNull(withoutCategory(root)) { "Planner spec must include a retrieval predicate" }
         return QueryExecutionSpec(retrieval)
-    }
-
-    private fun findCategory(node: ExecutionNode): ExecutionNode.Predicate? = when (node) {
-        is ExecutionNode.Predicate -> node.takeIf { it.field == ExecutionField.QUERY_CATEGORY }
-        is ExecutionNode.Sorted -> findCategory(node.value)
-        is ExecutionNode.Binary -> findCategory(node.left) ?: findCategory(node.right)
     }
 
     companion object {
@@ -528,14 +529,20 @@ private class ExecutionSpecParser(value: String) {
 
 /**
  * Compiles the Gemma planner AST into the bounded retrieval and answer-routing
- * model. The required category is both answer routing metadata and a hard
- * indexed retrieval scope; all predicates execute in [StructuredSearchExecutor].
+ * model. Category and answer intent may be derived from the user's wording;
+ * only retrieval predicates execute in [StructuredSearchExecutor].
  */
 object ExecutionSpecCompiler {
-    fun compile(spec: QueryExecutionSpec): QueryPlan {
-        val requiredAnswerNeeded = spec.requiredAnswerNeeded()
+    fun compile(
+        spec: QueryExecutionSpec,
+        derivedCategory: QueryCategory? = null,
+        derivedAnswerNeeded: Boolean? = null,
+    ): QueryPlan {
+        val explicitCategory = spec.queryCategoryOrNull()
+        val explicitAnswerNeeded = spec.answerNeededOrNull()
+        val requiredAnswerNeeded = derivedAnswerNeeded ?: explicitAnswerNeeded ?: true
+        val queryCategory = derivedCategory ?: explicitCategory ?: QueryCategory.SCENARY
         val canonicalSpec = spec.canonicalizeCategoryEnvelope()
-        val queryCategory = canonicalSpec.requiredQueryCategory()
         val semantic = ArrayList<String>()
         val keywords = ArrayList<String>()
         val negativeSemantic = ArrayList<String>()
@@ -629,8 +636,8 @@ object ExecutionSpecCompiler {
             mediaType = mediaType,
             queryCategory = queryCategory,
             timeHint = time,
-            needsAnswer = true,
-            answerIntentExplicit = false,
+            needsAnswer = requiredAnswerNeeded,
+            answerIntentExplicit = derivedAnswerNeeded != null || explicitAnswerNeeded != null,
             answerEvidenceScope = answerScope,
             executionSpec = canonicalSpec,
         )

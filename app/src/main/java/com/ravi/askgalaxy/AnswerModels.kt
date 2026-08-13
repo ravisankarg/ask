@@ -80,6 +80,8 @@ data class SearchResponse(
     val plannerSession: GemmaRuntime.ConversationSession? = null,
     val plannerJson: String = "",
     val effectivePlanJson: String = "",
+    /** E2B-resolved standalone wording retained only for the next contextual turn. */
+    val resolvedQuery: String = "",
     val queryCategory: QueryCategory = QueryCategory.SCENARY,
     val needsAnswer: Boolean = true,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
@@ -91,19 +93,59 @@ data class SearchResponse(
     val mergedResults: List<HybridSearchResult> = emptyList(),
 )
 
+/**
+ * Freezes the answer window to the same mixed order already published in the
+ * search grid. Answer preparation may enrich these records, but it must never
+ * privately rerank, replace, or backfill them.
+ */
+internal object AnswerEvidencePolicy {
+    const val MAX_RECORDS = 8
+
+    fun displayedTopEight(response: SearchResponse): List<HybridSearchResult> {
+        val displayed = response.mergedResults.ifEmpty {
+            buildList {
+                response.gallery.forEach { add(HybridSearchResult.Gallery(it)) }
+                response.documentMatches.forEach { add(HybridSearchResult.Document(it)) }
+            }
+        }
+        return displayed.take(MAX_RECORDS)
+    }
+}
+
+/** A displayed visual record could not be attached, so answering was stopped. */
+class AnswerEvidenceUnavailableException(
+    val recordNumber: Int,
+    detail: String,
+) : IllegalStateException("Displayed result R$recordNumber could not be read: $detail")
+
 /** Wall-clock durations shown to the user for one complete search answer. */
 data class PhaseTimings(
     val queryPlanningMs: Long = 0L,
     val searchMs: Long = 0L,
     val diverseRerankingMs: Long = 0L,
     val evidenceCurationMs: Long = 0L,
+    val answerImagePreparationMs: Long = 0L,
     val answerGenerationMs: Long = 0L,
+    val answerInitialPassMs: Long = 0L,
+    val answerRetryMs: Long = 0L,
+    val answerAttemptCount: Int = 0,
     val followUpMs: Long = 0L,
     val plannerProfile: GemmaRuntime.GenerationProfile? = null,
     val answerProfile: GemmaRuntime.GenerationProfile? = null,
 ) {
-    fun withAnswerTimings(answerMs: Long, followUpPhaseMs: Long): PhaseTimings = copy(
+    fun withAnswerTimings(
+        answerMs: Long,
+        followUpPhaseMs: Long,
+        imagePreparationMs: Long = 0L,
+        initialPassMs: Long = 0L,
+        retryMs: Long = 0L,
+        attemptCount: Int = 0,
+    ): PhaseTimings = copy(
+        answerImagePreparationMs = imagePreparationMs,
         answerGenerationMs = answerMs,
+        answerInitialPassMs = initialPassMs,
+        answerRetryMs = retryMs,
+        answerAttemptCount = attemptCount,
         followUpMs = followUpPhaseMs,
     )
 
@@ -114,5 +156,6 @@ data class PhaseTimings(
         if (profile == null) this else copy(answerProfile = profile)
 
     val totalMs: Long
-        get() = queryPlanningMs + searchMs + diverseRerankingMs + evidenceCurationMs + answerGenerationMs + followUpMs
+        get() = queryPlanningMs + searchMs + diverseRerankingMs + evidenceCurationMs +
+            answerImagePreparationMs + answerGenerationMs + followUpMs
 }

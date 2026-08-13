@@ -45,6 +45,21 @@ data class DocumentMatch(
     val cosineScore: Float? = null,
 )
 
+/** User-facing personal documents only; machine/config/source files never enter search. */
+internal object PersonalFileSearchPolicy {
+    private val SEARCHABLE_EXTENSIONS = setOf(
+        ".pdf", ".docx", ".odt", ".txt", ".md", ".csv", ".rtf",
+    )
+
+    fun isEligibleName(name: String): Boolean {
+        val normalized = name.substringBefore('?').substringBefore('#').lowercase()
+        return SEARCHABLE_EXTENSIONS.any(normalized::endsWith)
+    }
+
+    fun isEligible(chunk: DocumentChunk): Boolean =
+        chunk.source != DocumentSource.FILES || isEligibleName(chunk.title)
+}
+
 /** Conservative sentence-aware chunks for the 512-token application contract. */
 object DocumentChunker {
     private const val MAX_CHARS = 1_900
@@ -214,6 +229,23 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         return output.sortedBy { it.first }.map { it.second }
     }
 
+    /** All indexed text chunks are inputs for the derived record classifier. */
+    fun allChunksForClassification(): List<DocumentChunk> {
+        val result = ArrayList<DocumentChunk>()
+        readableDatabase.query(
+            "chunks",
+            null,
+            null,
+            null,
+            null,
+            null,
+            "stable_id ASC",
+        ).use { cursor ->
+            while (cursor.moveToNext()) result += chunkFromCursor(cursor)
+        }
+        return result
+    }
+
     /** Returns persisted candidate label/value cards for document chunks. */
     fun answerabilityFacts(stableIds: LongArray): Map<Long, List<AnswerFactGrounding.IndexedFact>> {
         if (stableIds.isEmpty()) return emptyMap()
@@ -340,6 +372,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         fromDate: String = "",
         toDate: String = "",
         senderOnly: Boolean = false,
+        allowedStableIds: Set<Long>? = null,
     ): List<DocumentChunk> {
         val normalizedNeedles = needles.map { it.trim().lowercase() }.filter(String::isNotBlank).distinct()
         if (normalizedNeedles.isEmpty() || limit <= 0) return emptyList()
@@ -361,6 +394,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         ).use { cursor ->
             while (cursor.moveToNext() && output.size < limit) {
                 val chunk = chunkFromCursor(cursor)
+                if (allowedStableIds != null && chunk.stableId !in allowedStableIds) continue
                 if (timeScope != null && chunk.timestampMs != null && !timeScope.matches(chunk.timestampMs)) {
                     continue
                 }
@@ -410,6 +444,10 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
             val timestampColumn = cursor.getColumnIndexOrThrow("timestamp_ms")
             while (cursor.moveToNext()) {
                 val source = DocumentSource.fromWire(cursor.getString(sourceColumn)) ?: continue
+                val title = cursor.getString(titleColumn).orEmpty()
+                if (source == DocumentSource.FILES && !PersonalFileSearchPolicy.isEligibleName(title)) {
+                    continue
+                }
                 val timestamp = cursor.getLong(timestampColumn).takeIf { !cursor.isNull(timestampColumn) }
                 if (source == DocumentSource.MESSAGES &&
                     senderNeedles.isNotEmpty() &&
@@ -427,7 +465,7 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                             source = source,
                             recordKey = "",
                             chunkNumber = 0,
-                            title = cursor.getString(titleColumn),
+                            title = title,
                             text = "",
                             timestampMs = timestamp,
                         ),
@@ -452,7 +490,11 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
         val forbiddenKeywords = setOf("number", "numbers", "num")
         val normalizedGroups = keywordGroups.map { group ->
             group.map { it.lowercase() }
-                .filter { it.isNotBlank() && it !in forbiddenKeywords }
+                .filter {
+                    it.isNotBlank() &&
+                        it !in forbiddenKeywords &&
+                        it !in SearchKeywordPolicy.forbiddenScaffoldingWords
+                }
                 .distinct()
         }.filter { it.isNotEmpty() }
         if (normalizedGroups.isEmpty() || sources.isEmpty()) return emptyList()
@@ -474,6 +516,9 @@ class DocumentDatabase(context: Context) : SQLiteOpenHelper(
                 val title = cursor.getString(cursor.getColumnIndexOrThrow("title"))
                 val text = cursor.getString(cursor.getColumnIndexOrThrow("text"))
                 val metadata = cursor.getString(cursor.getColumnIndexOrThrow("metadata"))
+                if (source == DocumentSource.FILES && !PersonalFileSearchPolicy.isEligibleName(title)) {
+                    continue
+                }
                 if (source == DocumentSource.MESSAGES &&
                     senderNeedles.isNotEmpty() &&
                     senderNeedles.none { needle ->

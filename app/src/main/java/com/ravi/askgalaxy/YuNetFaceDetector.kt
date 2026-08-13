@@ -231,9 +231,14 @@ class YuNetFaceDetector private constructor(
         private val STRIDES = intArrayOf(8, 16, 32)
         private val PAINT = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
-        fun open(context: Context): YuNetFaceDetector = YuNetFaceDetector(
-            LiteRtModel.open(ModelCatalog.faceDetector.file(context), threads = 2),
-        )
+        fun open(context: Context): YuNetFaceDetector {
+            check(ModelInstaller(context).verifyInstalledArtifact(ModelCatalog.faceDetector)) {
+                "YuNet model failed integrity verification"
+            }
+            return YuNetFaceDetector(
+                LiteRtModel.open(ModelCatalog.faceDetector.file(context), threads = 2),
+            )
+        }
     }
 }
 

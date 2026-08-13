@@ -26,6 +26,8 @@ data class ModelInstallReport(
     val missingSources: List<ModelArtifact>,
 )
 
+class ModelAuthorizationRequiredException(message: String) : IOException(message)
+
 /** Resumable, checksum-aware model provisioning owned by the background worker. */
 class ModelInstaller(context: Context) {
     private val appContext = context.applicationContext
@@ -45,7 +47,9 @@ class ModelInstaller(context: Context) {
         if (artifacts.isEmpty()) return ModelInstallReport(emptyList())
 
         artifacts.forEachIndexed { index, artifact ->
-            if (artifact.isInstalled(appContext)) return@forEachIndexed
+            if (artifact.isInstalled(appContext) && verifyInstalledArtifact(artifact)) {
+                return@forEachIndexed
+            }
             if (artifact.packagedAssetPath != null && installPackagedAsset(
                     artifact = artifact,
                     artifactIndex = index + 1,
@@ -70,6 +74,32 @@ class ModelInstaller(context: Context) {
             missingSources = artifacts.filter { !it.isInstalled(appContext) && !it.hasDownloadSource() },
         )
     }
+
+    /**
+     * Verifies a legacy or installed artifact once, then uses a size/mtime
+     * marker for constant-time readiness checks. Call only from background
+     * model-loading or worker threads.
+     */
+    fun verifyInstalledArtifact(artifact: ModelArtifact): Boolean =
+        synchronized(verificationLockFor(artifact.file(appContext).absolutePath)) {
+            val target = artifact.file(appContext)
+            if (!target.isFile ||
+                (artifact.expectedBytes > 0L && target.length() != artifact.expectedBytes)
+            ) {
+                return@synchronized false
+            }
+            val expectedHash = artifact.sha256?.lowercase()?.takeIf(String::isNotBlank)
+                ?: return@synchronized true
+            if (artifact.verificationFile(appContext).isFile && artifact.isInstalled(appContext)) {
+                return@synchronized true
+            }
+            if (sha256(target) != expectedHash) {
+                artifact.markInvalid(appContext)
+                return@synchronized false
+            }
+            artifact.markVerified(appContext)
+            true
+        }
 
     private fun installPackagedAsset(
         artifact: ModelArtifact,
@@ -116,6 +146,7 @@ class ModelInstaller(context: Context) {
             throw IOException("Checksum mismatch for bundled ${artifact.name}")
         }
         atomicInstall(partial, target)
+        artifact.markVerified(appContext)
         onProgress(ModelInstallProgress(artifact, artifactIndex, artifactTotal, downloaded, downloaded))
         return true
     }
@@ -128,6 +159,11 @@ class ModelInstaller(context: Context) {
         artifactTotal: Int,
         onProgress: (ModelInstallProgress) -> Unit,
     ) {
+        if (artifact.requiresAuthentication && authCookie.isNullOrBlank()) {
+            throw ModelAuthorizationRequiredException(
+                "Hugging Face authorization is required. Open Settings and authorize the gated model.",
+            )
+        }
         val target = artifact.file(appContext)
         target.parentFile?.mkdirs()
         val partial = artifact.partFile(appContext)
@@ -139,6 +175,7 @@ class ModelInstaller(context: Context) {
         if (artifact.expectedBytes > 0L && existing == artifact.expectedBytes) {
             if (artifact.sha256.isNullOrBlank() || sha256(partial) == artifact.sha256) {
                 atomicInstall(partial, target)
+                artifact.markVerified(appContext)
                 onProgress(
                     ModelInstallProgress(
                         artifact,
@@ -164,8 +201,19 @@ class ModelInstaller(context: Context) {
             responseCode = connection.responseCode
         }
         if (responseCode !in 200..299) {
+            val errorBody = connection.errorStream?.bufferedReader()?.use { reader ->
+                reader.readText().trim().replace(Regex("\\s+"), " ").take(240)
+            }.orEmpty()
             connection.disconnect()
-            throw IOException("Model download HTTP $responseCode for ${artifact.name}")
+            val suffix = if (errorBody.isBlank()) "" else ": $errorBody"
+            if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED ||
+                responseCode == HttpURLConnection.HTTP_FORBIDDEN
+            ) {
+                throw ModelAuthorizationRequiredException(
+                    "Hugging Face authorization was rejected (HTTP $responseCode) for ${artifact.name}$suffix",
+                )
+            }
+            throw IOException("Model download HTTP $responseCode for ${artifact.name}$suffix")
         }
 
         if (existing > 0L && responseCode == HttpURLConnection.HTTP_PARTIAL) {
@@ -220,6 +268,7 @@ class ModelInstaller(context: Context) {
             throw IOException("Checksum mismatch for ${artifact.name}")
         }
         atomicInstall(partial, target)
+        artifact.markVerified(appContext)
         onProgress(ModelInstallProgress(artifact, artifactIndex, artifactTotal, downloaded, total))
     }
 
@@ -298,6 +347,12 @@ class ModelInstaller(context: Context) {
     }
 
     companion object {
+        private val verificationLocks = HashMap<String, Any>()
+
+        private fun verificationLockFor(path: String): Any = synchronized(verificationLocks) {
+            verificationLocks.getOrPut(path) { Any() }
+        }
+
         private const val BUFFER_SIZE = 1024 * 1024
         private const val REPORT_BYTES = 4L * 1024L * 1024L
         private const val CONNECT_TIMEOUT_MS = 30_000

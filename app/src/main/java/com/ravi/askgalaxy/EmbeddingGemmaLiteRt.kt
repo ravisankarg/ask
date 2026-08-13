@@ -52,6 +52,13 @@ class EmbeddingGemmaLiteRt private constructor(
 
         fun open(context: Context): EmbeddingGemmaLiteRt {
             val appContext = context.applicationContext
+            val installer = ModelInstaller(appContext)
+            check(installer.verifyInstalledArtifact(ModelCatalog.embeddingGemma)) {
+                "EmbeddingGemma model failed integrity verification"
+            }
+            check(installer.verifyInstalledArtifact(ModelCatalog.embeddingGemmaTokenizer)) {
+                "EmbeddingGemma tokenizer failed integrity verification"
+            }
             return EmbeddingGemmaLiteRt(
                 LiteRtCompiledEmbedding.open(ModelCatalog.embeddingGemma.file(appContext)),
                 NativeSentencePiece.open(ModelCatalog.embeddingGemmaTokenizer.file(appContext)),

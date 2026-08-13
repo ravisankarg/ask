@@ -5,6 +5,7 @@ import androidx.work.WorkerParameters
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.IOException
 
 /** Sequential all-source pass with independent, user-visible progress rows. */
 class DocumentIndexWorker(
@@ -16,6 +17,15 @@ class DocumentIndexWorker(
         DocumentIndexRuntimeGate.begin()
         var activeSource = DocumentSource.MESSAGES
         try {
+            setForeground(
+                PreparationNotifier.foregroundInfo(
+                    applicationContext,
+                    PreparationSnapshot(
+                        phase = PreparationPhase.DOWNLOADING,
+                        message = "Preparing personal sources…",
+                    ),
+                ),
+            )
             runCatching {
                 val reader = DocumentSourceReader(applicationContext)
             if (DocumentSource.entries.none(reader::isAvailable)) {
@@ -34,20 +44,46 @@ class DocumentIndexWorker(
 
             val embeddingArtifacts = listOf(ModelCatalog.embeddingGemma, ModelCatalog.embeddingGemmaTokenizer)
             if (embeddingArtifacts.any { !it.isInstalled(applicationContext) }) {
+                val hfCookie = HuggingFaceSession.cookie()
                 progress.update(
                     IndexProgressStage.EMBEDDING_GEMMA,
                     embeddingArtifacts.sumOf { it.partFile(applicationContext).length() },
                     embeddingArtifacts.sumOf { it.expectedBytes },
                     phase = "starting download",
                 )
-                ModelInstaller(applicationContext).installArtifacts(embeddingArtifacts) { install ->
+                var lastDownloadSnapshot = PreparationSnapshot(
+                    phase = PreparationPhase.DOWNLOADING,
+                    message = "Downloading EmbeddingGemma…",
+                    bytesTotal = embeddingArtifacts.sumOf { it.expectedBytes },
+                )
+                setForeground(PreparationNotifier.foregroundInfo(applicationContext, lastDownloadSnapshot))
+                ModelInstaller(applicationContext).installArtifacts(embeddingArtifacts, hfCookie) { install ->
+                    val completedBeforeArtifact = embeddingArtifacts
+                        .take((install.artifactIndex - 1).coerceAtLeast(0))
+                        .sumOf { it.expectedBytes }
+                    val aggregateCurrent = completedBeforeArtifact + install.bytesDownloaded
+                    val aggregateTotal = embeddingArtifacts.sumOf { it.expectedBytes }
+                    lastDownloadSnapshot = lastDownloadSnapshot.copy(
+                        message = "Downloading ${install.artifact.name}…",
+                        bytesCurrent = aggregateCurrent,
+                        bytesTotal = aggregateTotal,
+                    )
                     progress.update(
                         IndexProgressStage.EMBEDDING_GEMMA,
-                        install.bytesDownloaded,
-                        install.bytesTotal,
+                        aggregateCurrent,
+                        aggregateTotal,
                         phase = "Downloading ${install.artifact.name}",
                     )
+                    setForegroundAsync(PreparationNotifier.foregroundInfo(applicationContext, lastDownloadSnapshot))
                 }
+                HuggingFaceSession.clear()
+                progress.update(
+                    IndexProgressStage.EMBEDDING_GEMMA,
+                    embeddingArtifacts.sumOf { it.expectedBytes },
+                    embeddingArtifacts.sumOf { it.expectedBytes },
+                    completed = true,
+                    phase = "Installed",
+                )
             }
             check(embeddingArtifacts.all { it.isInstalled(applicationContext) }) {
                 "LiteRT EmbeddingGemma download did not complete"
@@ -108,18 +144,18 @@ class DocumentIndexWorker(
             Result.success()
             }.getOrElse { error ->
                 Log.e(TAG, "document indexing failed", error)
+                val modelFailure = error is ModelAuthorizationRequiredException
                 progress.update(
-                    activeSource.progressStage(),
+                    if (modelFailure) IndexProgressStage.EMBEDDING_GEMMA else activeSource.progressStage(),
                     0L,
                     0L,
                     completed = false,
                     error = error.message.orEmpty().ifBlank { error.javaClass.simpleName },
-                    phase = "extraction failed",
+                    phase = if (modelFailure) "authorization required" else "extraction failed",
                 )
-                // Stop deterministic GPU/setup or source failures here. The
-                // error is persisted for the UI; an explicit enqueue/restart
-                // can retry after the user or a later app update changes state.
-                Result.failure()
+                // Authorization needs an explicit user action; resumable I/O
+                // can be retried by WorkManager without losing the .part file.
+                if (error is IOException && !modelFailure) Result.retry() else Result.failure()
             }
         } finally {
             DocumentIndexRuntimeGate.end()

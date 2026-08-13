@@ -75,8 +75,12 @@ class FaceNetEncoder private constructor(
         const val IMAGE_SIZE = 160
         const val EMBEDDING_DIMENSION = 512
 
-        fun open(context: Context): FaceNetEncoder =
-            FaceNetEncoder(LiteRtModel.open(ModelCatalog.faceEmbedder.file(context), threads = 2))
+        fun open(context: Context): FaceNetEncoder {
+            check(ModelInstaller(context).verifyInstalledArtifact(ModelCatalog.faceEmbedder)) {
+                "FaceNet model failed integrity verification"
+            }
+            return FaceNetEncoder(LiteRtModel.open(ModelCatalog.faceEmbedder.file(context), threads = 2))
+        }
 
         private fun l2Normalize(values: FloatArray) {
             var sum = 0.0

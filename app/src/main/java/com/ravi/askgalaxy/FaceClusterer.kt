@@ -48,6 +48,70 @@ class FaceClusterer(
         return assignments.size
     }
 
+    /** Assigns only new face rows, preserving all existing cluster membership. */
+    fun appendUnclusteredBlocking(): Int {
+        val records = database.unassignedFaceEmbeddings()
+        if (records.isEmpty()) return database.faceClusterCount()
+
+        val existing = database.existingFaceClusters()
+        val existingMembers = LinkedHashMap<String, MutableList<FaceEmbeddingRecord>>()
+        val newClusters = ArrayList<MutableCluster>()
+        records.sortedWith(compareBy<FaceEmbeddingRecord> { it.mediaStoreId }.thenBy { it.faceIndex })
+            .forEach { record ->
+                val recordNorm = vectorNorm(record.embedding)
+                val existingMatch = existing
+                    .asSequence()
+                    .map { it to cosine(it.centroid, record.embedding) }
+                    .filter { (_, score) -> score >= MATCH_THRESHOLD }
+                    .maxByOrNull { (_, score) -> score }
+
+                var newMatchIndex = -1
+                var newMatchScore = Float.NEGATIVE_INFINITY
+                newClusters.forEachIndexed { index, cluster ->
+                    val score = cluster.cosineTo(record.embedding, recordNorm)
+                    if (score > newMatchScore) {
+                        newMatchIndex = index
+                        newMatchScore = score
+                    }
+                }
+
+                if (existingMatch != null && existingMatch.second >= newMatchScore) {
+                    existingMembers.getOrPut(existingMatch.first.clusterId, ::ArrayList) += record
+                } else if (newMatchIndex >= 0 && newMatchScore >= MATCH_THRESHOLD) {
+                    newClusters[newMatchIndex].add(record)
+                } else {
+                    newClusters += MutableCluster(record)
+                }
+            }
+
+        val assignedIds = existing.mapTo(HashSet()) { it.clusterId }
+        val assignments = ArrayList<IncrementalFaceClusterAssignment>()
+        existingMembers.forEach { (clusterId, members) ->
+            val cluster = existing.first { it.clusterId == clusterId }
+            assignments += IncrementalFaceClusterAssignment(
+                clusterId = clusterId,
+                label = cluster.label,
+                isSelf = cluster.isSelf,
+                memberFaceIds = members.map { it.id }.toLongArray(),
+                memberMediaStoreIds = members.map { it.mediaStoreId }.distinct().toLongArray(),
+            )
+        }
+        newClusters.forEach { mutable ->
+            val cluster = mutable.freeze()
+            val clusterId = newClusterId(cluster.centroid, assignedIds)
+            assignedIds += clusterId
+            assignments += IncrementalFaceClusterAssignment(
+                clusterId = clusterId,
+                label = "",
+                isSelf = false,
+                memberFaceIds = cluster.members.map { it.id }.toLongArray(),
+                memberMediaStoreIds = cluster.members.map { it.mediaStoreId }.distinct().toLongArray(),
+            )
+        }
+        database.appendFaceClusters(assignments)
+        return database.faceClusterCount()
+    }
+
     private fun cluster(records: List<FaceEmbeddingRecord>): List<DiscoveredCluster> {
         val clusters = ArrayList<MutableCluster>()
         records.sortedWith(compareBy<FaceEmbeddingRecord> { it.mediaStoreId }.thenBy { it.faceIndex })

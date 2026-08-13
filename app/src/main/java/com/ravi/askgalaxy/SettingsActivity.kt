@@ -36,6 +36,8 @@ class SettingsActivity : Activity() {
     private lateinit var ocrStatus: TextView
     private lateinit var locationStatus: TextView
     private lateinit var fileAccessStatus: TextView
+    private lateinit var incrementalIndexStatus: TextView
+    private lateinit var incrementalIndexButton: Button
     private lateinit var locationPermissionButton: Button
     private lateinit var answerabilityStatus: TextView
     private lateinit var answerabilityProgress: ProgressBar
@@ -143,10 +145,10 @@ class SettingsActivity : Activity() {
         }, wrap())
         gemmaModelChoice = RadioGroup(this).apply {
             orientation = RadioGroup.VERTICAL
-            addView(gemmaOption(GemmaModelVariant.E4B, "E4B • stronger, larger download"))
+            addView(gemmaOption(GemmaModelVariant.E2B, "E2B • compact, GPU-first download"))
             setOnCheckedChangeListener { _, checkedId ->
                 if (updatingGemmaModelChoice) return@setOnCheckedChangeListener
-                val selected = GemmaModelVariant.E4B
+                val selected = GemmaModelVariant.E2B
                 if (GemmaModelSelection.select(this@SettingsActivity, selected)) {
                     Toast.makeText(
                         this@SettingsActivity,
@@ -159,7 +161,7 @@ class SettingsActivity : Activity() {
         }
         root.addView(gemmaModelChoice, wrap())
         root.addView(TextView(this).apply {
-            text = "The Gemma 4 E4B model runs locally on this device."
+            text = "The Gemma 4 E2B model runs locally on this device with text and vision on the GPU."
             textSize = 13f
             setTextColor(Color.rgb(72, 75, 85))
             setPadding(0, 0, 0, 12)
@@ -171,7 +173,7 @@ class SettingsActivity : Activity() {
         }
         root.addView(models, wrap())
         root.addView(TextView(this).apply {
-            text = "EmbeddingGemma is gated by Google’s Gemma license. Ask Galaxy will show Hugging Face’s sign-in page, then download only the two files needed for personal indexing after you confirm."
+            text = "EmbeddingGemma is the semantic document-embedding model for personal-source search. It is gated by Google’s Gemma license; authorize it here and Ask Galaxy will download its two required files."
             textSize = 13f
             setTextColor(Color.rgb(72, 75, 85))
             setLineSpacing(3f, 1f)
@@ -184,7 +186,6 @@ class SettingsActivity : Activity() {
                 startActivity(Intent(this@SettingsActivity, EmbeddingGemmaAuthorizationActivity::class.java))
             }
         }, wrap())
-
         root.addView(TextView(this).apply {
             text = "Personal sources"
             textSize = 20f
@@ -236,6 +237,37 @@ class SettingsActivity : Activity() {
                 }
             }
         }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Incremental index update"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 20, 0, 4)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Check the phone for photos, videos, PDFs, and supported documents added since the last pass. Only unindexed records are appended. Existing gallery rows, OCR, vectors, faces, labels, document chunks, and files are never cleared or removed."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setLineSpacing(3f, 1f)
+        }, wrap())
+        incrementalIndexStatus = TextView(this).apply {
+            text = "Ready to check for new records."
+            textSize = 13f
+            setTextColor(Color.rgb(90, 93, 103))
+            setPadding(0, 8, 0, 4)
+        }
+        root.addView(incrementalIndexStatus, wrap())
+        incrementalIndexButton = Button(this).apply {
+            text = "Update index"
+            setAllCaps(false)
+            setOnClickListener {
+                if (!isEnabled) return@setOnClickListener
+                isEnabled = false
+                incrementalIndexStatus.text = "Checking for new photos, videos, and files…"
+                IncrementalIndexScheduler.enqueue(this@SettingsActivity)
+                refreshState()
+            }
+        }
+        root.addView(incrementalIndexButton, wrap())
 
         root.addView(TextView(this).apply {
             text = "Preparation progress"
@@ -602,6 +634,21 @@ class SettingsActivity : Activity() {
             runOnUiThread {
                 if (!isFinishing) {
                     updateStageProgress(stageProgress)
+                    val incremental = stageProgress[IndexProgressStage.INCREMENTAL_UPDATE]
+                        ?: StageProgress()
+                    incrementalIndexButton.isEnabled =
+                        incremental.updatedAtMs == 0L || incremental.completed || incremental.error.isNotBlank()
+                    incrementalIndexStatus.text = when {
+                        incremental.error.isNotBlank() ->
+                            "Update paused safely: ${incremental.error}. Existing indexes were preserved; tap to retry."
+                        incremental.completed -> incremental.phase.ifBlank {
+                            "Index update complete. Existing index data was preserved."
+                        }
+                        incremental.updatedAtMs > 0L -> incremental.phase.ifBlank {
+                            "Checking for unindexed records…"
+                        }
+                        else -> "Ready to check for new records."
+                    }
                     ocrStatus.text = when (pendingOcr) {
                         0 -> "Text index is current."
                         -1 -> "Text-index status is temporarily unavailable."
@@ -675,6 +722,7 @@ class SettingsActivity : Activity() {
         nowMs: Long,
     ): String {
         if (progress.completed) return "Complete"
+        if (progress.paused) return "Paused at ${progress.current} / ${progress.total}"
         if (progress.updatedAtMs == 0L) return "Waiting"
         val counts = when {
             stage == IndexProgressStage.MODELS || stage == IndexProgressStage.EMBEDDING_GEMMA ->

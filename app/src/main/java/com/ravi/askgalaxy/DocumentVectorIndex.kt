@@ -99,8 +99,11 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
             ).time
             fun inTimeScope(chunk: DocumentChunk): Boolean =
                 timeScope == null || chunk.timestampMs == null || timeScope.matches(chunk.timestampMs)
-            fun inMediaScope(chunk: DocumentChunk): Boolean = mediaType?.matchesDocumentChunk(chunk) ?: true
-            val hasHardScope = timeScope != null || mediaType != null || senderNeedles.isNotEmpty()
+            fun inMediaScope(chunk: DocumentChunk): Boolean =
+                PersonalFileSearchPolicy.isEligible(chunk) &&
+                    (mediaType?.matchesDocumentChunk(chunk) ?: true)
+            val hasHardScope = timeScope != null || mediaType != null || senderNeedles.isNotEmpty() ||
+                DocumentSource.FILES in sources
             val scopedIdsBySource = if (hasHardScope) {
                 database.stableIdsForSearchScope(
                     sources = sources,
@@ -121,7 +124,10 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                 mediaType = mediaType,
                 senderNeedles = senderNeedles,
             )
-                .filter { inTimeScope(it.first) && inMediaScope(it.first) }
+                .filter { match ->
+                    inTimeScope(match.first) &&
+                        inMediaScope(match.first)
+                }
             val keywordIds = keywordMatches.mapTo(HashSet()) { it.first.stableId }
             // Each private source owns an independent TurboQuant file. Search
             // those files concurrently after the single query embedding is
@@ -154,9 +160,11 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                     }
                 },
             ).flatMap { it.get() }
-            // A keyword group is an AND contract. Semantic similarity cannot
-            // bypass it: otherwise a calendar row containing only "ticket"
-            // can enter an "Odyssey movie ticket" search.
+            // A keyword group is an AND contract, and private hybrid search
+            // is also an intersection: semantic similarity cannot bypass it,
+            // and keyword-only rows cannot enter the result either. This
+            // prevents a calendar row containing only "ticket" from entering
+            // an "Odyssey movie ticket" search.
             val semanticMatches = rawSemanticMatches.filter {
                 !hasKeywordContract || it.chunk.stableId in keywordIds
             }
@@ -164,17 +172,13 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
             semanticMatches.forEach { match -> byId[match.chunk.stableId] = match }
             val highestCosine = semanticMatches.maxOfOrNull { it.cosineScore ?: 0f }?.coerceIn(0f, 1f) ?: 1f
             keywordMatches.forEach { (chunk, coverage) ->
-                val existing = byId[chunk.stableId]
+                val existing = byId[chunk.stableId] ?: return@forEach
                 val keywordScore = highestCosine * coverage
-                byId[chunk.stableId] = if (existing == null) {
-                    DocumentMatch(chunk, keywordScore, rank = 0, fusionScore = keywordScore)
-                } else {
-                    val cosine = existing.cosineScore ?: 0f
-                    existing.copy(
-                        score = cosine + keywordScore,
-                        fusionScore = cosine + keywordScore,
-                    )
-                }
+                val cosine = existing.cosineScore ?: 0f
+                byId[chunk.stableId] = existing.copy(
+                    score = cosine + keywordScore,
+                    fusionScore = cosine + keywordScore,
+                )
             }
             // Per-source limits are only the candidate budget. The user-facing
             // contract is one ranked window across all private apps.
@@ -186,7 +190,7 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                 .take(limitPerSource)
             Log.i(
                 TAG,
-                "private search semantic=1 keywordGroups=${keywordGroups.size} " +
+                "private search semanticAndKeyword=1 keywordGroups=${keywordGroups.size} " +
                     "keywordMatches=${keywordMatches.size} " +
                         "sources=${sources.size} results=${merged.size} " +
                     "semanticDropped=${rawSemanticMatches.size - semanticMatches.size} " +

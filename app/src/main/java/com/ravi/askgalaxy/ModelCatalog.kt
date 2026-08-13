@@ -10,17 +10,56 @@ data class ModelArtifact(
     val required: Boolean,
     val downloadUrl: String? = null,
     val packagedAssetPath: String? = null,
+    val requiresAuthentication: Boolean = false,
     val expectedBytes: Long = 0L,
     val sha256: String? = null,
     val sourceLabel: String = "Automatic background download",
 ) {
     fun file(context: Context): File = File(context.filesDir, relativePath)
     fun partFile(context: Context): File = File(context.filesDir, "$relativePath.part")
+    internal fun verificationFile(context: Context): File =
+        File(context.filesDir, "$relativePath.verified")
+    internal fun invalidFile(context: Context): File =
+        File(context.filesDir, "$relativePath.invalid")
 
     fun isInstalled(context: Context): Boolean {
         val target = file(context)
-        return target.isFile && (expectedBytes <= 0L || target.length() == expectedBytes)
+        if (!target.isFile || (expectedBytes > 0L && target.length() != expectedBytes)) return false
+        if (invalidFile(context).isFile) return false
+        val expectedHash = sha256?.lowercase()?.takeIf(String::isNotBlank) ?: return true
+        val marker = verificationFile(context)
+        // Existing pre-marker installs were checksum-verified by the previous
+        // installer. Their first background/model-open verification migrates
+        // them without blocking Activity readiness on a multi-GB hash.
+        if (!marker.isFile) return true
+        return runCatching { marker.readText().trim() == verificationFingerprint(target, expectedHash) }
+            .getOrDefault(false)
     }
+
+    internal fun markVerified(context: Context) {
+        val target = file(context)
+        val expectedHash = sha256?.lowercase()?.takeIf(String::isNotBlank) ?: return
+        val marker = verificationFile(context)
+        marker.parentFile?.mkdirs()
+        val partialMarker = File(marker.parentFile, "${marker.name}.part")
+        partialMarker.writeText(verificationFingerprint(target, expectedHash))
+        check(partialMarker.renameTo(marker) || runCatching {
+            partialMarker.copyTo(marker, overwrite = true)
+            partialMarker.delete()
+        }.isSuccess) { "Could not persist verification marker for $name" }
+        invalidFile(context).delete()
+    }
+
+    internal fun markInvalid(context: Context) {
+        verificationFile(context).delete()
+        invalidFile(context).apply {
+            parentFile?.mkdirs()
+            writeText("checksum mismatch")
+        }
+    }
+
+    private fun verificationFingerprint(target: File, expectedHash: String): String =
+        "$expectedHash:${target.length()}:${target.lastModified()}"
 
     fun hasDownloadSource(): Boolean = !downloadUrl.isNullOrBlank()
 }
@@ -29,12 +68,12 @@ enum class GemmaModelVariant(
     val preferenceValue: String,
     val displayName: String,
 ) {
-    E4B("e4b", "Gemma 4 E4B"),
+    E2B("e2b", "Gemma 4 E2B"),
     ;
 
     companion object {
         fun fromPreference(value: String?): GemmaModelVariant =
-            entries.firstOrNull { it.preferenceValue == value } ?: E4B
+            entries.firstOrNull { it.preferenceValue == value } ?: E2B
     }
 }
 
@@ -46,7 +85,7 @@ object GemmaModelSelection {
     fun selected(context: Context): GemmaModelVariant = GemmaModelVariant.fromPreference(
         context.applicationContext
             .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-            .getString(VARIANT_KEY, GemmaModelVariant.E4B.preferenceValue),
+            .getString(VARIANT_KEY, GemmaModelVariant.E2B.preferenceValue),
     )
 
     fun select(context: Context, variant: GemmaModelVariant): Boolean {
@@ -72,8 +111,10 @@ object ModelCatalog {
         runtime = "LiteRT GPU (512 tokens, 768-D)",
         required = false,
         downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq512_mixed-precision.tflite?download=true",
+        packagedAssetPath = "embeddinggemma-300M_seq512_mixed-precision.tflite",
+        requiresAuthentication = true,
         expectedBytes = 179132472L,
-        sourceLabel = "Hugging Face Gemma license; browser download and import",
+        sourceLabel = "Locally packaged asset or Hugging Face Gemma-license download",
     )
 
     val embeddingGemmaTokenizer = ModelArtifact(
@@ -82,8 +123,10 @@ object ModelCatalog {
         runtime = "SentencePiece",
         required = false,
         downloadUrl = "https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/sentencepiece.model?download=true",
+        packagedAssetPath = "sentencepiece.model",
+        requiresAuthentication = true,
         expectedBytes = 4_683_319L,
-        sourceLabel = "Hugging Face Gemma license; browser download and import",
+        sourceLabel = "Locally packaged asset or Hugging Face Gemma-license download",
     )
 
     val siglipVision = ModelArtifact(
@@ -144,32 +187,38 @@ object ModelCatalog {
         sourceLabel = "Pinned Apache-2.0 Android FaceNet TFLite artifact",
     )
 
-    val gemmaE4B = ModelArtifact(
-        name = "Gemma 4 E4B instruction",
-        relativePath = "models/gemma-4-E4B-it.litertlm",
+    val gemmaE2B = ModelArtifact(
+        name = "Gemma 4 E2B instruction",
+        relativePath = "models/gemma-4-E2B-it.litertlm",
         runtime = "LiteRT-LM",
         required = true,
-        downloadUrl = "https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/f7ad3343bd6ebc9607f4dc3bc4f2398bd5749bc5/gemma-4-E4B-it.litertlm?download=true",
-        expectedBytes = 3_659_530_240L,
-        sha256 = "0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0",
+        downloadUrl = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/6b78abd019e61a1ca4cbe3b212d2c9ce8ff38a94/gemma-4-E2B-it.litertlm?download=true",
+        expectedBytes = 2_588_147_712L,
+        sha256 = "181938105e0eefd105961417e8da75903eacda102c4fce9ce90f50b97139a63c",
         sourceLabel = "LiteRT Community pinned model revision",
     )
 
-    fun gemma(context: Context): ModelArtifact = gemmaE4B
+    fun gemma(context: Context): ModelArtifact = gemmaE2B
 
-    /** Removes model files from versions that offered the retired E2B option. */
+    /** Migrates the selected model and removes only the retired E4B artifact. */
     fun removeRetiredModels(context: Context) {
         val modelsDir = File(context.filesDir, "models")
         modelsDir.walkBottomUp()
-            .filter { it.name.contains("E2B", ignoreCase = true) }
+            .filter { it.name.contains("E4B", ignoreCase = true) }
             .forEach { if (it.isDirectory) it.deleteRecursively() else it.delete() }
         File(modelsDir, "lfm2.5-vl").deleteRecursively()
+        // The experimental LFM2 derived index has been retired. These are
+        // feature-owned artifacts only; gallery and document indexes remain.
+        File(modelsDir, "lfm2").deleteRecursively()
+        context.deleteDatabase("record_classification.db")
+        File(modelsDir, "gemma3-270m-it-q8.litertlm").delete()
+        File(modelsDir, "gemma3-270m-it-q8.qualcomm.sm8750.litertlm").delete()
         // Do not delete persisted personal/document data during normal app
         // startup. Reinstalling/updating the APK must preserve indexed
         // messages, files, and their resumable progress. Retired model
         // artifacts are safe to remove; user data is not.
         context.getSharedPreferences("ask_galaxy_model_selection", Context.MODE_PRIVATE)
-            .edit().putString("gemma_variant", GemmaModelVariant.E4B.preferenceValue).apply()
+            .edit().putString("gemma_variant", GemmaModelVariant.E2B.preferenceValue).apply()
     }
 
     fun all(context: Context): List<ModelArtifact> = listOf(

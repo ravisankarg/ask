@@ -52,7 +52,9 @@ class PreparationWorker(
 
     private suspend fun runPreparation(): Result {
         val indexProgressStore = IndexProgressStore(applicationContext)
-        var snapshot = store.read().copy(
+        val previousPreparation = store.read()
+        val wasAlreadyPrepared = previousPreparation.isPrepared
+        var snapshot = previousPreparation.copy(
             phase = PreparationPhase.DOWNLOADING,
             message = "Installing on-device models in the background…",
             error = "",
@@ -64,7 +66,7 @@ class PreparationWorker(
         val indexingModels = ModelCatalog.all(applicationContext)
             .filter { it.required && it != selectedGemma }
         val installer = ModelInstaller(applicationContext)
-        val report = installer.installArtifacts(indexingModels) { progress ->
+        val report = installer.installArtifacts(indexingModels, HuggingFaceSession.cookie()) { progress ->
             snapshot = snapshot.copy(
                 phase = PreparationPhase.DOWNLOADING,
                 message = "Installing indexing model ${progress.artifact.name}…",
@@ -78,6 +80,7 @@ class PreparationWorker(
             store.write(snapshot)
             setForegroundAsync(PreparationNotifier.foregroundInfo(applicationContext, snapshot))
         }
+        HuggingFaceSession.clear()
 
         if (report.missingSources.isNotEmpty()) {
             val names = report.missingSources.joinToString { it.name }

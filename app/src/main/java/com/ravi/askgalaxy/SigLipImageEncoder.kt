@@ -92,8 +92,12 @@ class SigLipImageEncoder private constructor(
         const val IMAGE_SIZE = 224
         const val EMBEDDING_DIMENSION = 768
 
-        fun open(context: android.content.Context): SigLipImageEncoder =
-            SigLipImageEncoder(LiteRtModel.open(ModelCatalog.siglipVision.file(context)))
+        fun open(context: android.content.Context): SigLipImageEncoder {
+            check(ModelInstaller(context).verifyInstalledArtifact(ModelCatalog.siglipVision)) {
+                "SigLIP vision model failed integrity verification"
+            }
+            return SigLipImageEncoder(LiteRtModel.open(ModelCatalog.siglipVision.file(context)))
+        }
 
         private fun l2Normalize(values: FloatArray) {
             var sum = 0.0

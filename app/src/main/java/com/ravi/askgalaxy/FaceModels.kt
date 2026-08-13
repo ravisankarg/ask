@@ -58,3 +58,12 @@ data class FaceClusterAssignment(
     val memberFaceIds: LongArray,
     val memberMediaStoreIds: LongArray,
 )
+
+/** New face members to attach without clearing or reclustering existing rows. */
+data class IncrementalFaceClusterAssignment(
+    val clusterId: String,
+    val label: String,
+    val isSelf: Boolean,
+    val memberFaceIds: LongArray,
+    val memberMediaStoreIds: LongArray,
+)

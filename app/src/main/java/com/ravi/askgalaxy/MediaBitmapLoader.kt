@@ -18,12 +18,13 @@ class MediaBitmapLoader(context: Context) : Closeable {
         media: GalleryMedia,
         maxDimension: Int? = 768,
         applyExifOrientation: Boolean = false,
+        exactMaxDimension: Boolean = false,
     ): Bitmap? {
         val uri = Uri.parse(media.contentUri)
         return if (media.mimeType.startsWith("video/")) {
             loadVideoFrame(uri, maxDimension)
         } else {
-            loadImage(uri, maxDimension, applyExifOrientation)
+            loadImage(uri, maxDimension, applyExifOrientation, exactMaxDimension)
         }
     }
 
@@ -39,6 +40,7 @@ class MediaBitmapLoader(context: Context) : Closeable {
         uri: Uri,
         maxDimension: Int?,
         applyExifOrientation: Boolean,
+        exactMaxDimension: Boolean,
     ): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -58,8 +60,10 @@ class MediaBitmapLoader(context: Context) : Closeable {
         val decoded = resolver.openInputStream(uri)?.use { stream ->
             BitmapFactory.decodeStream(stream, null, options)
         }
-        if (decoded == null || !applyExifOrientation) return decoded
-        return orient(decoded, readOrientation(uri))
+        if (decoded == null) return null
+        val oriented = if (applyExifOrientation) orient(decoded, readOrientation(uri)) else decoded
+        if (!exactMaxDimension || maxDimension == null || maxDimension <= 0) return oriented
+        return scaleToFit(oriented, maxDimension)
     }
 
     private fun readOrientation(uri: Uri): Int = runCatching {
@@ -121,6 +125,20 @@ class MediaBitmapLoader(context: Context) : Closeable {
             true,
         )
         if (scaled !== frame) frame.recycle()
+        return scaled
+    }
+
+    private fun scaleToFit(bitmap: Bitmap, maxDimension: Int): Bitmap {
+        val largest = maxOf(bitmap.width, bitmap.height)
+        if (largest <= maxDimension) return bitmap
+        val scale = maxDimension.toFloat() / largest
+        val scaled = Bitmap.createScaledBitmap(
+            bitmap,
+            (bitmap.width * scale).toInt().coerceAtLeast(1),
+            (bitmap.height * scale).toInt().coerceAtLeast(1),
+            true,
+        )
+        if (scaled !== bitmap && !bitmap.isRecycled) bitmap.recycle()
         return scaled
     }
 }

@@ -10,6 +10,7 @@ enum class IndexProgressStage(val wire: String, val label: String) {
     LOCATION("location", "Photo locations"),
     FACE("face", "Face index"),
     EPISODE("episode", "Photo episodes"),
+    INCREMENTAL_UPDATE("incremental_update", "Incremental update"),
     DOCUMENT("document", "All personal sources (overall)"),
     DOCUMENT_MESSAGES("document_messages", "Messages"),
     DOCUMENT_CALENDAR("document_calendar", "Calendar"),
@@ -24,6 +25,7 @@ data class StageProgress(
     val startedAtMs: Long = 0L,
     val updatedAtMs: Long = 0L,
     val completed: Boolean = false,
+    val paused: Boolean = false,
     val error: String = "",
     val phase: String = "",
 ) {
@@ -53,6 +55,7 @@ class IndexProgressStore(context: Context) {
             startedAtMs = preferences.getLong(key(stage, "started"), 0L),
             updatedAtMs = preferences.getLong(key(stage, "updated"), 0L),
             completed = preferences.getBoolean(key(stage, "completed"), false),
+            paused = preferences.getBoolean(key(stage, "paused"), false),
             error = preferences.getString(key(stage, "error"), null).orEmpty(),
             phase = preferences.getString(key(stage, "phase"), null).orEmpty(),
         )
@@ -68,10 +71,12 @@ class IndexProgressStore(context: Context) {
         completed: Boolean = total > 0L && current >= total,
         error: String = "",
         phase: String = "",
+        paused: Boolean? = null,
     ) {
         synchronized(preferences) {
             val previousStarted = preferences.getLong(key(stage, "started"), 0L)
             val previousCurrent = preferences.getLong(key(stage, "current"), 0L)
+            val previousPaused = preferences.getBoolean(key(stage, "paused"), false)
             val now = System.currentTimeMillis()
             val started = if (previousStarted == 0L || current < previousCurrent) now else previousStarted
             preferences.edit()
@@ -80,6 +85,7 @@ class IndexProgressStore(context: Context) {
                 .putLong(key(stage, "started"), started)
                 .putLong(key(stage, "updated"), now)
                 .putBoolean(key(stage, "completed"), completed)
+                .putBoolean(key(stage, "paused"), paused ?: previousPaused)
                 .putString(key(stage, "error"), error)
                 .putString(key(stage, "phase"), phase)
                 .apply()
@@ -87,7 +93,7 @@ class IndexProgressStore(context: Context) {
     }
 
     fun reset(stage: IndexProgressStage) {
-        update(stage, 0L, 0L, completed = false)
+        update(stage, 0L, 0L, completed = false, paused = false)
     }
 
     private fun key(stage: IndexProgressStage, suffix: String): String =

@@ -14,7 +14,6 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -103,19 +102,18 @@ class SearchResultsUiDeviceTest {
             val gridColumns = onMain(instrumentation) { grid.numColumns }
             assertEquals(4, gridColumns)
 
-            val detailMonitor = instrumentation.addMonitor(
-                MediaDetailActivity::class.java.name,
-                null,
-                false,
-            )
             onMain(instrumentation) {
                 val position = 0
                 val item = grid.adapter.getView(position, null, grid)
                 item.performClick()
             }
-            val detail = detailMonitor.waitForActivityWithTimeout(DETAIL_TIMEOUT_MS)
-            assertNotNull("Clicking a search result did not open details", detail)
-            requireNotNull(detail).finish()
+            instrumentation.waitForIdleSync()
+            val detailBack = requireNotNull(onMain(instrumentation) {
+                activity.window.decorView.descendants().firstOrNull {
+                    it.contentDescription?.toString() == "Back to search results"
+                }
+            }) { "In-place detail Back button is missing" }
+            onMain(instrumentation) { detailBack.performClick() }
             instrumentation.waitForIdleSync()
 
             val afterBack = snapshot(instrumentation, activity)
@@ -158,8 +156,8 @@ class SearchResultsUiDeviceTest {
             answerGenerating =
                 modelStatus.visibility == View.VISIBLE &&
                     (
-                        modelStatus.text.toString().startsWith("Gemma 4 E4B is joining") ||
-                            modelStatus.text.toString().startsWith("Gemma 4 E4B is reading")
+                        modelStatus.text.toString().startsWith("Gemma 4 E2B is joining") ||
+                            modelStatus.text.toString().startsWith("Gemma 4 E2B is reading")
                         ),
             gridHeight = grid.height,
             gridChildCount = grid.childCount,
@@ -234,7 +232,6 @@ class SearchResultsUiDeviceTest {
         const val POLL_INTERVAL_MS = 250L
         const val SEARCH_TIMEOUT_MS = 240_000L
         const val SCROLL_TIMEOUT_MS = 10_000L
-        const val DETAIL_TIMEOUT_MS = 10_000L
         const val TAG = "AskGalaxySearchUi"
         val RAW_FILENAME_PATTERN = Regex(
             "(?i)\\b[^\\s]+\\.(?:jpe?g|png|webp|heic|gif|mp4|mov|mkv)\\b",

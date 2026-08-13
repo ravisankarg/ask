@@ -377,11 +377,15 @@ class GemmaRuntime private constructor(
             temperature = 0.35,
             seed = 29,
         )
-        // The answer contract carries the complete selected top-four
-        // evidence block. Keep the graph capacity aligned with the product
-        // contract; request-level visual inputs remain capped at four.
-        private const val E4B_MAX_CONTEXT_TOKENS = 8192
-        private const val MAX_IMAGES = 4
+        // The answer contract carries the complete selected visual evidence
+        // block. Keep the graph capacity aligned with the product contract;
+        // request-level visual inputs remain capped at eight ranked records
+        // plus one optional identity crop.
+        // Prompts, planner repairs, answer grounding, and warmup behavior stay
+        // unchanged after the model swap; only the context/image capacity is
+        // raised for the requested 16K/nine-image policy.
+        private const val E2B_MAX_CONTEXT_TOKENS = 16_384
+        private const val MAX_IMAGES = 9
         private val residentLock = Any()
         private val prefilledPlannerLock = Any()
         private val prefilledAnswerLock = Any()
@@ -407,7 +411,7 @@ class GemmaRuntime private constructor(
         private var plannerWarmupStateListener: ((Boolean) -> Unit)? = null
 
         @Volatile
-        private var backendPlacement = "text CPU/4 threads • vision GPU"
+        private var backendPlacement = "E2B full GPU • text + vision"
 
         @Volatile
         private var prefilledPlanner: ConversationSession? = null
@@ -437,7 +441,7 @@ class GemmaRuntime private constructor(
                 .onFailure { error -> Log.w(TAG, "Planner warmup UI callback failed", error) }
         }
 
-        /** Returns the one resident CPU Gemma engine for the app process. */
+        /** Returns the one resident GPU Gemma engine for the app process. */
         fun shared(context: Context): GemmaRuntime {
             check(!DocumentIndexRuntimeGate.isActive()) {
                 "Gemma 4 is paused while personal document indexing is active"
@@ -597,7 +601,7 @@ class GemmaRuntime private constructor(
         /** Takes the warmed answer conversation for the next answer turn. */
         fun takePrefilledAnswerSession(allowTextOnlyRawSession: Boolean = true): ConversationSession? {
             // QP deliberately switches to the answer system context. Do not
-            // race that load by falling back to an uncached 12K Conversation;
+            // race that load by falling back to an uncached 16K Conversation;
             // answerAsync is already off the UI thread, so waiting here keeps
             // the costly work outside the submitted answer latency.
             val pending = answerPrefillFuture
@@ -649,8 +653,10 @@ class GemmaRuntime private constructor(
         }
 
         private fun open(context: Context): GemmaRuntime {
-            val model = modelFile(context)
-            check(model.isFile) {
+            val artifact = ModelCatalog.gemma(context)
+            val model = artifact.file(context)
+            check(ModelInstaller(context).verifyInstalledArtifact(artifact)) {
+                GemmaDownloadScheduler.enqueueIfNeeded(context)
                 "Gemma model is not installed: ${model.absolutePath}"
             }
             val cacheDir = File(context.filesDir, "models/cache").apply {
@@ -683,14 +689,15 @@ class GemmaRuntime private constructor(
                     throw error
                 }
             }
-            // Strict E4B configuration: both language and vision run on the
+            // Strict E2B configuration: both language and vision run on the
             // phone GPU. A device without a usable GPU backend fails clearly.
-            backendPlacement = "E4B full GPU • text + vision"
+            backendPlacement = "E2B full GPU • text + vision"
             return initialize(
                 language = Backend.GPU(),
                 vision = Backend.GPU(),
-                maxContextTokens = E4B_MAX_CONTEXT_TOKENS,
+                maxContextTokens = E2B_MAX_CONTEXT_TOKENS,
             )
         }
+
     }
 }

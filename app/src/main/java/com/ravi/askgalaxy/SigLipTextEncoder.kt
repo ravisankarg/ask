@@ -78,10 +78,19 @@ class SigLipTextEncoder private constructor(
         const val EMBEDDING_DIMENSION = 768
         private const val QUERY_CACHE_CAPACITY = 32
 
-        fun open(context: Context): SigLipTextEncoder = SigLipTextEncoder(
-            LiteRtModel.open(ModelCatalog.siglipText.file(context)),
-            NativeTokenizer.open(ModelCatalog.siglipTokenizer.file(context)),
-        )
+        fun open(context: Context): SigLipTextEncoder {
+            val installer = ModelInstaller(context)
+            check(installer.verifyInstalledArtifact(ModelCatalog.siglipText)) {
+                "SigLIP text model failed integrity verification"
+            }
+            check(installer.verifyInstalledArtifact(ModelCatalog.siglipTokenizer)) {
+                "SigLIP tokenizer failed integrity verification"
+            }
+            return SigLipTextEncoder(
+                LiteRtModel.open(ModelCatalog.siglipText.file(context)),
+                NativeTokenizer.open(ModelCatalog.siglipTokenizer.file(context)),
+            )
+        }
 
         /** Keeps the text tower warm while the search field is available. */
         fun preloadAsync(context: Context) {

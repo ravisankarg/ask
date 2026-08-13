@@ -43,6 +43,7 @@ class MainActivity : Activity() {
     private lateinit var preparationPanel: LinearLayout
     private lateinit var preparationStatus: TextView
     private lateinit var preparationProgress: ProgressBar
+    private lateinit var preparationAction: Button
     private lateinit var searchPanel: LinearLayout
     private lateinit var conversationScroll: ScrollView
     private lateinit var facePromptPanel: LinearLayout
@@ -86,6 +87,9 @@ class MainActivity : Activity() {
     private var lastSubmittedAtMs = 0L
     /** The visible result set is reused by follow-up chips; no new QP/search. */
     private var activeSearchResponse: SearchResponse? = null
+    /** One accepted turn only; supplied locally to E2B for indirect follow-up resolution. */
+    private var previousGroundedQuery = ""
+    private var previousGroundedAnswer = ""
     private var followUpInFlight = false
     private var deferredFreshQuery: String? = null
     private var deferredPreserveConversation = false
@@ -133,7 +137,8 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ModelCatalog.removeRetiredModels(this)
-        WorkManager.getInstance(this).cancelUniqueWork("ask_galaxy_kv_document_index")
+        // Retire any persisted work from the removed experimental KV feature.
+        WorkManager.getInstance(this).cancelUniqueWork("ask_galaxy_record_classification")
         PreparationNotifier.createChannel(this)
         galleryIndexer = GalleryIndexer(this)
         setContentView(createContent())
@@ -192,13 +197,17 @@ class MainActivity : Activity() {
             DocumentIndexScheduler.enqueue(this)
         }
         val preparation = PreparationStore(this).read()
+        val selectedGemma = ModelCatalog.gemma(this)
+        val indexingModelsReady = ModelCatalog.all(this)
+            .filter { it.required && it != selectedGemma }
+            .all { it.isInstalled(this) }
         val visual = IndexProgressStore(this).read(IndexProgressStage.VISUAL)
         val visualWorkerStale =
             !visual.completed &&
                 visual.current > 0L &&
                 visual.updatedAtMs > 0L &&
                 System.currentTimeMillis() - visual.updatedAtMs > STALE_WORKER_TIMEOUT_MS
-        if (!preparation.isPrepared) {
+        if (!preparation.isPrepared || !indexingModelsReady) {
             if (visualWorkerStale) {
                 PreparationScheduler.restart(this)
             } else {
@@ -235,7 +244,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
-        // Full-GPU E4B is intentionally released as soon as the UI is no
+        // Full-GPU E2B is intentionally released as soon as the UI is no
         // longer visible. Reopening the app pays a cold-load cost, but avoids
         // retaining several GiB of GL/native memory in the background.
         if (!isChangingConfigurations) {
@@ -365,6 +374,11 @@ class MainActivity : Activity() {
             setTextColor(Color.GRAY)
             setPadding(0, 0, 0, dp(12))
         }, matchWrap())
+        preparationAction = Button(this).apply {
+            setAllCaps(false)
+            visibility = View.GONE
+        }
+        preparationPanel.addView(preparationAction, matchWrap())
         root.addView(preparationPanel, matchWrap())
 
         facePromptPanel = LinearLayout(this).apply {
@@ -673,8 +687,6 @@ class MainActivity : Activity() {
             max = 100
             progress = 0
             progressTintList = ColorStateList.valueOf(Color.rgb(82, 103, 205))
-            minHeight = dp(3)
-            maxHeight = dp(3)
         }
         answerPipelinePanel.addView(
             answerPipelineProgress,
@@ -721,8 +733,23 @@ class MainActivity : Activity() {
     /** @return true only while preparation progress needs periodic polling. */
     private fun refreshPreparation(): Boolean {
         val snapshot = PreparationStore(this).read()
-        val indexPrepared = snapshot.isPrepared
+        val indexProgressStore = IndexProgressStore(this)
+        val embeddingProgress = indexProgressStore.read(IndexProgressStage.EMBEDDING_GEMMA)
+        val documentProgress = indexProgressStore.read(IndexProgressStage.DOCUMENT)
+        val personalSourcesEnabled = runCatching {
+            val reader = DocumentSourceReader(this)
+            DocumentSource.entries.any(reader::isAvailable)
+        }.getOrDefault(false)
         val selectedGemma = ModelCatalog.gemma(this)
+        val embeddingArtifacts = listOf(ModelCatalog.embeddingGemma, ModelCatalog.embeddingGemmaTokenizer)
+        val embeddingReady = embeddingArtifacts.all { it.isInstalled(this) }
+        val embeddingBytes = embeddingArtifacts.sumOf { artifact ->
+            when {
+                artifact.isInstalled(this) -> artifact.expectedBytes
+                artifact.partFile(this).isFile -> artifact.partFile(this).length()
+                else -> 0L
+            }
+        }
         val gemmaReady = selectedGemma.isInstalled(this)
         val gemmaPart = selectedGemma.partFile(this)
         val gemmaBytes = gemmaPart.takeIf { it.isFile }?.length() ?: 0L
@@ -732,33 +759,95 @@ class MainActivity : Activity() {
             0
         }
         val waitingForFaceTags = snapshot.phase == PreparationPhase.WAITING_FOR_FACE_TAGS
-        val ready = snapshot.isReady && gemmaReady
-        val gemmaOnly = indexPrepared && !gemmaReady
-        preparationProgress.isIndeterminate = if (gemmaOnly) false else snapshot.total <= 0L && !ready
-        preparationProgress.progress = if (gemmaOnly) gemmaPercent else snapshot.percent
-        preparationStatus.text = if (waitingForFaceTags) {
-            if (gemmaOnly) {
-                "Face groups are ready. Gemma 4 is still downloading (${gemmaPercent}%). You can review groups now."
-            } else {
-                "Face groups are ready. Review the complete set once, merge duplicates, then name the people you know."
+        val galleryReady = snapshot.isReady
+        val personalIndexReady = !personalSourcesEnabled || documentProgress.completed
+        val allIndexingReady = galleryReady && embeddingReady && personalIndexReady
+        val ready = allIndexingReady && gemmaReady
+        val searchReadyNow = ready
+
+        val statusProgress: Int
+        val statusIndeterminate: Boolean
+        when {
+            !embeddingReady -> {
+                statusProgress = if (embeddingProgress.total > 0L) {
+                    embeddingProgress.percent
+                } else {
+                    ((embeddingBytes * 100L) / embeddingArtifacts.sumOf { it.expectedBytes })
+                        .toInt().coerceIn(0, 100)
+                }
+                statusIndeterminate = embeddingBytes == 0L && embeddingProgress.total <= 0L
             }
-        } else if (gemmaOnly) {
-            if (gemmaBytes > 0L) {
-                "Gallery index is ready. Installing ${selectedGemma.name}: ${formatBytes(gemmaBytes)} / ${formatBytes(selectedGemma.expectedBytes)}"
-            } else {
-                "Gallery index is ready. Gemma 4 download is queued…"
+            !galleryReady -> {
+                statusProgress = snapshot.percent
+                statusIndeterminate = snapshot.total <= 0L
             }
-        } else {
-            snapshot.message
+            !personalIndexReady -> {
+                statusProgress = documentProgress.percent
+                statusIndeterminate = documentProgress.total <= 0L
+            }
+            !gemmaReady -> {
+                statusProgress = gemmaPercent
+                statusIndeterminate = gemmaBytes == 0L
+            }
+            else -> {
+                statusProgress = 100
+                statusIndeterminate = false
+            }
+        }
+        preparationProgress.isIndeterminate = statusIndeterminate
+        preparationProgress.progress = statusProgress
+
+        preparationStatus.text = when {
+            !embeddingReady && embeddingProgress.phase == "authorization required" ->
+                "Download EmbeddingGemma model — sign in to Hugging Face and accept the Gemma license."
+            !embeddingReady && embeddingProgress.error.isNotBlank() ->
+                "EmbeddingGemma download paused: ${embeddingProgress.error}"
+            !embeddingReady && embeddingBytes > 0L ->
+                "Download EmbeddingGemma model: ${formatBytes(embeddingBytes)} / ${formatBytes(embeddingArtifacts.sumOf { it.expectedBytes })}"
+            !embeddingReady ->
+                "Download EmbeddingGemma model — waiting for authorization."
+            !galleryReady && waitingForFaceTags ->
+                "Gallery indexing is complete. Review and name your private face groups before searching."
+            !galleryReady ->
+                "Indexing your gallery: ${snapshot.message}"
+            !personalIndexReady && documentProgress.error.isNotBlank() ->
+                "Personal indexing paused: ${documentProgress.error}"
+            !personalIndexReady ->
+                if (documentProgress.total > 0L) {
+                    "Indexing your personal sources: ${documentProgress.current}/${documentProgress.total}"
+                } else {
+                    "Indexing your personal sources…"
+                }
+            !gemmaReady && gemmaBytes > 0L ->
+                "Download Gemma 4 model: ${formatBytes(gemmaBytes)} / ${formatBytes(selectedGemma.expectedBytes)}"
+            !gemmaReady ->
+                "Download Gemma 4 model — waiting to start."
+            else -> "All indexing is complete. Warming Gemma 4 for search…"
+        }
+
+        val actionForEmbedding = !embeddingReady
+        val actionForRetry = !actionForEmbedding && documentProgress.error.isNotBlank()
+        preparationAction.visibility = if (actionForEmbedding || actionForRetry) View.VISIBLE else View.GONE
+        if (actionForEmbedding) {
+            preparationAction.text = "Sign in and authorize EmbeddingGemma"
+            preparationAction.setOnClickListener {
+                startActivity(Intent(this, EmbeddingGemmaAuthorizationActivity::class.java))
+            }
+        } else if (actionForRetry) {
+            preparationAction.text = "Retry personal indexing"
+            preparationAction.setOnClickListener {
+                DocumentIndexScheduler.restart(this)
+                refreshPreparation()
+            }
         }
         preparationPanel.visibility = if (ready) View.GONE else View.VISIBLE
         facePromptPanel.visibility = if (waitingForFaceTags) View.VISIBLE else View.GONE
-        searchPanel.visibility = if (ready) View.VISIBLE else View.GONE
-        if (ready) {
+        searchPanel.visibility = if (searchReadyNow) View.VISIBLE else View.GONE
+        if (searchReadyNow) {
             val plannerReady = GemmaRuntime.isPlannerReady()
             val hasReusableFollowUpContext = activeSearchResponse != null && !followUpInFlight
             // A submitted query must consume the prewarmed QP system KV.
-            // An uncached Conversation re-prefills the 12K system context and
+            // An uncached Conversation re-prefills the 16K system context and
             // can take minutes, so wait for the one explicit QP warmup.
             query.isEnabled = plannerReady || hasReusableFollowUpContext
             query.alpha = if (query.isEnabled) 1f else 0.62f
@@ -781,17 +870,17 @@ class MainActivity : Activity() {
             gemmaWarmupIndicator.visibility = View.GONE
             gemmaWarmupStatus.clearAnimation()
         }
-        if (ready && !searchReady) {
+        if (searchReadyNow && !searchReady) {
             searchReady = true
             SigLipTextEncoder.preloadAsync(this)
             NativeVectorIndex.preloadAsync(this)
             DocumentVectorIndex.preloadAsync(this)
-        } else if (!ready) {
+        } else if (!searchReadyNow) {
             searchReady = false
         }
-        if (ready && !launchPlannerWarmupRequested) {
+        if (searchReadyNow && !launchPlannerWarmupRequested) {
             // Warm Gemma before enabling the search bar. The runtime remains
-            // bounded to the mobile-safe 8K/four-image configuration.
+            // bounded to the mobile-safe 16K/eight-image configuration.
             val pendingOcr = runCatching { galleryIndexer.pendingOcrCount() }
                 .getOrDefault(Int.MAX_VALUE)
             if (pendingOcr == 0) {
@@ -808,11 +897,10 @@ class MainActivity : Activity() {
 
     private fun formatBytes(bytes: Long): String {
         if (bytes < 1_024L * 1_024L) return "${bytes / 1_024L} KB"
-        return String.format(
-            java.util.Locale.US,
-            "%.1f GB",
-            bytes / (1_024.0 * 1_024.0 * 1_024.0),
-        )
+        if (bytes < 1_024L * 1_024L * 1_024L) {
+            return String.format(java.util.Locale.US, "%.1f MB", bytes / (1_024.0 * 1_024.0))
+        }
+        return String.format(java.util.Locale.US, "%.1f GB", bytes / (1_024.0 * 1_024.0 * 1_024.0))
     }
 
     private fun search(
@@ -895,6 +983,8 @@ class MainActivity : Activity() {
         setModelLoading(true, "Blending image, OCR, and metadata matches…")
         galleryIndexer.searchAsync(
             query = text,
+            previousQuery = previousGroundedQuery,
+            previousAnswer = previousGroundedAnswer,
             onMatches = { matches, totalMatches ->
                 runOnUiThread {
                     if (generation != searchGeneration || matches.isEmpty()) return@runOnUiThread
@@ -942,9 +1032,9 @@ class MainActivity : Activity() {
                     activeSearchResponse = null
                     setModelLoading(false, "")
                     hideAnswerPipeline()
-                    renderQpFailure()
+                    val plannerRejection = renderQpFailure(error)
                     warmPlannerForNextSearch()
-                    answer.text = if (
+                    answer.text = plannerRejection ?: if (
                         error.message.orEmpty().contains("Gemma 4", ignoreCase = true) ||
                         error.cause?.message.orEmpty().contains("Gemma 4", ignoreCase = true)
                     ) {
@@ -996,13 +1086,13 @@ class MainActivity : Activity() {
                 sourcePanel.visibility = View.GONE
                 if (response.needsAnswer) {
                     answer.visibility = View.VISIBLE
-                    answer.text = "Answering from the top 4 hybrid records…"
+                    answer.text = "Answering from the top 8 hybrid records…"
                     showAnswerPipeline(PipelineUiStage.ANSWERING)
                     if (!preserveConversation) appendConversationQuestion(text)
                     setModelLoading(
                         true,
                         GemmaModelSelection.selected(this).displayName +
-                            " is answering from the top 4 records…",
+                            " is answering from the top 8 records…",
                     )
                     galleryIndexer.answerAsync(
                         query = text,
@@ -1018,13 +1108,27 @@ class MainActivity : Activity() {
                                         appendConversationAnswer(
                                             it.text.ifBlank { "I couldn't answer that yet." },
                                         )
-                                        renderAnswerSources(it.sources.take(4), generation)
+                                        previousGroundedQuery = response.resolvedQuery.ifBlank { text }
+                                        previousGroundedAnswer = it.text
+                                        // The top-16 grid is the single public
+                                        // evidence surface. Its first eight
+                                        // are already the immutable answer
+                                        // window, so do not duplicate them as
+                                        // a second thumbnail/source strip.
+                                        sourcePanel.visibility = View.GONE
+                                        sourceRow.removeAllViews()
+                                        sourceDetails.removeAllViews()
+                                        expandedSourceId = null
                                         renderFollowUps(emptyList(), emptyList(), generation)
                                         renderTimeStats(it.timings, "Answer")
                                     },
-                                    onFailure = {
+                                    onFailure = { error ->
                                         hideAnswerPipeline()
-                                        answer.text = "I couldn't answer that yet."
+                                        answer.text = when (error) {
+                                            is AnswerEvidenceUnavailableException ->
+                                                "I couldn't read result R${error.recordNumber}, so I stopped instead of answering from different records."
+                                            else -> "I couldn't answer that yet."
+                                        }
                                         answer.visibility = View.VISIBLE
                                     },
                                 )
@@ -1145,14 +1249,24 @@ class MainActivity : Activity() {
         qpOutputText.text = effectivePlanJson
     }
 
-    private fun renderQpFailure() {
+    private fun renderQpFailure(error: Throwable): String? {
         timeStatsPanel.visibility = View.VISIBLE
+        val rejection = QueryPlannerFailureDiagnostics.from(error)
+        if (rejection != null) {
+            val diagnostic = rejection.render()
+            qpOutputLabel.text = "QP op • validator rejected"
+            qpOutputText.text = diagnostic
+            timeStatsSummary = "QP rejected"
+            updateTimeStatsButton()
+            return diagnostic
+        }
         if (qpOutputLabel.text.toString().contains("planning", ignoreCase = true)) {
             qpOutputLabel.text = "QP op • unavailable"
             qpOutputText.text = "The executable query could not be prepared."
         }
         timeStatsSummary = "Stopped"
         updateTimeStatsButton()
+        return null
     }
 
     private fun updateTimeStatsButton() {
@@ -1169,8 +1283,9 @@ class MainActivity : Activity() {
         val phaseRows = listOf(
             "Query planning" to timings.queryPlanningMs,
             "Search / hybrid retrieval" to timings.searchMs,
-            "Top 4 context selection" to timings.diverseRerankingMs,
+            "Top 8 context selection" to timings.diverseRerankingMs,
             "Evidence curation" to timings.evidenceCurationMs,
+            "Answer image preparation" to timings.answerImagePreparationMs,
             "Answer generation" to timings.answerGenerationMs,
             "Follow-up query/actions" to timings.followUpMs,
         ).filter { (_, durationMs) -> durationMs > 0L }
@@ -1186,6 +1301,12 @@ class MainActivity : Activity() {
                     }
                 }
                 if (label == "Answer generation") {
+                    if (timings.answerInitialPassMs > 0L) {
+                        add("  ↳ Initial multimodal pass" to timings.answerInitialPassMs)
+                    }
+                    if (timings.answerRetryMs > 0L) {
+                        add("  ↳ Validation retry" to timings.answerRetryMs)
+                    }
                     timings.answerProfile?.let { profile ->
                         if (profile.startupPrefillMs > 0L) add("  ↳ AP system warm-up (overlapped)" to profile.startupPrefillMs)
                         if (profile.prefillMs > 0L) add("  ↳ AP answer-prompt prefill" + profile.prefillTokens.takeIf { it > 0 }?.let { " ($it tok)" }.orEmpty() to profile.prefillMs)
@@ -1455,9 +1576,7 @@ class MainActivity : Activity() {
             image.contentDescription = caption
             holder.caption.text = caption
             card.contentDescription = "Open $caption"
-            card.setOnClickListener {
-                startActivity(MediaDetailActivity.intent(this@MainActivity, media))
-            }
+            card.setOnClickListener { showGalleryPopup(media) }
             val cached = thumbnails.get(media.mediaStoreId)
             if (cached != null && !cached.isRecycled) {
                 image.setImageBitmap(cached)
@@ -1513,6 +1632,97 @@ class MainActivity : Activity() {
         DocumentSource.CONTACTS -> "👤 Contact"
         DocumentSource.CALL_LOGS -> "📞 Call log"
         DocumentSource.FILES -> "📄 File"
+    }
+
+    /**
+     * Keeps record browsing inside MainActivity. Dismissing this dialog cannot
+     * remove the search/chat task or require Android to recreate its parent.
+     */
+    private fun showGalleryPopup(media: GalleryMedia) {
+        var previewBitmap: Bitmap? = null
+        var dialog: AlertDialog? = null
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(ImageButton(this@MainActivity).apply {
+                setImageResource(android.R.drawable.ic_media_previous)
+                contentDescription = "Back to search results"
+                setBackgroundColor(Color.TRANSPARENT)
+                setColorFilter(Color.rgb(40, 43, 52))
+                setOnClickListener { dialog?.dismiss() }
+            }, LinearLayout.LayoutParams(dp(48), dp(48)))
+            addView(TextView(this@MainActivity).apply {
+                text = if (media.mimeType.startsWith("video/", true)) {
+                    "Video details"
+                } else {
+                    "Photo details"
+                }
+                textSize = 21f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(Color.rgb(25, 28, 36))
+                setPadding(dp(8), 0, 0, 0)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val image = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.rgb(235, 237, 243))
+            contentDescription = "Expanded gallery result"
+        }
+        val details = TextView(this).apply {
+            text = buildString {
+                append(resultCaption(media).substringAfter('\n'))
+                if (media.width > 0 && media.height > 0) {
+                    append("\nDimensions: ${media.width} × ${media.height}")
+                }
+                media.personLabel?.takeIf(String::isNotBlank)?.let {
+                    append("\nPeople: $it")
+                }
+                media.ocrText.takeIf(String::isNotBlank)?.let {
+                    append("\nText found: ")
+                    append(it.replace(Regex("\\s+"), " ").take(MAX_SOURCE_DETAIL_CHARS))
+                }
+            }
+            textSize = 14f
+            setTextColor(Color.rgb(55, 58, 70))
+            setPadding(dp(8), dp(12), dp(8), dp(8))
+            setTextIsSelectable(true)
+        }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(14))
+            addView(header, matchWrap())
+            addView(image, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(420),
+            ).apply { topMargin = dp(8) })
+            addView(details, matchWrap())
+        }
+        dialog = AlertDialog.Builder(this)
+            .setView(ScrollView(this).apply { addView(body, matchWrap()) })
+            .create()
+            .also { created ->
+                created.setOnDismissListener {
+                    previewBitmap?.takeUnless(Bitmap::isRecycled)?.recycle()
+                    previewBitmap = null
+                }
+                created.show()
+                created.window?.setLayout(
+                    (resources.displayMetrics.widthPixels * 0.96f).toInt(),
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                )
+            }
+        galleryIndexer.loadDetailPreviewAsync(media) { result ->
+            val bitmap = result.getOrNull()
+            runOnUiThread {
+                if (bitmap == null) return@runOnUiThread
+                if (dialog?.isShowing == true && !isFinishing && !isDestroyed) {
+                    previewBitmap = bitmap
+                    image.setImageBitmap(bitmap)
+                } else if (!bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
+            }
+        }
     }
 
     private fun showDocumentPopup(match: DocumentMatch) {

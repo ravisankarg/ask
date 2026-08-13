@@ -171,9 +171,13 @@ object AnswerFactGrounding {
     fun documentKey(stableId: Long): String = "document:$stableId"
 
     fun requestedFieldInstruction(query: String): String =
-        "Resolve the exact attribute requested in ${quote(query)} by matching it to the closest explicit field label in each relevant record. " +
-            "A value belongs only to its own label; never substitute a neighbouring field, date, number, timestamp, or metadata value. " +
-            "Check every relevant top-four record and return every distinct value that answers that same requested attribute."
+        if (AnswerValueGrounding.isIdentityExpiryDateQuestion(query)) {
+            "Resolve the expiry-date attribute requested in ${quote(query)} only from a visible Expiry, Date of Expiry, Expiration, Valid Until, or Valid Till label. The answer must be a calendar date, not a document number, MRZ, phone number, issue date, birth date, capture time, modified time, or another long identifier. Check every relevant top-eight record and do not guess."
+        } else {
+            "Resolve the exact attribute requested in ${quote(query)} by matching it to the closest explicit field label in each relevant record. " +
+                "A value belongs only to its own label; never substitute a neighbouring field, date, number, timestamp, or metadata value. " +
+                "Check every relevant top-eight record and return every distinct value that answers that same requested attribute."
+        }
 
     private fun extractFacts(text: String): List<Pair<String, String>> {
         val lines = text.lineSequence()

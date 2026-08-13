@@ -151,21 +151,36 @@ class DocumentSourceReader(private val context: Context) {
     }
 
     fun file(uri: Uri, displayName: String = uri.toString(), timestampMs: Long? = null): Sequence<DocumentChunk> = sequence {
+        if (!PersonalFileSearchPolicy.isEligibleName(displayName)) return@sequence
         val lower = displayName.lowercase()
+        if (lower.endsWith(".pdf")) {
+            var chunkNumber = 0
+            extractPdfPages(uri).forEach { (pageNumber, pageText) ->
+                DocumentChunker.chunk(pageText).forEach { chunk ->
+                    yield(
+                        DocumentChunk(
+                            source = DocumentSource.FILES,
+                            recordKey = uri.toString(),
+                            chunkNumber = chunkNumber++,
+                            title = displayName,
+                            text = chunk,
+                            uri = uri.toString(),
+                            page = pageNumber,
+                            timestampMs = timestampMs,
+                        ),
+                    )
+                }
+            }
+            return@sequence
+        }
         val text = when {
-            lower.endsWith(".pdf") -> extractPdf(uri)
             lower.endsWith(".docx") -> extractDocx(uri)
             lower.endsWith(".odt") -> extractZipText(uri)
             lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".csv") ||
-                lower.endsWith(".json") || lower.endsWith(".xml") || lower.endsWith(".yaml") ||
-                lower.endsWith(".yml") || lower.endsWith(".html") || lower.endsWith(".rtf") ||
-                lower.endsWith(".kt") || lower.endsWith(".java") || lower.endsWith(".js") ||
-                lower.endsWith(".ts") || lower.endsWith(".sql") || lower.endsWith(".ini") ||
-                lower.endsWith(".properties") || lower.endsWith(".log") ->
+                lower.endsWith(".rtf") ->
                 resolver.openInputStream(uri)?.use { InputStreamReader(it).buffered().readText() }.orEmpty()
             else -> ""
         }
-        val paginated = lower.endsWith(".pdf") || lower.endsWith(".docx") || lower.endsWith(".odt")
         DocumentChunker.chunk(text).forEachIndexed { index, chunk ->
             yield(DocumentChunk(
                 source = DocumentSource.FILES,
@@ -174,19 +189,30 @@ class DocumentSourceReader(private val context: Context) {
                 title = displayName,
                 text = chunk,
                 uri = uri.toString(),
-                page = (index + 1).takeIf { paginated },
+                // DOCX/ODT text extraction does not expose physical pages;
+                // never mislabel an arbitrary text chunk as a page.
+                page = null,
                 timestampMs = timestampMs,
             ))
         }
     }
 
-    private fun extractPdf(uri: Uri): String = runCatching {
-        resolver.openInputStream(uri).use { input ->
-            PDDocument.load(input).use { document ->
-                PDFTextStripper().apply { startPage = 1; endPage = minOf(5, document.numberOfPages) }.getText(document)
+    private fun extractPdfPages(uri: Uri): List<Pair<Int, String>> = runCatching {
+        val input = resolver.openInputStream(uri) ?: return@runCatching emptyList()
+        input.use {
+            PDDocument.load(it).use { document ->
+                (1..minOf(MAX_PDF_PAGES, document.numberOfPages)).mapNotNull { pageNumber ->
+                    PDFTextStripper().apply {
+                        startPage = pageNumber
+                        endPage = pageNumber
+                        sortByPosition = true
+                    }.getText(document)
+                        .takeIf(String::isNotBlank)
+                        ?.let { pageNumber to it }
+                }
             }
         }
-    }.getOrDefault("")
+    }.getOrDefault(emptyList())
 
     private fun extractDocx(uri: Uri): String = extractZipText(uri, "word/document.xml")
 
@@ -208,8 +234,7 @@ class DocumentSourceReader(private val context: Context) {
     private data class FileReference(val uri: Uri, val name: String, val modifiedMs: Long?)
 
     private fun isSupportedDocumentName(name: String): Boolean {
-        val lower = name.lowercase()
-        return SUPPORTED_EXTENSIONS.any(lower::endsWith)
+        return PersonalFileSearchPolicy.isEligibleName(name)
     }
 
     private fun record(source: DocumentSource, key: String, title: String, text: String, timestamp: Long?, metadata: String): List<DocumentChunk> =
@@ -217,10 +242,6 @@ class DocumentSourceReader(private val context: Context) {
 
     private companion object {
         const val TAG = "AskGalaxyDocumentReader"
-        val SUPPORTED_EXTENSIONS = setOf(
-            ".pdf", ".docx", ".odt", ".txt", ".md", ".csv", ".json", ".xml",
-            ".yaml", ".yml", ".html", ".rtf", ".kt", ".java", ".js", ".ts",
-            ".sql", ".ini", ".properties", ".log",
-        )
+        const val MAX_PDF_PAGES = 5
     }
 }

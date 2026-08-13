@@ -181,6 +181,33 @@ internal object AnswerValueGrounding {
             POLICY_FIELD.containsMatchIn(normalized)
     }
 
+    fun isIdentityExpiryDateQuestion(query: String): Boolean {
+        val normalized = query.lowercase(Locale.ROOT)
+        return EXPIRY_FIELD.containsMatchIn(normalized) &&
+            (
+                PASSPORT_FIELD.containsMatchIn(normalized) ||
+                    LICENCE_FIELD.containsMatchIn(normalized) ||
+                    Regex("\\b(?:identity|\\bid\\b)\\b").containsMatchIn(normalized)
+                )
+    }
+
+    fun matchesRequestedValueType(query: String, answer: String): Boolean {
+        if (!isIdentityExpiryDateQuestion(query)) return true
+        return DATE_VALUE_IN_ANSWER.containsMatchIn(answer) ||
+            MONTH_DATE_IN_ANSWER.containsMatchIn(answer)
+    }
+
+    fun requestedValueTypeInstruction(query: String): String =
+        if (isIdentityExpiryDateQuestion(query)) {
+            "The requested value type is a calendar date. Return only the visibly labelled expiry/expiration/valid-until date. A passport, licence, identity, MRZ, or phone number is the wrong value type. Do not return an uninterrupted long identifier."
+        } else {
+            "Return a value whose type matches the exact requested field."
+        }
+
+    fun typeMismatchFallback(query: String): String? =
+        "I couldn't read the requested expiry date clearly."
+            .takeIf { isIdentityExpiryDateQuestion(query) }
+
     /** Keeps Gemma from relabelling an explicit identity value as a phone. */
     fun constrainFieldLabel(query: String, draft: String): String {
         val normalizedQuery = query.lowercase(Locale.ROOT)
@@ -203,6 +230,14 @@ internal object AnswerValueGrounding {
 
     fun fieldLabelInstruction(query: String): String {
         val normalizedQuery = query.lowercase(Locale.ROOT)
+        if (isIdentityExpiryDateQuestion(normalizedQuery)) {
+            val document = when {
+                PASSPORT_FIELD.containsMatchIn(normalizedQuery) -> "passport"
+                LICENCE_FIELD.containsMatchIn(normalizedQuery) -> "licence"
+                else -> "identity document"
+            }
+            return "The requested field is the $document expiry date (also labelled Date of Expiry, Expiration Date, Valid Until, or Valid Till). Return that date only; never substitute the document number, MRZ, date of issue, date of birth, capture time, modified time, or another long number."
+        }
         if (!NUMBER_FIELD.containsMatchIn(normalizedQuery)) return "No explicit identity-number label rule."
         return when {
             AADHAAR_FIELD.containsMatchIn(normalizedQuery) ->
@@ -243,6 +278,10 @@ internal object AnswerValueGrounding {
     private val AADHAAR_FIELD = Regex("\\b(?:aadhaar|aadhar)\\b", RegexOption.IGNORE_CASE)
     private val LICENCE_FIELD = Regex("\\b(?:licen[cs]e|driving)\\b", RegexOption.IGNORE_CASE)
     private val POLICY_FIELD = Regex("\\b(?:n?policy|insurance)\\b", RegexOption.IGNORE_CASE)
+    private val EXPIRY_FIELD = Regex(
+        "\\b(?:expir(?:e|es|ed|y|ation)|expriy|expirty|exporty|valid(?:ity)?(?:\\s+(?:until|till|through))?)\\b",
+        RegexOption.IGNORE_CASE,
+    )
     private val GENERIC_FIELD = Regex(
         "\\b(?:number|no\\.?|code|reference|ref\\.?|account|policy|certificate|identity|\\bid\\b)\\b",
         RegexOption.IGNORE_CASE,
@@ -264,6 +303,12 @@ internal object AnswerValueGrounding {
     )
     private val VALUE = Regex("(?i)(?<![\\p{L}\\p{N}])[A-Z]{0,3}\\d{3,}[A-Z0-9-]*(?![\\p{L}\\p{N}])")
     private val DATE_VALUE = Regex("(?<![\\p{L}\\p{N}])\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}(?![\\p{L}\\p{N}])")
+    private val DATE_VALUE_IN_ANSWER = Regex(
+        "(?<![\\p{L}\\p{N}])(?:\\d{1,2}[./-]\\d{1,2}[./-]\\d{2,4}|\\d{4}-\\d{1,2}-\\d{1,2}|(?:19|20)\\d{2})(?![\\p{L}\\p{N}])",
+    )
+    private val MONTH_DATE_IN_ANSWER = Regex(
+        "(?i)\\b(?:\\d{1,2}\\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\\s+\\d{1,2})?(?:,?\\s+(?:19|20)\\d{2})\\b",
+    )
 
     private data class SourceRecord(
         val text: String,

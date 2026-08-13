@@ -69,15 +69,14 @@ enum class QueryMediaType {
 
 internal fun QueryMediaType.matchesDocumentChunk(chunk: DocumentChunk): Boolean {
     if (chunk.source !in documentSources()) return false
+    if (!PersonalFileSearchPolicy.isEligible(chunk)) return false
     if (this == QueryMediaType.FILES) return true
     if (chunk.source != DocumentSource.FILES) return true
     val title = chunk.title.lowercase()
     return when (this) {
         QueryMediaType.PDF -> title.endsWith(".pdf")
         QueryMediaType.DOC -> title.endsWithAny(
-            ".doc", ".docx", ".odt", ".txt", ".md", ".csv", ".json", ".xml",
-            ".yaml", ".yml", ".html", ".rtf", ".kt", ".java", ".js", ".ts",
-            ".sql", ".ini", ".properties", ".log",
+            ".docx", ".odt", ".txt", ".md", ".csv", ".rtf",
         )
         else -> true
     }
@@ -401,7 +400,8 @@ data class QueryPlan(
                     .orEmpty(),
             )
         val retrievalNode = retrievalPredicates.reduceOrNull { left, right ->
-            ExecutionNode.Binary(left, ExecutionBinaryOperator.ADD, right)
+            // Semantic and lexical evidence must resolve to the same record.
+            ExecutionNode.Binary(left, ExecutionBinaryOperator.INTERSECT, right)
         }
         val positiveNodes = hardPredicates + listOfNotNull(retrievalNode)
         var root = positiveNodes.reduceOrNull { left, right ->
@@ -430,8 +430,6 @@ data class QueryPlan(
                 ExecutionBinaryOperator.SUBTRACT,
                 negative,
             )
-        }
-        if (root != null) {
         }
         if (recentFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
         if (sortByLocation && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)

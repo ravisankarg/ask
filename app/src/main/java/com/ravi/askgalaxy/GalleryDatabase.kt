@@ -352,6 +352,25 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         return ids
     }
 
+    /** Pending rows are additive work; this query never mutates existing index state. */
+    fun pendingIncrementalMediaCount(): Int = readableDatabase.rawQuery(
+        """
+        SELECT COUNT(*)
+        FROM $TABLE_MEDIA
+        WHERE image_embedding_indexed = 0
+           OR face_embedding_indexed = 0
+           OR location_enrichment_state = $LOCATION_PENDING
+           OR (mime_type LIKE 'image/%' AND (ocr_indexed = 0 OR ocr_signature <> ?))
+        """.trimIndent(),
+        arrayOf(OcrIndexContract.SIGNATURE),
+    ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+
+    /** OCR-bearing image records are the gallery inputs for classification. */
+    fun allMediaForClassification(): List<GalleryMedia> = queryMedia(
+        selection = "mime_type LIKE 'image/%' AND TRIM(ocr_text) <> ''",
+        orderBy = "media_store_id ASC",
+    )
+
     fun pendingEmbeddings(): List<GalleryMedia> = queryMedia(
         selection = "image_embedding_indexed = 0",
         orderBy = "date_modified_seconds DESC",
@@ -924,6 +943,10 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         )
     }
 
+    fun unassignedFaceEmbeddings(): List<FaceEmbeddingRecord> = queryFaceEmbeddings(
+        selection = "TRIM(cluster_id) = ''",
+    )
+
     fun existingFaceClusters(): List<StoredFaceCluster> {
         val result = ArrayList<StoredFaceCluster>()
         readableDatabase.query(
@@ -1050,6 +1073,69 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
                     "cluster_id NOT IN ($placeholders)",
                     activeIds.toTypedArray(),
                 )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    /**
+     * Attaches only previously-unassigned face rows. Existing cluster IDs,
+     * labels, self markers, face assignments, and media rows are never cleared.
+     */
+    fun appendFaceClusters(assignments: List<IncrementalFaceClusterAssignment>) {
+        if (assignments.isEmpty()) return
+        val db = writableDatabase
+        db.beginTransactionNonExclusive()
+        try {
+            assignments.forEach { assignment ->
+                assignment.memberFaceIds.forEach { faceId ->
+                    db.update(
+                        TABLE_FACE_EMBEDDINGS,
+                        ContentValues().apply { put("cluster_id", assignment.clusterId) },
+                        "id = ? AND TRIM(cluster_id) = ''",
+                        arrayOf(faceId.toString()),
+                    )
+                }
+
+                val members = faceEmbeddingsForClusters(listOf(assignment.clusterId))
+                if (members.isEmpty()) return@forEach
+                val representative = members.maxByOrNull { it.detectionScore } ?: members.first()
+                val values = ContentValues().apply {
+                    put("label", assignment.label)
+                    put("is_self", if (assignment.isSelf) 1 else 0)
+                    put("centroid_blob", faceEmbeddingCrypto.encrypt(averageEmbedding(members)))
+                    put("representative_media_store_id", representative.mediaStoreId)
+                    put("face_count", members.size)
+                    put("representative_face_id", representative.id)
+                    put("updated_at_ms", System.currentTimeMillis())
+                }
+                val updated = db.update(
+                    TABLE_FACE_CLUSTERS,
+                    values,
+                    "cluster_id = ?",
+                    arrayOf(assignment.clusterId),
+                )
+                if (updated == 0) {
+                    values.put("cluster_id", assignment.clusterId)
+                    db.insertOrThrow(TABLE_FACE_CLUSTERS, null, values)
+                }
+
+                assignment.memberMediaStoreIds.distinct().forEach { mediaStoreId ->
+                    db.update(
+                        TABLE_MEDIA,
+                        ContentValues().apply { putNull("person_cluster_id") },
+                        "media_store_id = ?",
+                        arrayOf(mediaStoreId.toString()),
+                    )
+                    db.update(
+                        TABLE_MEDIA,
+                        ContentValues().apply { put("person_cluster_id", assignment.clusterId) },
+                        "media_store_id = ? AND NOT EXISTS (SELECT 1 FROM $TABLE_FACE_EMBEDDINGS other WHERE other.media_store_id = media_items.media_store_id AND other.cluster_id <> ?)",
+                        arrayOf(mediaStoreId.toString(), assignment.clusterId),
+                    )
+                }
             }
             db.setTransactionSuccessful()
         } finally {
@@ -1565,8 +1651,7 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
 
     /**
      * Matches planner-selected document keywords against OCR text only.
-     * Rows containing partial keyword coverage are retained so hybrid ranking
-     * can reduce their keyword contribution proportionally.
+     * Every requested keyword must be present in the same OCR record.
      */
     fun searchOcrKeywordsRanked(
         keywords: List<String>,
@@ -1581,8 +1666,8 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
             .toList()
         if (terms.isEmpty()) return emptyList()
         // A keyword predicate is an AND group: all requested words must be
-        // present in the same OCR record. Semantic retrieval remains the
-        // separate OR branch of gallery hybrid search.
+        // present in the same OCR record. The gallery executor intersects
+        // this result with semantic retrieval.
         val selection = terms.joinToString(" AND ") {
             "LOWER(ocr_text) LIKE ? ESCAPE '\\'"
         }
