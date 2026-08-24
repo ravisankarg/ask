@@ -717,6 +717,58 @@ class GalleryDatabase(context: Context) : SQLiteOpenHelper(
         return result
     }
 
+    /** Resolves members of persisted episodes outside the modal normal locality without rebuilding anything. */
+    fun mediaStoreIdsOutsideNormalLocation(): TravelMediaScope {
+        val candidates = ArrayList<TravelEpisodeCandidate>()
+        readableDatabase.query(
+            TABLE_EPISODES,
+            arrayOf("episode_id", "location_name", "member_count"),
+            "TRIM(COALESCE(location_name, '')) <> ''",
+            null,
+            null,
+            null,
+            "start_time_ms DESC, episode_id ASC",
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                candidates += TravelEpisodeCandidate(
+                    episodeId = cursor.getString(0),
+                    location = cursor.getString(1)?.takeIf(String::isNotBlank),
+                    memberCount = cursor.getInt(2),
+                )
+            }
+        }
+        val selection = TravelLocationPolicy.select(candidates)
+        if (selection.travelEpisodeIds.isEmpty()) {
+            return TravelMediaScope(
+                mediaStoreIds = emptySet(),
+                normalEpisodeCount = selection.normalEpisodeCount,
+                locatedEpisodeCount = selection.locatedEpisodeCount,
+                travelEpisodeCount = 0,
+            )
+        }
+        val mediaIds = linkedSetOf<Long>()
+        selection.travelEpisodeIds.toList().chunked(SQLITE_ID_CHUNK).forEach { episodeIds ->
+            val placeholders = episodeIds.joinToString(",") { "?" }
+            readableDatabase.query(
+                TABLE_EPISODE_MEMBERS,
+                arrayOf("media_store_id"),
+                "episode_id IN ($placeholders)",
+                episodeIds.toTypedArray(),
+                null,
+                null,
+                "episode_id ASC, member_ordinal ASC",
+            ).use { cursor ->
+                while (cursor.moveToNext()) mediaIds += cursor.getLong(0)
+            }
+        }
+        return TravelMediaScope(
+            mediaStoreIds = mediaIds,
+            normalEpisodeCount = selection.normalEpisodeCount,
+            locatedEpisodeCount = selection.locatedEpisodeCount,
+            travelEpisodeCount = selection.travelEpisodeIds.size,
+        )
+    }
+
     fun markEmbeddingIndexed(mediaStoreId: Long) {
         val values = ContentValues().apply { put("image_embedding_indexed", 1) }
         writableDatabase.update(

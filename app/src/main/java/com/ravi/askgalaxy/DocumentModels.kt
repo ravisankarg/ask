@@ -39,11 +39,22 @@ data class DocumentMatch(
     val chunk: DocumentChunk,
     val score: Float,
     val rank: Int,
-    /** Reciprocal-rank score; raw cosine values are not comparable across sources. */
+    /** Cross-source relevance: semantic cosine, or cosine plus lexical coverage. */
     val fusionScore: Float = 0f,
     /** Raw EmbeddingGemma cosine when this record had a semantic hit. */
     val cosineScore: Float? = null,
 )
+
+/**
+ * Device-calibrated EmbeddingGemma acceptance gate shared by every private
+ * source. Nearest-neighbour rank alone is never evidence of relevance.
+ */
+internal object DocumentSemanticAcceptancePolicy {
+    const val MIN_COSINE_SCORE = 0.62f
+
+    fun accepts(score: Float): Boolean =
+        score.isFinite() && score >= MIN_COSINE_SCORE
+}
 
 /** User-facing personal documents only; machine/config/source files never enter search. */
 internal object PersonalFileSearchPolicy {

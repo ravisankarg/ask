@@ -64,6 +64,48 @@ sealed class HybridSearchResult {
     data class Document(val match: DocumentMatch) : HybridSearchResult()
 }
 
+/**
+ * Existing public fusion contract: gallery contributes its final structured-search rank, while
+ * private records contribute their already-fused EmbeddingGemma/keyword score normalized inside
+ * that engine. Raw gallery and document scores are never compared directly.
+ */
+internal object CrossEngineFusionPolicy {
+    const val FEATURED_RESULT_LIMIT = 8
+    const val OVERALL_RESULT_LIMIT = 24
+
+    fun rank(
+        gallery: List<GalleryMedia>,
+        documents: List<DocumentMatch>,
+        limit: Int = OVERALL_RESULT_LIMIT,
+    ): List<HybridSearchResult> {
+        val galleryHits = gallery.mapIndexed { index, media ->
+            RankedHit(
+                score = 1f / (index + 1f),
+                result = HybridSearchResult.Gallery(media),
+            )
+        }
+        val eligibleDocuments = documents.filter { PersonalFileSearchPolicy.isEligible(it.chunk) }
+        val maxDocumentScore = eligibleDocuments.maxOfOrNull(DocumentMatch::fusionScore)
+            ?.coerceAtLeast(1.0e-6f)
+            ?: 1f
+        val documentHits = eligibleDocuments.map { match ->
+            RankedHit(
+                score = (match.fusionScore / maxDocumentScore).coerceIn(0f, 1f),
+                result = HybridSearchResult.Document(match),
+            )
+        }
+        return (galleryHits + documentHits)
+            .sortedByDescending(RankedHit::score)
+            .take(limit.coerceAtLeast(0))
+            .map(RankedHit::result)
+    }
+
+    private data class RankedHit(
+        val score: Float,
+        val result: HybridSearchResult,
+    )
+}
+
 data class SearchResponse(
     val gallery: List<GalleryMedia>,
     /** Full evaluated match count; [gallery] is the bounded UI browsing window. */
@@ -83,13 +125,17 @@ data class SearchResponse(
     /** E2B-resolved standalone wording retained only for the next contextual turn. */
     val resolvedQuery: String = "",
     val queryCategory: QueryCategory = QueryCategory.SCENARY,
+    /** Frozen Settings value for this query; false means no answer work was scheduled. */
+    val answerFeatureEnabled: Boolean = true,
     val needsAnswer: Boolean = true,
     val answerEvidenceScope: AnswerEvidenceScope = AnswerEvidenceScope.all(),
     /** OCR conjunction that grounded the original answer; follow-ups inherit it for "it". */
     val answerOcrKeywords: List<String> = emptyList(),
     val timings: PhaseTimings = PhaseTimings(),
     val documentMatches: List<DocumentMatch> = emptyList(),
-    /** The exact cross-source order used by the shared top-16 result window. */
+    /** Full accepted private-record count before the shared Top 24 window. */
+    val totalDocumentMatches: Int = documentMatches.size,
+    /** The exact cross-source rank-fused order used by the shared top-24 result window. */
     val mergedResults: List<HybridSearchResult> = emptyList(),
 )
 

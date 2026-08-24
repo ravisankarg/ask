@@ -146,15 +146,23 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                         }
                         val result = sourceIndexes.getValue(source)
                             .search(vector, limitPerSource, scopedIds)
+                        val rankedScores = result.ids.indices.associate { index ->
+                            result.ids[index] to ((index + 1) to result.scores.getOrElse(index) { Float.NaN })
+                        }
                         val chunks = database.chunks(result.ids)
-                        chunks.filter { inTimeScope(it) && inMediaScope(it) }.mapIndexed { index, chunk ->
-                            val rank = index + 1
+                        chunks.mapNotNull { chunk ->
+                            val (rank, score) = rankedScores[chunk.stableId] ?: return@mapNotNull null
+                            if (!DocumentSemanticAcceptancePolicy.accepts(score) ||
+                                !inTimeScope(chunk) || !inMediaScope(chunk)
+                            ) {
+                                return@mapNotNull null
+                            }
                             DocumentMatch(
                                 chunk = chunk,
-                                score = result.scores.getOrElse(index) { 0f },
+                                score = score,
                                 rank = rank,
-                                fusionScore = 1f / (RRF_K + rank.toFloat()),
-                                cosineScore = result.scores.getOrElse(index) { 0f },
+                                fusionScore = score,
+                                cosineScore = score,
                             )
                         }
                     }
@@ -180,14 +188,13 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
                     fusionScore = cosine + keywordScore,
                 )
             }
-            // Per-source limits are only the candidate budget. The user-facing
-            // contract is one ranked window across all private apps.
+            // Per-source limits are only the candidate budget. The accepted
+            // semantic/fused scores retain relevance across the shared window.
             val merged = byId.values
                 .groupBy { it.chunk.source }
                 .values
                 .flatMap { it.sortedByDescending(DocumentMatch::fusionScore).take(limitPerSource) }
                 .sortedByDescending(DocumentMatch::fusionScore)
-                .take(limitPerSource)
             Log.i(
                 TAG,
                 "private search semanticAndKeyword=1 keywordGroups=${keywordGroups.size} " +
@@ -273,7 +280,6 @@ class DocumentVectorIndex(private val context: Context) : Closeable {
 
     companion object {
         const val TAG = "AskGalaxyDocumentSearch"
-        const val RRF_K = 60f
         const val BATCH_SIZE = 4
         const val MAX_PARALLEL_SOURCES = 4
 

@@ -43,6 +43,7 @@ class SettingsActivity : Activity() {
     private lateinit var answerabilityProgress: ProgressBar
     private lateinit var answerabilityButton: Button
     private lateinit var gemmaModelChoice: RadioGroup
+    private lateinit var searchScopeSummary: TextView
     private val stageProgressViews = LinkedHashMap<IndexProgressStage, StageProgressView>()
     private val handler = Handler(Looper.getMainLooper())
     private val contextExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -166,6 +167,100 @@ class SettingsActivity : Activity() {
             setTextColor(Color.rgb(72, 75, 85))
             setPadding(0, 0, 0, 12)
         }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Query planner"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 6, 0, 4)
+        }, wrap())
+        root.addView(Switch(this).apply {
+            text = "Use QP V2 typed planner"
+            textSize = 15f
+            setTextColor(Color.rgb(32, 34, 42))
+            isChecked = QueryPlannerProtocolPreferences.selected(this@SettingsActivity) ==
+                QueryPlannerProtocol.V2
+            setOnCheckedChangeListener { _, enabled ->
+                QueryPlannerProtocolPreferences.setV2Enabled(this@SettingsActivity, enabled)
+                GemmaRuntime.invalidatePlannerPrefill()
+                QueryPlannerRuntime.preloadAsync(this@SettingsActivity)
+                Toast.makeText(
+                    this@SettingsActivity,
+                    if (enabled) "QP V2 enabled" else "QP V1 restored",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "V2 emits fixed-shape typed JSON with face and literal references. Turn this off to restore the retained V1 planner without changing indexes or models."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 0, 0, 12)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Answers"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 6, 0, 4)
+        }, wrap())
+        root.addView(Switch(this).apply {
+            text = "Generate answers with E2B"
+            textSize = 15f
+            setTextColor(Color.rgb(32, 34, 42))
+            isChecked = AnswerFeaturePreferences.isEnabled(this@SettingsActivity)
+            setOnCheckedChangeListener { _, enabled ->
+                AnswerFeaturePreferences.setEnabled(this@SettingsActivity, enabled)
+                if (!enabled) {
+                    // Drop any answer-only KV and immediately restore the resident planner prefix.
+                    GemmaRuntime.preloadPlannerAfterAnswerAsync(
+                        this@SettingsActivity,
+                        QueryPlannerRuntime.plannerSystemInstruction(this@SettingsActivity),
+                    )
+                }
+                Toast.makeText(
+                    this@SettingsActivity,
+                    if (enabled) "E2B answers enabled" else "Answers off • planner kept warm",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "When off, E2B still plans every query. Search highlights the fused Top 8, then repeats them inside the full Top 24 below for comparison."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 0, 0, 12)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Search indexes"
+            textSize = 15f
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 8, 0, 4)
+        }, wrap())
+        root.addView(TextView(this).apply {
+            text = "Search only the selected indexes. This changes retrieval immediately and never deletes or rebuilds existing index data."
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 0, 0, 4)
+        }, wrap())
+        val selectedSearchScope = IndexSearchScopePreferences.selected(this)
+        SearchIndexSource.entries.forEach { source ->
+            root.addView(Switch(this).apply {
+                text = source.displayName
+                textSize = 15f
+                setTextColor(Color.rgb(32, 34, 42))
+                isChecked = selectedSearchScope.contains(source)
+                setOnCheckedChangeListener { _, enabled ->
+                    IndexSearchScopePreferences.setEnabled(this@SettingsActivity, source, enabled)
+                    refreshSearchScopeSummary()
+                }
+            }, wrap())
+        }
+        searchScopeSummary = TextView(this).apply {
+            textSize = 13f
+            setTextColor(Color.rgb(72, 75, 85))
+            setPadding(0, 2, 0, 12)
+        }
+        root.addView(searchScopeSummary, wrap())
+        refreshSearchScopeSummary()
         models = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.rgb(50, 52, 60))
@@ -571,6 +666,16 @@ class SettingsActivity : Activity() {
             setPadding(0, 30, 0, 0)
         }, wrap())
         return ScrollView(this).apply { addView(root) }
+    }
+
+    private fun refreshSearchScopeSummary() {
+        val scope = IndexSearchScopePreferences.selected(this)
+        val enabled = SearchIndexSource.entries.filter(scope::contains)
+        searchScopeSummary.text = if (enabled.isEmpty()) {
+            "No indexes selected. Searches will return no records."
+        } else {
+            "Enabled: ${enabled.joinToString { it.displayName }}"
+        }
     }
 
     private fun refreshState() {

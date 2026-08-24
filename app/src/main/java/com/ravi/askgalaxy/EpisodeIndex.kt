@@ -36,6 +36,94 @@ data class EpisodeMembership(
     val memberCount: Int,
 )
 
+/** Read-only input used to identify travel episodes from the persisted episode index. */
+data class TravelEpisodeCandidate(
+    val episodeId: String,
+    val location: String?,
+    val memberCount: Int,
+)
+
+data class TravelEpisodeSelection(
+    val normalLocationKey: String?,
+    val normalEpisodeCount: Int,
+    val locatedEpisodeCount: Int,
+    val travelEpisodeIds: Set<String>,
+)
+
+data class TravelMediaScope(
+    val mediaStoreIds: Set<Long>,
+    val normalEpisodeCount: Int,
+    val locatedEpisodeCount: Int,
+    val travelEpisodeCount: Int,
+)
+
+/**
+ * Derives travel from location behavior instead of visual similarity to the word "trip".
+ * The normal locality is the modal first locality component across persisted episodes;
+ * photo count breaks episode-count ties but cannot let one large trip become "normal".
+ */
+internal object TravelLocationPolicy {
+    fun select(candidates: List<TravelEpisodeCandidate>): TravelEpisodeSelection {
+        val located = candidates.mapNotNull { candidate ->
+            localityKey(candidate.location)?.let { key -> candidate to key }
+        }
+        val normal = located
+            .groupBy(Pair<TravelEpisodeCandidate, String>::second)
+            .map { (key, episodes) ->
+                NormalLocationCandidate(
+                    key = key,
+                    episodeCount = episodes.size,
+                    memberCount = episodes.sumOf { (episode, _) -> episode.memberCount.coerceAtLeast(1) },
+                )
+            }
+            .filter { it.episodeCount >= MIN_NORMAL_EPISODES }
+            .maxWithOrNull(
+                compareBy<NormalLocationCandidate> { it.episodeCount }
+                    .thenBy { it.memberCount }
+                    .thenBy { it.key.length },
+            )
+            ?: return TravelEpisodeSelection(
+                normalLocationKey = null,
+                normalEpisodeCount = 0,
+                locatedEpisodeCount = located.size,
+                travelEpisodeIds = emptySet(),
+            )
+        val travel = located
+            .filterNot { (_, key) -> sameLocality(key, normal.key) }
+            .mapTo(linkedSetOf()) { (episode, _) -> episode.episodeId }
+        return TravelEpisodeSelection(
+            normalLocationKey = normal.key,
+            normalEpisodeCount = normal.episodeCount,
+            locatedEpisodeCount = located.size,
+            travelEpisodeIds = travel,
+        )
+    }
+
+    private data class NormalLocationCandidate(
+        val key: String,
+        val episodeCount: Int,
+        val memberCount: Int,
+    )
+
+    private fun localityKey(value: String?): String? {
+        val raw = value?.trim().orEmpty()
+        if (raw.isBlank() || EpisodeIndexer.GPS_PATTERN.matches(raw)) return null
+        return raw
+            .substringBefore('|')
+            .substringBefore(',')
+            .lowercase()
+            .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+            .trim()
+            .replace(Regex("\\s+"), " ")
+            .takeIf { key -> key.length >= 2 && key.any(Char::isLetter) }
+    }
+
+    private fun sameLocality(left: String, right: String): Boolean =
+        left == right || left.contains(right) || right.contains(left)
+
+    private const val MIN_NORMAL_EPISODES = 2
+}
+
 /**
  * Rebuildable preprocessing-time episode index.
  *

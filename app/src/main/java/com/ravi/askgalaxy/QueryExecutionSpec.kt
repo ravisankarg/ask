@@ -12,7 +12,7 @@ import java.time.LocalDate
 data class QueryExecutionSpec(val root: ExecutionNode) {
     fun render(): String = ExecutionSpecRenderer.render(root)
 
-    /** Reads an optional legacy/internal category envelope. Compact QP never emits it. */
+    /** Reads the model-authored category envelope; the structural QP gate requires it. */
     fun queryCategoryOrNull(): QueryCategory? {
         val categories = ArrayList<ExecutionNode.Predicate>(1)
         fun collectCategories(node: ExecutionNode) {
@@ -36,9 +36,11 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
     }
 
-    fun requiredQueryCategory(): QueryCategory = queryCategoryOrNull() ?: QueryCategory.SCENARY
+    fun requiredQueryCategory(): QueryCategory = requireNotNull(queryCategoryOrNull()) {
+        "Planner spec must contain query_category"
+    }
 
-    /** Reads an optional legacy/internal answer-routing envelope. */
+    /** Reads the model-authored answer-routing envelope; the structural QP gate requires it. */
     fun answerNeededOrNull(): Boolean? {
         val answers = ArrayList<ExecutionNode.Predicate>(1)
         fun collect(node: ExecutionNode) {
@@ -61,7 +63,9 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
         }
     }
 
-    fun requiredAnswerNeeded(): Boolean = answerNeededOrNull() ?: true
+    fun requiredAnswerNeeded(): Boolean = requireNotNull(answerNeededOrNull()) {
+        "Planner spec must contain answer_needed"
+    }
 
     /**
      * Normalizes Gemma's routing predicate without planning any user intent.
@@ -125,6 +129,9 @@ data class QueryExecutionSpec(val root: ExecutionNode) {
                             ) {
                                 "query_category must be one of doc, scenary, person, location, time"
                             }
+                            ExecutionField.TRAVEL -> require(node.value == "outside_normal") {
+                                "travel must be outside_normal"
+                            }
                             else -> Unit
                         }
                     }
@@ -154,6 +161,7 @@ enum class ExecutionField(val wireName: String) {
     FROM_DATE("from_date"),
     TO_DATE("to_date"),
     LOCATION("location"),
+    TRAVEL("travel"),
     TIME("time"),
     SEMANTIC("semantic"),
     KEYWORD("keyword"),
@@ -172,6 +180,7 @@ enum class ExecutionField(val wireName: String) {
             "from_date" -> FROM_DATE
             "to_date" -> TO_DATE
             "location" -> LOCATION
+            "travel" -> TRAVEL
             "time" -> TIME
             "semantic" -> SEMANTIC
             "keyword" -> KEYWORD
@@ -190,6 +199,7 @@ enum class ExecutionBinaryOperator(val symbol: String, val precedence: Int) {
 
 enum class ExecutionSort(val wireName: String) {
     DATE("SORT_DATE"),
+    OLDEST("SORT_OLDEST"),
     LOCATION("SORT_LOC"),
 }
 
@@ -247,7 +257,7 @@ object ExecutionSpecRenderer {
         val needsQuotes = clean.isBlank() ||
             clean.any { it in charArrayOf('[', ']', ',', '+', '&', '"') } ||
             Regex("(^|\\s)-(\\s|$)").containsMatchIn(clean) ||
-            Regex("\\b(?:SORT_DATE|SORT_LOC)\\b", RegexOption.IGNORE_CASE).containsMatchIn(clean) ||
+            Regex("\\b(?:SORT_DATE|SORT_OLDEST|SORT_LOC)\\b", RegexOption.IGNORE_CASE).containsMatchIn(clean) ||
             clean.contains(" == ") ||
             clean.contains('\\')
         if (!needsQuotes) return clean
@@ -307,6 +317,7 @@ private class ExecutionSpecParser(value: String) {
         while (true) {
             value = when {
                 match(TokenKind.SORT_DATE) -> ExecutionNode.Sorted(value, ExecutionSort.DATE)
+                match(TokenKind.SORT_OLDEST) -> ExecutionNode.Sorted(value, ExecutionSort.OLDEST)
                 match(TokenKind.SORT_LOC) -> ExecutionNode.Sorted(value, ExecutionSort.LOCATION)
                 else -> return value
             }
@@ -441,6 +452,7 @@ private class ExecutionSpecParser(value: String) {
         AND,
         COMMA,
         SORT_DATE,
+        SORT_OLDEST,
         SORT_LOC,
         WORD,
     }
@@ -508,6 +520,7 @@ private class ExecutionSpecParser(value: String) {
                         val word = value.substring(start, cursor)
                         output += when (word.uppercase()) {
                             "SORT_DATE" -> Token(TokenKind.SORT_DATE, word)
+                            "SORT_OLDEST" -> Token(TokenKind.SORT_OLDEST, word)
                             "SORT_LOC" -> Token(TokenKind.SORT_LOC, word)
                             else -> Token(TokenKind.WORD, word)
                         }
@@ -529,19 +542,17 @@ private class ExecutionSpecParser(value: String) {
 
 /**
  * Compiles the Gemma planner AST into the bounded retrieval and answer-routing
- * model. Category and answer intent may be derived from the user's wording;
+ * model. Category and answer intent are mandatory model-authored predicates;
  * only retrieval predicates execute in [StructuredSearchExecutor].
  */
 object ExecutionSpecCompiler {
-    fun compile(
-        spec: QueryExecutionSpec,
-        derivedCategory: QueryCategory? = null,
-        derivedAnswerNeeded: Boolean? = null,
-    ): QueryPlan {
-        val explicitCategory = spec.queryCategoryOrNull()
-        val explicitAnswerNeeded = spec.answerNeededOrNull()
-        val requiredAnswerNeeded = derivedAnswerNeeded ?: explicitAnswerNeeded ?: true
-        val queryCategory = derivedCategory ?: explicitCategory ?: QueryCategory.SCENARY
+    fun compile(spec: QueryExecutionSpec): QueryPlan {
+        val queryCategory = requireNotNull(spec.queryCategoryOrNull()) {
+            "Planner spec must contain query_category"
+        }
+        val requiredAnswerNeeded = requireNotNull(spec.answerNeededOrNull()) {
+            "Planner spec must contain answer_needed"
+        }
         val canonicalSpec = spec.canonicalizeCategoryEnvelope()
         val semantic = ArrayList<String>()
         val keywords = ArrayList<String>()
@@ -555,8 +566,10 @@ object ExecutionSpecCompiler {
         var fromDate = ""
         var toDate = ""
         var location = ""
+        var travel = ""
         var time = ""
         var sortDate = false
+        var sortOldest = false
         var sortLocation = false
 
         fun visit(node: ExecutionNode, subtract: Boolean = false) {
@@ -577,6 +590,7 @@ object ExecutionSpecCompiler {
                     ExecutionField.FROM_DATE -> if (!subtract) fromDate = node.value
                     ExecutionField.TO_DATE -> if (!subtract) toDate = node.value
                     ExecutionField.LOCATION -> if (!subtract) location = node.value
+                    ExecutionField.TRAVEL -> if (!subtract) travel = node.value
                     ExecutionField.TIME -> if (!subtract) time = node.value
                     ExecutionField.SEMANTIC ->
                         if (subtract) negativeSemantic += node.value else semantic += node.value
@@ -587,6 +601,7 @@ object ExecutionSpecCompiler {
                 is ExecutionNode.Sorted -> {
                     when (node.sort) {
                         ExecutionSort.DATE -> sortDate = true
+                        ExecutionSort.OLDEST -> sortOldest = true
                         ExecutionSort.LOCATION -> sortLocation = true
                     }
                     visit(node.value, subtract)
@@ -604,7 +619,7 @@ object ExecutionSpecCompiler {
         val metadataFields = buildSet {
             if (people.isNotEmpty() || excludedPeople.isNotEmpty()) add(AnswerMetadataField.PEOPLE)
             if (fromDate.isNotBlank() || toDate.isNotBlank() || time.isNotBlank()) add(AnswerMetadataField.TIME)
-            if (location.isNotBlank()) add(AnswerMetadataField.LOCATION)
+            if (location.isNotBlank() || travel.isNotBlank()) add(AnswerMetadataField.LOCATION)
         }
         val answerScope = queryCategory.answerEvidenceScope()
             .withMetadataFields(metadataFields)
@@ -631,13 +646,15 @@ object ExecutionSpecCompiler {
             fromDate = fromDate,
             toDate = toDate,
             locationHint = location,
+            travelScope = travel,
             recentFirst = sortDate,
+            oldestFirst = sortOldest,
             sortByLocation = sortLocation,
             mediaType = mediaType,
             queryCategory = queryCategory,
             timeHint = time,
             needsAnswer = requiredAnswerNeeded,
-            answerIntentExplicit = derivedAnswerNeeded != null || explicitAnswerNeeded != null,
+            answerIntentExplicit = true,
             answerEvidenceScope = answerScope,
             executionSpec = canonicalSpec,
         )

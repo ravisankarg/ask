@@ -4,6 +4,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -59,7 +60,7 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun compact_planner_expression_parses_without_a_routing_envelope() {
+    fun expression_parser_can_read_but_model_gate_rejects_a_missing_envelope() {
         val emitted =
             "[semantic == passport identity document] && " +
                 "[keyword == {Ravi} && {passport}]"
@@ -68,104 +69,42 @@ class QueryAndDiversityContractTest {
 
         assertEquals(null, parsed.queryCategoryOrNull())
         assertEquals(emitted, parsed.render())
+        assertThrows(IllegalArgumentException::class.java) {
+            ModelAuthoredPlanStructure.compile(parsed)
+        }
     }
 
     @Test
-    fun planner_normalizes_explicit_person_only_date_and_answer_routing_constraints() {
-        val known = listOf("Ravi", "Ramani")
-        fun normalized(query: String, emitted: String): QueryPlan {
-            val spec = QueryPlannerRuntime.normalizeFiniteConstraints(
-                QueryExecutionSpec.parse(emitted),
-                query,
-                known,
-            )
-            return ExecutionSpecCompiler.compile(
-                spec,
-                derivedCategory = QueryCategoryConstraintPolicy.expectedCategory(query),
-                derivedAnswerNeeded = AnswerIntentPolicy.expected(query),
-            )
-        }
-
-        val onlyLastWeek = normalized(
-            "Ramani only photos last week",
-            "[answer_needed == true] && [query_category == person] && " +
-                "[[mime type == photos] && [person == Ramani]]",
+    fun complete_model_authored_envelope_compiles_without_intent_derivation() {
+        val onlyLastWeek = ModelAuthoredPlanStructure.compile(
+            QueryExecutionSpec.parse(
+                "[answer_needed == true] && [query_category == person] && " +
+                    "[people_only == Ramani] && [mime type == photos] && " +
+                    "[person == Ramani] && [from_date == 2026-08-10] && [to_date == 2026-08-16]",
+            ),
         )
-        assertFalse(onlyLastWeek.needsAnswer)
-        assertEquals(QueryCategory.SCENARY, onlyLastWeek.queryCategory)
+
+        assertTrue(onlyLastWeek.needsAnswer)
+        assertEquals(QueryCategory.PERSON, onlyLastWeek.queryCategory)
         assertEquals(listOf("Ramani"), onlyLastWeek.personNames)
         assertEquals(listOf("Ramani"), onlyLastWeek.onlyPersonNames)
         assertEquals(QueryMediaType.PHOTOS, onlyLastWeek.mediaType)
-        assertEquals(QueryScopeParser.explicitDateBoundsFromQuery("last week")!!.first, onlyLastWeek.fromDate)
-        assertEquals(QueryScopeParser.explicitDateBoundsFromQuery("last week")!!.second, onlyLastWeek.toDate)
-
-        val places = normalized(
-            "how many places Ramani visited last year",
-            "[answer_needed == true] && [query_category == person] && " +
-                "[[semantic == places visited by Ramani]]",
-        )
-        assertTrue(places.needsAnswer)
-        assertEquals(QueryCategory.LOCATION, places.queryCategory)
-        assertEquals(listOf("Ramani"), places.personNames)
-        assertTrue(places.sortByLocation)
-        assertTrue(places.semanticQueries.isEmpty())
-
-        val birthday = normalized(
-            "when is Ramani birthday",
-            "[answer_needed == true] && [query_category == person] && " +
-                "[[person == Ramani] && [semantic == birthday]]",
-        )
-        assertEquals(QueryCategory.TIME, birthday.queryCategory)
-        assertTrue(birthday.recentFirst)
-
-        val dancing = normalized(
-            "Ramani dancing",
-            "[answer_needed == false] && [query_category == person] && " +
-                "[[mime type == photos] && [semantic == Ramani dancing]]",
-        )
-        assertEquals(QueryCategory.SCENARY, dancing.queryCategory)
-        assertEquals(listOf("Ramani"), dancing.personNames)
-        assertEquals(listOf("dancing"), dancing.semanticQueries)
-
-        val pair = normalized(
-            "Ravi and Ramani in 2015",
-            "[answer_needed == true] && [query_category == person] && " +
-                "[[semantic == Ravi and Ramani]]",
-        )
-        assertFalse(pair.needsAnswer)
-        assertEquals(QueryCategory.SCENARY, pair.queryCategory)
-        assertEquals(listOf("Ravi", "Ramani"), pair.personNames)
-        assertEquals("2015-01-01", pair.fromDate)
-        assertEquals("2015-12-31", pair.toDate)
-
-        val odyssey = normalized(
-            "how much is odyssy movie",
-            "[semantic == Odyssey movie ticket] && [keyword == {Odyssey} && {movie}]",
-        )
-        assertEquals(QueryCategory.DOC, odyssey.queryCategory)
-        assertEquals(listOf("Odyssey movie ticket"), odyssey.semanticQueries)
-        assertEquals(listOf("Odyssey movie"), odyssey.keywordTerms)
-        assertTrue(odyssey.ocrTerms.isEmpty())
-
-        val namedPassport = normalized(
-            "what is Ravi passport number",
-            "[semantic == passport identity document] && [keyword == {Ravi} && {passport}]",
-        )
-        assertTrue(namedPassport.personNames.isEmpty())
-        assertEquals(listOf("Ravi passport"), namedPassport.keywordTerms)
-        assertTrue(namedPassport.ocrTerms.isEmpty())
+        assertTrue(onlyLastWeek.timeHint.isBlank())
+        assertEquals("2026-08-10", onlyLastWeek.fromDate)
+        assertEquals("2026-08-16", onlyLastWeek.toDate)
     }
 
     @Test
     fun formal_execution_spec_round_trips_requested_person_subtraction() {
         val raw =
-            "[query_category == scenary] && [[person == ravi] && [mime type == photos]] - [semantic == glasses]"
+            "[query_category == scenary] && [answer_needed == false] && " +
+                "[[person == ravi] && [mime type == photos]] - [semantic == glasses]"
 
         val spec = QueryExecutionSpec.parse(raw)
 
         assertEquals(spec, QueryExecutionSpec.parse(spec.render()))
         assertEquals(spec, QueryExecutionSpec.parse(spec.render()))
-        val compiled = ExecutionSpecCompiler.compile(spec)
+        val compiled = ModelAuthoredPlanStructure.compile(spec)
         assertEquals(QueryCategory.SCENARY, compiled.queryCategory)
         assertEquals(listOf("ravi"), compiled.personNames)
         assertEquals(listOf("glasses"), compiled.negativeSemanticQueries)
@@ -196,39 +135,35 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun planner_category_is_optional_model_output_and_remains_internal_metadata() {
+    fun model_authored_category_and_answer_envelope_are_required() {
         val valid = QueryExecutionSpec.parse(
-            "[query_category == doc] && [[semantic == food receipt total] && [mime type == photos]]",
+            "[query_category == doc] && [answer_needed == true] && " +
+                "[semantic == food receipt total] && [mime type == photos]",
         )
 
         assertEquals(QueryCategory.DOC, valid.requiredQueryCategory())
-        val compiled = ExecutionSpecCompiler.compile(valid)
+        val compiled = ModelAuthoredPlanStructure.compile(valid)
         assertTrue(compiled.answerEvidenceScope.needsOcr)
         assertFalse(compiled.answerEvidenceScope.needsVisual)
 
         val compact = QueryExecutionSpec.parse("[semantic == receipt]")
         assertEquals(null, compact.queryCategoryOrNull())
-        assertEquals(
-            QueryCategory.DOC,
-            ExecutionSpecCompiler.compile(compact, derivedCategory = QueryCategory.DOC).queryCategory,
-        )
-        val relocated = QueryExecutionSpec.parse(
-            "[semantic == receipt], [query_category == doc]",
-        )
-        assertEquals(
-            "[semantic == receipt]",
-            relocated.canonicalizeCategoryEnvelope().render(),
-        )
+        assertThrows(IllegalArgumentException::class.java) {
+            ModelAuthoredPlanStructure.compile(compact)
+        }
     }
 
     @Test
-    fun planner_category_remains_hard_scoped_when_subtraction_wraps_intersection() {
+    fun planner_envelope_is_rejected_inside_subtraction() {
         val spec = QueryExecutionSpec.parse(
-            "[[[query_category == scenary] && [semantic == swimming]] - [semantic == glasses]]",
+            "[[[query_category == scenary] && [answer_needed == false] && " +
+                "[semantic == swimming]] - [semantic == glasses]]",
         )
 
         assertEquals(QueryCategory.SCENARY, spec.requiredQueryCategory())
-        assertEquals(QueryCategory.SCENARY, ExecutionSpecCompiler.compile(spec).queryCategory)
+        assertThrows(IllegalArgumentException::class.java) {
+            ModelAuthoredPlanStructure.compile(spec)
+        }
     }
 
     @Test
@@ -280,19 +215,19 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun planner_prompt_requires_compact_search_fields_and_semantics() {
-        val prompt = QueryPlannerRuntime.plannerSystemInstruction()
+    fun planner_prompt_requires_complete_model_authored_plan_and_semantics() {
+        val prompt = QueryPlannerRuntime.plannerSystemInstruction(QueryPlannerProtocol.V1)
 
-        assertTrue(prompt.contains("private query compiler"))
-        assertTrue(prompt.contains("Emit only person, location, time, semantic, keyword"))
-        assertTrue(prompt.contains("Do not emit query_category, answer_needed, ocr"))
-        assertTrue(prompt.contains("Do not emit keyword for visual intent"))
-        assertTrue(prompt.contains("File lifecycle wording has no searchable meaning"))
+        assertTrue(prompt.contains("only query planner"))
+        assertTrue(prompt.contains("runtime does not infer, add, remove, or rewrite query intent"))
+        assertTrue(prompt.contains("exactly one [query_category == value]"))
+        assertTrue(prompt.contains("exactly one [answer_needed == true|false]"))
+        assertTrue(prompt.contains("Do not emit ocr"))
+        assertTrue(prompt.contains("Visual/gallery intent never uses keyword"))
+        assertTrue(prompt.contains("Phone/file lifecycle words"))
         assertTrue(prompt.contains("Every predicate is exactly [field == value]"))
-        assertTrue(prompt.contains("Ramani at Goa"))
-        assertTrue(prompt.contains("Ramani dancing in the morning"))
-        assertTrue(prompt.contains("odyssy movie ticket"))
-        assertTrue(prompt.contains("{Odyssey}"))
+        assertTrue(prompt.contains("cycling in rain"))
+        assertTrue(prompt.contains("BR Hills"))
         assertTrue(prompt.contains("Ravi passport number"))
         assertTrue(prompt.contains("[keyword == {Ravi} && {passport}]"))
         assertTrue(prompt.length < 8_000)
@@ -300,13 +235,14 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun broad_monthly_spending_plan_uses_derived_doc_route_without_legacy_ocr() {
+    fun broad_monthly_spending_plan_uses_model_authored_doc_route_without_legacy_ocr() {
         val raw =
-            "[from_date == 2026-06-01] && [to_date == 2026-06-30] && " +
+            "[query_category == doc] && [answer_needed == true] && " +
+                "[from_date == 2026-06-01] && [to_date == 2026-06-30] && " +
                 "[semantic == purchase receipts bills invoices payment confirmations]"
 
         val spec = QueryExecutionSpec.parse(raw)
-        val plan = ExecutionSpecCompiler.compile(spec, derivedCategory = QueryCategory.DOC)
+        val plan = ModelAuthoredPlanStructure.compile(spec)
 
         assertEquals(spec, QueryExecutionSpec.parse(spec.render()))
         assertEquals(QueryCategory.DOC, plan.queryCategory)
@@ -319,12 +255,6 @@ class QueryAndDiversityContractTest {
         assertTrue(plan.ocrTerms.isEmpty())
         assertTrue(plan.answerEvidenceScope.needsOcr)
         assertFalse(plan.answerEvidenceScope.needsVisual)
-        QueryPlannerRuntime.validateSemanticValues(plan)
-        QueryStructuredIntentPolicy.validate(
-            "How much did I spend last month?",
-            emptyList(),
-            plan,
-        )
     }
 
     @Test
@@ -360,449 +290,26 @@ class QueryAndDiversityContractTest {
         ).render()
         assertTrue(rendered.contains("[keyword == {Ravi} && {passport}]"))
         assertEquals(rendered, QueryExecutionSpec.parse(rendered).render())
-        QueryPlannerRuntime.validatePlannerOcrSyntax(rendered)
-        try {
-            QueryPlannerRuntime.validatePlannerOcrSyntax(
-                "[semantic == passport identity document] && [ocr == Ravi passport]",
+        assertThrows(IllegalArgumentException::class.java) {
+            ModelAuthoredPlanStructure.compile(
+                QueryExecutionSpec.parse(
+                    "[query_category == doc] && [answer_needed == true] && " +
+                        "[semantic == passport identity document] && [ocr == Ravi passport]",
+                ),
             )
-            fail("Expected old implicit OCR syntax to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-    }
-
-    @Test
-    fun undated_queries_reject_model_invented_date_predicates() {
-        val today = LocalDate.now().toString()
-        val inventedDatePlan = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == doc] && [[from_date == $today] && " +
-                    "[to_date == $today] && [semantic == car repair invoice total]]",
-            ),
-        )
-
-        try {
-            QueryDateConstraintPolicy.validate(
-                "How much I spend on car repair",
-                inventedDatePlan,
-            )
-            fail("Expected invented date predicates to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-
-        QueryDateConstraintPolicy.validate(
-            "How much did I spend on car repair today",
-            inventedDatePlan,
-        )
-        assertFalse(
-            QueryDateConstraintPolicy.hasExplicitTemporalConstraint(
-                "How much I spend on car repair",
-            ),
-        )
-        assertTrue(QueryDateConstraintPolicy.hasExplicitTemporalConstraint("car repair last summer"))
-        assertTrue(QueryDateConstraintPolicy.hasExplicitTemporalConstraint("car repair three weeks ago"))
-        assertTrue(QueryDateConstraintPolicy.hasExplicitTemporalConstraint("car repair on Monday"))
-    }
-
-    @Test
-    fun one_exact_day_requires_equal_from_and_to_boundaries() {
-        assertEquals(
-            "2026-07-24" to "2026-07-24",
-            QueryScopeParser.explicitDateBoundsFromQuery("photos taken on 24 July 2026"),
-        )
-        assertEquals(
-            "2026-07-24" to "2026-07-24",
-            QueryScopeParser.explicitDateBoundsFromQuery("photos taken on 24/07/2026"),
-        )
-        assertEquals(
-            "2026-07-24",
-            QueryDateConstraintPolicy.requiredSingleDay("photos taken on 24 July 2026"),
-        )
-
-        val missingToDate = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == scenary] && [[from_date == 2026-07-24] && " +
-                    "[mime type == photos]]",
-            ),
-        )
-        try {
-            QueryDateConstraintPolicy.validate(
-                "photos taken on 24 July 2026",
-                missingToDate,
-            )
-            fail("Expected a one-day plan without to_date to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected: Gemma must repair this into a closed one-day interval.
-        }
-
-        val closedDay = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == scenary] && [[from_date == 2026-07-24] && " +
-                    "[to_date == 2026-07-24] && [mime type == photos]]",
-            ),
-        )
-        QueryDateConstraintPolicy.validate("photos taken on 24 July 2026", closedDay)
-
-        assertEquals(
-            null,
-            QueryDateConstraintPolicy.requiredSingleDay("photos after 24 July 2026"),
-        )
-        val afterDay = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == scenary] && [[from_date == 2026-07-25] && " +
-                    "[mime type == photos]]",
-            ),
-        )
-        QueryDateConstraintPolicy.validate("photos after 24 July 2026", afterDay)
-    }
-
-    @Test
-    fun category_validator_follows_requested_answer_over_prominent_nouns() {
-        assertEquals(
-            QueryCategory.PERSON,
-            QueryCategoryConstraintPolicy.expectedCategory("Who is in these beach photos?"),
-        )
-        assertEquals(
-            QueryCategory.LOCATION,
-            QueryCategoryConstraintPolicy.expectedCategory(
-                "Where was the sunset photo with the lighthouse taken?",
-            ),
-        )
-        assertEquals(
-            QueryCategory.TIME,
-            QueryCategoryConstraintPolicy.expectedCategory("When did I visit Goa?"),
-        )
-        assertEquals(
-            QueryCategory.TIME,
-            QueryCategoryConstraintPolicy.expectedCategory(
-                "On which dates did we visit national parks last year?",
-            ),
-        )
-        assertEquals(
-            QueryCategory.DOC,
-            QueryCategoryConstraintPolicy.expectedCategory(
-                "When does my driving licence expire?",
-            ),
-        )
-        listOf(
-            "What is Ravi passport number?",
-            "What is Ravi DL number?",
-            "What is Ravi driving license number?",
-            "What is Ravi SSN?",
-            "What is Ravi social security number?",
-            "What is Ravi PAN card number?",
-            "What is Ravi Aadhaar card number?",
-            "What is Ravi Aadhar number?",
-            "What is Ravi Aadhard number?",
-            "What is Ravi ID number?",
-            "What is the WiFi password?",
-            "What is Ravi user ID?",
-            "What is Ravi DOB?",
-            "What is Ravi age?",
-            "What are Ravi exam marks?",
-            "show insurance documents",
-            "property tax",
-            "sale deed",
-            "government identification docs",
-            "coupons and tickets",
-            "certificates",
-        ).forEach { query ->
-            assertEquals(
-                "Expected doc for '$query'",
-                QueryCategory.DOC,
-                QueryCategoryConstraintPolicy.expectedCategory(query),
-            )
-        }
-        assertEquals(
-            QueryCategory.SCENARY,
-            QueryCategoryConstraintPolicy.expectedCategory(
-                "What did I eat on my trip to Barcelona?",
-            ),
-        )
-        listOf("Ramani dancing", "sleeping photos", "running", "playing cricket", "mountain hike", "dog")
-            .forEach { query ->
-                assertEquals(
-                    "Expected scenary for '$query'",
-                    QueryCategory.SCENARY,
-                    QueryCategoryConstraintPolicy.expectedCategory(query),
-                )
-            }
-    }
-
-    @Test
-    fun self_pronouns_resolve_only_when_they_refer_to_person_presence() {
-        assertTrue(SelfPersonQueryPolicy.referencesSelfAsPerson("Show photos of me at the beach"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelfAsPerson("Who was with me at dinner?"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelfAsPerson("Where did I go last month?"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelfAsPerson("What was I wearing?"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelfAsPerson("Show my birthday photos"))
-        assertFalse(SelfPersonQueryPolicy.referencesSelfAsPerson("What is my passport number?"))
-        assertFalse(SelfPersonQueryPolicy.referencesSelfAsPerson("How much did I spend last month?"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelf("What is my passport number?"))
-        assertTrue(SelfPersonQueryPolicy.referencesSelf("How much did I spend last month?"))
-        assertTrue(
-            SelfPersonQueryPolicy.referencesSelfForCategory(
-                "What is my passport number?",
-                QueryCategory.DOC,
-            ),
-        )
-        assertFalse(
-            SelfPersonQueryPolicy.referencesSelfForCategory(
-                "How much did I spend last month?",
-                QueryCategory.DOC,
-            ),
-        )
-
-        val presencePlan = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == scenary] && [[mime type == photos] && " +
-                    "[person == Ravi] && [semantic == beach]]",
-            ),
-        )
-        QueryPlannerRuntime.validateCompiledPlan(
-            "Show photos of me at the beach",
-            listOf("Ravi"),
-            presencePlan,
-            selfPersonLabel = "Ravi",
-        )
-
-        val documentPlan = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[semantic == passport identity document] && [keyword == {Ravi} && {passport}]",
-            ),
-            derivedCategory = QueryCategory.DOC,
-        )
-        QueryPlannerRuntime.validateCompiledPlan(
-            "What is my passport number?",
-            listOf("Ravi"),
-            documentPlan,
-            selfPersonLabel = "Ravi",
-        )
-
-        val aliasPollutedPlan = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[semantic == passport identity document] && " +
-                    "[keyword == {passport} && {self}]",
-            ),
-            derivedCategory = QueryCategory.DOC,
-        )
-        try {
-            QueryPlannerRuntime.validateCompiledPlan(
-                "What is my passport number?",
-                listOf("Ravi"),
-                aliasPollutedPlan,
-                selfPersonLabel = "Ravi",
-            )
-            fail("Expected self aliases in document keywords to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-    }
-
-    @Test
-    fun named_document_subject_stays_in_keywords_instead_of_face_scope() {
-        val correct = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[semantic == passport identity document] && " +
-                    "[keyword == {Ravi} && {passport}]",
-            ),
-            derivedCategory = QueryCategory.DOC,
-        )
-        QueryStructuredIntentPolicy.validate(
-            "What is Ravi passport number?",
-            listOf("Ravi"),
-            correct,
-        )
-
-        val faceScoped = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[person == Ravi] && [semantic == passport identity document] && " +
-                    "[keyword == {Ravi} && {passport}]",
-            ),
-            derivedCategory = QueryCategory.DOC,
-        )
-        try {
-            QueryStructuredIntentPolicy.validate(
-                "What is Ravi passport number?",
-                listOf("Ravi"),
-                faceScoped,
-            )
-            fail("Expected a printed document owner to be rejected as a face scope")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-    }
-
-    @Test
-    fun date_validator_requires_full_ranges_and_open_boundaries() {
-        assertEquals(
-            "2025-01-01" to "2025-12-31",
-            QueryScopeParser.explicitDateBoundsFromQuery("places visited last year"),
-        )
-        assertEquals(
-            "2025-06-01" to "2025-08-31",
-            QueryScopeParser.explicitDateBoundsFromQuery(
-                "bills photographed between June and August 2025",
-            ),
-        )
-        assertEquals(
-            "2025-07-01" to "",
-            QueryScopeParser.explicitDateBoundsFromQuery("sunset after June 2025"),
-        )
-
-        val anniversaryOnly = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == location] && [[from_date == 2025-07-25] && " +
-                    "[to_date == 2025-07-25]] SORT_LOC",
-            ),
-        )
-        try {
-            QueryDateConstraintPolicy.validate("What places did I visit last year?", anniversaryOnly)
-            fail("Expected an anniversary-only plan to be rejected for last year")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-    }
-
-    @Test
-    fun structured_intent_validator_preserves_media_people_and_single_places() {
-        assertEquals(
-            QueryMediaType.PHOTOS,
-            QueryStructuredIntentPolicy.expectedMediaType("beach phootos"),
-        )
-        assertEquals(
-            QueryMediaType.VIDEOS,
-            QueryStructuredIntentPolicy.expectedMediaType("fireworks vidoes"),
-        )
-        assertEquals(
-            listOf("Barcelona"),
-            QueryStructuredIntentPolicy.explicitLocationCandidates(
-                "What did I eat on my trip to Barcelona?",
-            ),
-        )
-        assertEquals(
-            listOf("Goa"),
-            QueryStructuredIntentPolicy.explicitLocationCandidates(
-                "Which people joined both the Goa trip and the mountain trek?",
-            ),
-        )
-        assertEquals(
-            listOf("Hyderabad"),
-            QueryStructuredIntentPolicy.explicitLocationCandidates(
-                "On which day did the team meet at the Hyderabad offsite?",
-            ),
-        )
-        assertTrue(
-            QueryStructuredIntentPolicy.explicitLocationCandidates(
-                "What places did I visit last year?",
-            ).isEmpty(),
-        )
-
-        val complete = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == person] && [[person == Meghana] && " +
-                    "[location == Bengaluru]] - [person == Ravi]",
-            ),
-        )
-        QueryStructuredIntentPolicy.validate(
-            "Who appears with Meghna in Bengaluru without Ravi?",
-            listOf("Ravi", "Meghana", "Ramani"),
-            complete,
-        )
-        assertTrue(
-            QueryStructuredIntentPolicy.isMetadataOnlyIntent(
-                "Who appears most often with Ramani?",
-            ),
-        )
-        assertTrue(
-            QueryStructuredIntentPolicy.isMetadataOnlyIntent(
-                "Which cities did I visit with Meghana but without Ravi?",
-            ),
-        )
-        assertFalse(
-            QueryStructuredIntentPolicy.isMetadataOnlyIntent(
-                "Who else was with Meghana at the team outing?",
-            ),
-        )
-
-        val relationalSemantic = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == person] && [[person == Meghana] && " +
-                    "[location == Bengaluru] && [semantic == appears with]] - " +
-                    "[person == Ravi]",
-            ),
-        )
-        try {
-            QueryStructuredIntentPolicy.validate(
-                "Who appears with Meghna in Bengaluru without Ravi?",
-                listOf("Ravi", "Meghana", "Ramani"),
-                relationalSemantic,
-            )
-            fail("Expected a metadata-only relation with a semantic filter to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-
-        val missingSubtraction = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == location] && [semantic == airport layovers]",
-            ),
-        )
-        try {
-            QueryStructuredIntentPolicy.validate(
-                "Which places did I visit excluding airport layovers?",
-                emptyList(),
-                missingSubtraction,
-            )
-            fail("Expected an explicit exclusion without subtraction to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-
-        val invertedAnchor = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == person] && " +
-                    "[semantic == team outing] - [person == Meghana]",
-            ),
-        )
-        try {
-            QueryStructuredIntentPolicy.validate(
-                "Who else was with Meghana at the team outing?",
-                listOf("Meghana"),
-                invertedAnchor,
-            )
-            fail("Expected a named positive person anchor in subtraction to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-
-        val missingEvent = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == person] && [person == Meghana]",
-            ),
-        )
-        try {
-            QueryStructuredIntentPolicy.validate(
-                "Who else was with Meghana at the team outing?",
-                listOf("Meghana"),
-                missingEvent,
-            )
-            fail("Expected an explicitly named event without semantic retrieval to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
         }
     }
 
     @Test
     fun planner_prompt_covers_uniform_output_visual_time_and_exclusion_contracts() {
-        val prompt = QueryPlannerRuntime.plannerSystemInstruction()
+        val prompt = QueryPlannerRuntime.plannerSystemInstruction(QueryPlannerProtocol.V1)
 
         assertTrue(prompt.contains("RESOLVED_QUERY: <the standalone"))
-        assertTrue(prompt.contains("[time == morning]"))
-        assertTrue(prompt.contains("Every without, excluding, except, but not, not, or no clause"))
+        assertTrue(prompt.contains("[from_date == 2023-08-22]"))
+        assertTrue(prompt.contains("current_query=recent trip"))
+        assertTrue(prompt.contains("Every without/excluding/except/but not/not/no clause"))
 
-        val groupedExclusion = ExecutionSpecCompiler.compile(
+        val groupedExclusion = ModelAuthoredPlanStructure.compile(
             QueryExecutionSpec.parse(
                 "[answer_needed == true] && [query_category == person] && " +
                     "[[[person == Ravi] && [semantic == birthday celebration] && " +
@@ -810,72 +317,18 @@ class QueryAndDiversityContractTest {
                     "[semantic == restaurant screenshot]]",
             ),
         )
-        QueryStructuredIntentPolicy.validate(
-            "Who else was present across Ravi's whole birthday celebration, " +
-                "excluding restaurant screenshots?",
-            listOf("Ravi"),
-            groupedExclusion,
-        )
         assertEquals(listOf("restaurant screenshot"), groupedExclusion.negativeSemanticQueries)
     }
 
     @Test
-    fun sort_validator_requires_time_and_plural_location_ordering() {
-        val unsortedTime = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == time] && [semantic == birthday party]",
-            ),
-        )
-        try {
-            QuerySortConstraintPolicy.validate("When was the birthday party?", unsortedTime)
-            fail("Expected a time plan without SORT_DATE to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-
-        val sortedPlaces = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == location] && [semantic == national park] SORT_LOC",
-            ),
-        )
-        QuerySortConstraintPolicy.validate(
-            "Which national parks have I visited?",
-            sortedPlaces,
-        )
-
-        val incorrectlySortedRoute = ExecutionSpecCompiler.compile(
-            QueryExecutionSpec.parse(
-                "[query_category == location] && " +
-                    "[semantic == lunch stop on Bengaluru-to-Goa road trip] SORT_LOC",
-            ),
-        )
-        try {
-            QuerySortConstraintPolicy.validate(
-                "Where did my Bengaluru-to-Goa road trip stop for lunch?",
-                incorrectlySortedRoute,
-            )
-            fail("Expected unrequested SORT_LOC to be rejected")
-        } catch (_: IllegalArgumentException) {
-            // Expected.
-        }
-    }
-
-    @Test
     fun movie_ticket_remains_semantic_content_instead_of_mime() {
-        val plan = ExecutionSpecCompiler.compile(
+        val plan = ModelAuthoredPlanStructure.compile(
             QueryExecutionSpec.parse(
-                "[semantic == Odyssey movie ticket] && [keyword == {Odyssey} && {movie}]",
+                "[query_category == doc] && [answer_needed == true] && " +
+                    "[semantic == Odyssey movie ticket] && [keyword == {Odyssey} && {movie}]",
             ),
-            derivedCategory = QueryCategory.DOC,
-            derivedAnswerNeeded = true,
         )
 
-        QueryPlannerRuntime.validateSemanticValues(plan)
-        QueryPlannerRuntime.validateCompiledPlan(
-            "Odyssey movie ticket",
-            emptyList(),
-            plan,
-        )
         assertEquals(QueryCategory.DOC, plan.queryCategory)
         assertEquals(null, plan.mediaType)
         assertEquals(listOf("Odyssey movie ticket"), plan.semanticQueries)
@@ -886,9 +339,10 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun semantic_vector_cutoff_is_inclusive_at_point_eighteen() {
-        assertFalse(GallerySemanticIndexer.isAcceptedSemanticScore(0.1799f))
-        assertTrue(GallerySemanticIndexer.isAcceptedSemanticScore(0.18f))
+    fun semantic_vector_cutoff_is_inclusive_at_point_ten() {
+        assertFalse(GallerySemanticIndexer.isAcceptedSemanticScore(0.0999f))
+        assertTrue(GallerySemanticIndexer.isAcceptedSemanticScore(0.10f))
+        assertTrue(GallerySemanticIndexer.isAcceptedSemanticScore(0.126672f))
         assertTrue(GallerySemanticIndexer.isAcceptedSemanticScore(0.20f))
         assertTrue(GallerySemanticIndexer.isAcceptedSemanticScore(0.81f))
         assertFalse(GallerySemanticIndexer.isAcceptedSemanticScore(Float.NaN))
@@ -916,52 +370,13 @@ class QueryAndDiversityContractTest {
     }
 
     @Test
-    fun semantic_fallback_preserves_strict_results_and_only_fills_positive_empty_searches() {
-        val strict = listOf(SemanticMatch(1L, 0.31f))
-        val nearest = listOf(
-            SemanticMatch(2L, 0.19f),
-            SemanticMatch(3L, 0.17f),
-            SemanticMatch(2L, 0.16f),
-        )
-
-        assertEquals(
-            strict,
-            SemanticFallbackPolicy.select(
-                strictMatches = strict,
-                nearestMatches = nearest,
-                hasMetadataMatches = false,
-                allowFallback = true,
-                limit = 200,
-            ),
-        )
-        assertEquals(
-            listOf(2L, 3L),
-            SemanticFallbackPolicy.select(
-                strictMatches = emptyList(),
-                nearestMatches = nearest,
-                hasMetadataMatches = false,
-                allowFallback = true,
-                limit = 200,
-            ).map { it.mediaStoreId },
-        )
-        assertTrue(
-            SemanticFallbackPolicy.select(
-                strictMatches = emptyList(),
-                nearestMatches = nearest,
-                hasMetadataMatches = false,
-                allowFallback = false,
-                limit = 200,
-            ).isEmpty(),
-        )
-        assertTrue(
-            SemanticFallbackPolicy.select(
-                strictMatches = emptyList(),
-                nearestMatches = nearest,
-                hasMetadataMatches = true,
-                allowFallback = true,
-                limit = 200,
-            ).isEmpty(),
-        )
+    fun private_semantic_gate_rejects_nearest_but_irrelevant_records() {
+        assertFalse(DocumentSemanticAcceptancePolicy.accepts(0.3220f))
+        assertFalse(DocumentSemanticAcceptancePolicy.accepts(0.4664f))
+        assertFalse(DocumentSemanticAcceptancePolicy.accepts(0.6199f))
+        assertTrue(DocumentSemanticAcceptancePolicy.accepts(0.62f))
+        assertTrue(DocumentSemanticAcceptancePolicy.accepts(0.7390f))
+        assertFalse(DocumentSemanticAcceptancePolicy.accepts(Float.NaN))
     }
 
     @Test
@@ -1511,6 +926,25 @@ class QueryAndDiversityContractTest {
         assertEquals(2, episodes.size)
         assertEquals(listOf(1L, 2L, 4L), episodes.first().memberMediaStoreIds)
         assertEquals(listOf(3L), episodes.last().memberMediaStoreIds)
+    }
+
+    @Test
+    fun travel_scope_uses_modal_episode_locality_and_keeps_every_outside_episode() {
+        val selection = TravelLocationPolicy.select(
+            listOf(
+                TravelEpisodeCandidate("home-1", "Bengaluru, Karnataka, India", 12),
+                TravelEpisodeCandidate("home-2", "Bengaluru, Karnataka, India", 3),
+                TravelEpisodeCandidate("home-3", "Bengaluru Urban, Karnataka, India", 2),
+                TravelEpisodeCandidate("goa", "Panaji, Goa, India", 30),
+                TravelEpisodeCandidate("ooty", "Ooty, Tamil Nadu, India", 4),
+                TravelEpisodeCandidate("unknown", null, 20),
+            ),
+        )
+
+        assertEquals("bengaluru", selection.normalLocationKey)
+        assertEquals(2, selection.normalEpisodeCount)
+        assertEquals(5, selection.locatedEpisodeCount)
+        assertEquals(setOf("goa", "ooty"), selection.travelEpisodeIds)
     }
 
     private fun assertInvalidExecutionSpec(raw: String) {

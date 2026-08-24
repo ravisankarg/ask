@@ -208,10 +208,12 @@ class GalleryIndexer(context: Context) {
                             effectivePlanJson = searchExecution.effectivePlanJson,
                             resolvedQuery = searchExecution.resolvedQuery,
                             queryCategory = searchExecution.queryCategory,
+                            answerFeatureEnabled = searchExecution.answerFeatureEnabled,
                             needsAnswer = false,
                             answerEvidenceScope = searchExecution.answerEvidenceScope,
                             timings = timings,
                             documentMatches = globalWindow.documents,
+                            totalDocumentMatches = searchExecution.documentMatches.size,
                             mergedResults = globalWindow.ordered,
                         )
                     }
@@ -292,11 +294,13 @@ class GalleryIndexer(context: Context) {
                         effectivePlanJson = searchExecution.effectivePlanJson,
                         resolvedQuery = searchExecution.resolvedQuery,
                         queryCategory = searchExecution.queryCategory,
+                        answerFeatureEnabled = searchExecution.answerFeatureEnabled,
                         needsAnswer = searchExecution.needsAnswer,
                         answerEvidenceScope = searchExecution.answerEvidenceScope,
                         answerOcrKeywords = searchExecution.ocrKeywords,
                         timings = timings,
                         documentMatches = globalWindow.documents,
+                        totalDocumentMatches = searchExecution.documentMatches.size,
                         mergedResults = globalWindow.ordered,
                     )
                 } finally {
@@ -420,7 +424,10 @@ class GalleryIndexer(context: Context) {
         onStage: (AnswerPipelineStage) -> Unit = {},
     ) {
         answerExecutor.execute {
-            if (!response.needsAnswer) {
+            if (!response.answerFeatureEnabled ||
+                !AnswerFeaturePreferences.isEnabled(appContext) ||
+                !response.needsAnswer
+            ) {
                 response.plannerSession?.close()
                 onFinished(
                     Result.success(
@@ -447,7 +454,10 @@ class GalleryIndexer(context: Context) {
                 onStage(AnswerPipelineStage.ACCEPTING)
                 onFinished(Result.success(directAnswer))
                 if (warmPlannerAfterAnswer) {
-                    GemmaRuntime.preloadPlannerAfterAnswerAsync(appContext, QueryPlannerRuntime.plannerSystemInstruction())
+                    GemmaRuntime.preloadPlannerAfterAnswerAsync(
+                        appContext,
+                        QueryPlannerRuntime.plannerSystemInstruction(appContext),
+                    )
                 }
                 return@execute
             }
@@ -852,6 +862,7 @@ class GalleryIndexer(context: Context) {
             // the image-capable Conversation. Avoid retaining that needless
             // second KV allocation for document/scenery follow-ups.
             if (warmAnswerAfterAnswer &&
+                AnswerFeaturePreferences.isEnabled(appContext) &&
                 QueryCategoryContextPolicy.answerImageLimit(response.queryCategory) == 0
             ) {
                 GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
@@ -859,7 +870,10 @@ class GalleryIndexer(context: Context) {
             onFinished(result)
             deferredFollowUps?.invoke()
             if (!warmAnswerAfterAnswer && warmPlannerAfterAnswer) {
-                GemmaRuntime.preloadPlannerAfterAnswerAsync(appContext, QueryPlannerRuntime.plannerSystemInstruction())
+                GemmaRuntime.preloadPlannerAfterAnswerAsync(
+                    appContext,
+                    QueryPlannerRuntime.plannerSystemInstruction(appContext),
+                )
             }
         }
     }
@@ -1088,12 +1102,12 @@ class GalleryIndexer(context: Context) {
             plannerProfile: GemmaRuntime.GenerationProfile?,
         ) -> Unit = { _, _, _ -> },
     ): SearchExecution {
-        // MediaStore deletion is not guaranteed to deliver a callback to the
-        // app. Reconcile immediately before retrieval so a deleted gallery
-        // item cannot survive in the displayed or answer evidence window.
-        reconcileStaleRecordsBlocking()
-        val communicationIntent = CallLogQueryPolicy.detect(query)
-            ?: CallLogQueryPolicy.detectMessage(query)
+        // Freeze the user-owned allowlist for this query. A Settings change
+        // applies to the next query and never mutates or rebuilds an index.
+        val indexSearchScope = IndexSearchScopePreferences.selected(appContext)
+        val answerFeatureEnabled = AnswerFeaturePreferences.isEnabled(appContext)
+        val plannerProtocol = QueryPlannerProtocolPreferences.selected(appContext)
+        val communicationIntent = CallLogQueryPolicy.legacyPlanOverride(plannerProtocol, query)
         val plannerQuery = communicationIntent?.let {
             CallLogQueryPolicy.canonicalPlannerQuery(query)
         } ?: query
@@ -1109,19 +1123,34 @@ class GalleryIndexer(context: Context) {
         // a clean conversation, so holding this session through SQLite,
         // native retrieval, and diversity only increases memory pressure.
         plannedQuery.session?.close()
+        if (!answerFeatureEnabled) {
+            // Search-only mode never reserves answer KV. Replenish the consumed planner prefix
+            // immediately and in parallel with retrieval so the next QP turn stays warm.
+            GemmaRuntime.preloadPlannerAfterAnswerAsync(
+                appContext,
+                QueryPlannerRuntime.plannerSystemInstruction(appContext),
+            )
+        }
         val resolvedSearchQuery = plannedQuery.resolvedQuery.ifBlank { plannerQuery }
         var plan = plannedQuery.plan
         val resolvedCommunicationIntent = communicationIntent?.let { intent ->
-            val documentIndex = DocumentVectorIndex.shared(appContext)
-            val indexedNames = when (intent.source) {
-                DocumentSource.CALL_LOGS -> documentIndex.knownCallLogNames()
-                DocumentSource.MESSAGES -> documentIndex.knownContactNames()
-                else -> emptyList()
+            val indexedNames = if (intent.source in indexSearchScope.documentSources) {
+                val documentIndex = DocumentVectorIndex.shared(appContext)
+                when (intent.source) {
+                    DocumentSource.CALL_LOGS -> documentIndex.knownCallLogNames()
+                    DocumentSource.MESSAGES -> documentIndex.knownContactNames()
+                    else -> emptyList()
+                }
+            } else {
+                emptyList()
             }
             CallLogQueryPolicy.resolve(intent, indexedNames)
         }
         val communicationSenderNeedles = resolvedCommunicationIntent
-            ?.takeIf { it.source == DocumentSource.MESSAGES }
+            ?.takeIf {
+                it.source == DocumentSource.MESSAGES &&
+                    it.source in indexSearchScope.documentSources
+            }
             ?.let { intent ->
                 buildList {
                     intent.resolvedPerson?.let(::add)
@@ -1266,7 +1295,11 @@ class GalleryIndexer(context: Context) {
                     effectivePlanJson = "(empty)",
                     resolvedQuery = resolvedSearchQuery,
                     queryCategory = effectivePlan.queryCategory,
-                    needsAnswer = effectivePlan.needsAnswer,
+                    answerFeatureEnabled = answerFeatureEnabled,
+                    needsAnswer = AnswerFeaturePolicy.effectiveNeedsAnswer(
+                        effectivePlan.needsAnswer,
+                        answerFeatureEnabled,
+                    ),
                     plannerProfile = plannedQuery.generationProfile,
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
                     ocrKeywords = effectivePlan.keywordTerms.flatMap(OcrKeywordPolicy::keywords),
@@ -1277,7 +1310,11 @@ class GalleryIndexer(context: Context) {
             // The normal OCR/doc and scenery paths attach images. A warmed
             // text-only answer session would be discarded before those image
             // turns, so reserve answer KV only for metadata-only categories.
-            if (effectivePlan.needsAnswer &&
+            val effectiveNeedsAnswer = AnswerFeaturePolicy.effectiveNeedsAnswer(
+                effectivePlan.needsAnswer,
+                answerFeatureEnabled,
+            )
+            if (effectiveNeedsAnswer &&
                 QueryCategoryContextPolicy.answerImageLimit(effectivePlan.queryCategory) == 0
             ) {
                 GemmaRuntime.preloadAnswerAsync(appContext, ANSWER_SYSTEM_INSTRUCTION)
@@ -1288,24 +1325,46 @@ class GalleryIndexer(context: Context) {
                 plannedQuery.generationProfile,
             )
             Log.i(TAG, "Executing QP spec: ${renderedExecutionSpec.take(600)}")
-            // Category no longer routes retrieval. Every query searches the
-            // gallery and all private sources, then each source applies only
-            // the fields it can actually represent.
             val semanticPhrase = privateSemanticPhrase(effectivePlan, resolvedSearchQuery)
             val keywordGroups = buildPrivateKeywordGroups(effectivePlan, resolvedSearchQuery)
-            val documentSources = effectivePlan.mediaType?.documentSources()
-                ?: DocumentSource.entries.toSet()
+            val searchGallery = IndexSearchScopePolicy.galleryEnabledFor(
+                effectivePlan.mediaType,
+                indexSearchScope,
+            )
+            val documentSources = IndexSearchScopePolicy.documentSourcesFor(
+                effectivePlan.mediaType,
+                indexSearchScope,
+            )
+            Log.i(
+                TAG,
+                "Index search scope gallery=$searchGallery documents=" +
+                    documentSources.joinToString(",") { it.wire },
+            )
+            val documentResultBudget = if (answerFeatureEnabled) {
+                DOCUMENT_MATCHES_PER_SOURCE
+            } else {
+                CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT
+            }
+            if (searchGallery) {
+                // MediaStore deletion is not guaranteed to deliver a callback.
+                // Reconcile only when this query is allowed to search Gallery.
+                reconcileStaleRecordsBlocking()
+            }
             // Gallery and private retrieval use independent databases, native
             // indexes, and text encoders. Run them concurrently so
             // HYBRID_RETRIEVAL reflects the slower branch instead of their sum.
             val galleryFuture = retrievalExecutor.submit<StructuredSearchExecutor.ScoredGalleryResults> {
-                structuredSearchExecutor.executeScored(
-                    executionSpec,
-                    allowOcrlessPhotoKeywordBypass =
-                        GalleryKeywordIntersectionPolicy.allowsOcrlessPhotoBypass(
-                            effectivePlan.queryCategory,
-                        ),
-                )
+                if (!searchGallery) {
+                    StructuredSearchExecutor.ScoredGalleryResults(emptyList(), emptyMap())
+                } else {
+                    structuredSearchExecutor.executeScored(
+                        executionSpec,
+                        allowOcrlessPhotoKeywordBypass =
+                            GalleryKeywordIntersectionPolicy.allowsOcrlessPhotoBypass(
+                                effectivePlan.queryCategory,
+                            ),
+                    )
+                }
             }
             val documentFuture = retrievalExecutor.submit<List<DocumentMatch>> {
                 if (documentSources.isEmpty()) {
@@ -1332,7 +1391,7 @@ class GalleryIndexer(context: Context) {
                             } else {
                                 directNeedles
                             },
-                            limit = DOCUMENT_MATCHES_PER_SOURCE,
+                            limit = documentResultBudget,
                             timeHint = effectivePlan.timeHint,
                             fromDate = effectivePlan.fromDate,
                             toDate = effectivePlan.toDate,
@@ -1348,7 +1407,7 @@ class GalleryIndexer(context: Context) {
                             query = semanticPhrase,
                             keywordGroups = keywordGroups,
                             sources = documentSources,
-                            limitPerSource = DOCUMENT_MATCHES_PER_SOURCE,
+                            limitPerSource = documentResultBudget,
                             timeHint = effectivePlan.timeHint,
                             fromDate = effectivePlan.fromDate,
                             toDate = effectivePlan.toDate,
@@ -1361,7 +1420,7 @@ class GalleryIndexer(context: Context) {
                         query = semanticPhrase,
                         keywordGroups = keywordGroups,
                         sources = documentSources,
-                        limitPerSource = DOCUMENT_MATCHES_PER_SOURCE,
+                        limitPerSource = documentResultBudget,
                         timeHint = effectivePlan.timeHint,
                         fromDate = effectivePlan.fromDate,
                         toDate = effectivePlan.toDate,
@@ -1380,7 +1439,8 @@ class GalleryIndexer(context: Context) {
                 effectivePlanJson = renderedExecutionSpec,
                 resolvedQuery = resolvedSearchQuery,
                 queryCategory = effectivePlan.queryCategory,
-                needsAnswer = effectivePlan.needsAnswer,
+                answerFeatureEnabled = answerFeatureEnabled,
+                needsAnswer = effectiveNeedsAnswer,
                 plannerProfile = plannedQuery.generationProfile,
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
                 ocrKeywords = effectivePlan.keywordTerms.flatMap(OcrKeywordPolicy::keywords),
@@ -1430,29 +1490,10 @@ class GalleryIndexer(context: Context) {
         gallery: List<GalleryMedia>,
         documents: List<DocumentMatch>,
     ): GlobalSearchWindow {
-        val galleryHits = gallery.mapIndexed { index, media ->
-            GlobalSearchHit(score = 1f / (index + 1f), gallery = media)
-        }
-        val maxDocumentScore = documents.maxOfOrNull { it.fusionScore }?.coerceAtLeast(1.0e-6f) ?: 1f
-        val documentHits = documents.filter { PersonalFileSearchPolicy.isEligible(it.chunk) }.map { match ->
-            GlobalSearchHit(
-                score = (match.fusionScore / maxDocumentScore).coerceIn(0f, 1f),
-                document = match,
-            )
-        }
-        val selected = (galleryHits + documentHits)
-            .sortedByDescending(GlobalSearchHit::score)
-            .take(GLOBAL_RESULT_LIMIT)
-        val ordered = selected.mapNotNull { hit ->
-            when {
-                hit.gallery != null -> HybridSearchResult.Gallery(hit.gallery)
-                hit.document != null -> HybridSearchResult.Document(hit.document)
-                else -> null
-            }
-        }
+        val ordered = CrossEngineFusionPolicy.rank(gallery, documents)
         return GlobalSearchWindow(
-            gallery = selected.mapNotNull(GlobalSearchHit::gallery),
-            documents = selected.mapNotNull(GlobalSearchHit::document),
+            gallery = ordered.mapNotNull { (it as? HybridSearchResult.Gallery)?.media },
+            documents = ordered.mapNotNull { (it as? HybridSearchResult.Document)?.match },
             ordered = ordered,
         )
     }
@@ -1487,6 +1528,7 @@ class GalleryIndexer(context: Context) {
     private fun privateSemanticPhrase(plan: QueryPlan, query: String): String {
         val planned = plan.semanticQueries.joinToString(" ").trim()
         if (planned.isNotBlank()) return planned
+        if (plan.travelScope.isNotBlank()) return ""
         return QueryLifecycleScaffoldingPolicy.strip(query)
             .replace(
                 Regex(
@@ -2652,7 +2694,6 @@ class GalleryIndexer(context: Context) {
         // an explicit model contract, and the runtime records any overrun.
         private const val MAX_ANSWER_GENERATED_TOKENS = 50
         private const val UI_RESULT_LIMIT = 16
-        private const val GLOBAL_RESULT_LIMIT = 16
         private const val MAX_EVIDENCE_LOG_CHARS = 600
         private const val MAX_FOLLOW_UPS = 2
         private const val MAX_NEXT_BRIEFS = 2
@@ -2725,17 +2766,12 @@ class GalleryIndexer(context: Context) {
         val effectivePlanJson: String,
         val resolvedQuery: String,
         val queryCategory: QueryCategory,
+        val answerFeatureEnabled: Boolean,
         val needsAnswer: Boolean,
         val plannerProfile: GemmaRuntime.GenerationProfile?,
         val answerEvidenceScope: AnswerEvidenceScope,
         val ocrKeywords: List<String>,
         val documentMatches: List<DocumentMatch>,
-    )
-
-    private data class GlobalSearchHit(
-        val score: Float,
-        val gallery: GalleryMedia? = null,
-        val document: DocumentMatch? = null,
     )
 
     private data class GlobalSearchWindow(

@@ -499,7 +499,7 @@ class GallerySemanticIndexer(
         private const val DIVERSITY_CANDIDATE_LIMIT = 100
         /** Retrieval budget only; presentation never truncates the returned set. */
         private const val MAX_SEARCH_RESULTS = 512
-        internal const val MIN_SEMANTIC_COSINE_SCORE = 0.18f
+        internal const val MIN_SEMANTIC_COSINE_SCORE = 0.10f
         private const val MAX_QUERY_VARIANTS = 4
         private const val TAG = "AskGalaxyImageIndex"
 

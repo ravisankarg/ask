@@ -1,6 +1,7 @@
 package com.ravi.askgalaxy
 
 import android.util.Log
+import java.util.Locale
 
 /**
  * Executes the canonical QP AST directly against SQLite metadata and the
@@ -70,6 +71,10 @@ class StructuredSearchExecutor(
                 relevance.thenByDescending {
                     it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
                 }
+            ExecutionSort.OLDEST in sorts ->
+                relevance.thenBy {
+                    it.dateTakenMs ?: it.dateModifiedSeconds.takeIf { value -> value > 0L }?.times(1000L)
+                }
             ExecutionSort.LOCATION in sorts ->
                 relevance.thenBy {
                     (it.locationName ?: it.location).orEmpty().lowercase()
@@ -84,21 +89,18 @@ class StructuredSearchExecutor(
     private fun evaluate(
         node: ExecutionNode,
         categoryAllowlist: Set<Long>,
-        allowSemanticFallback: Boolean = true,
         allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet = when (node) {
         is ExecutionNode.Predicate ->
             evaluatePredicate(
                 node,
                 categoryAllowlist,
-                allowSemanticFallback,
                 allowOcrlessPhotoKeywordBypass,
             )
         is ExecutionNode.Sorted ->
             evaluate(
                 node.value,
                 categoryAllowlist,
-                allowSemanticFallback,
                 allowOcrlessPhotoKeywordBypass,
             ).let {
                 it.copy(sorts = it.sorts + node.sort)
@@ -109,21 +111,16 @@ class StructuredSearchExecutor(
                     evaluateIntersection(
                         node,
                         categoryAllowlist,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
                 ExecutionBinaryOperator.SUBTRACT -> {
                     val left = evaluate(
                         node.left,
                         categoryAllowlist,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
-                    // A low-confidence nearest-neighbor fallback is useful for
-                    // positive discovery, but unsafe for exclusions: it could
-                    // subtract unrelated photos from an otherwise valid set.
-                    // The negative branch is also scoped to the positive set,
-                    // so "photos excluding selfies" does not search selfies
+                    // The negative branch is scoped to the positive set, so
+                    // "photos excluding selfies" does not search selfies
                     // across an unrelated MIME/date/person universe first.
                     val scopedIds = left.scores.keys.intersect(categoryAllowlist)
                     val right = if (scopedIds.isEmpty()) {
@@ -132,7 +129,6 @@ class StructuredSearchExecutor(
                         evaluate(
                             node.right,
                             scopedIds,
-                            allowSemanticFallback = false,
                             allowOcrlessPhotoKeywordBypass = allowOcrlessPhotoKeywordBypass,
                         )
                     }
@@ -144,13 +140,11 @@ class StructuredSearchExecutor(
                     val left = evaluate(
                         node.left,
                         categoryAllowlist,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
                     val right = evaluate(
                         node.right,
                         categoryAllowlist,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
                     union(
@@ -165,14 +159,12 @@ class StructuredSearchExecutor(
 
     /**
      * Push a pure structured sibling into retrieval before lexical or semantic
-     * ranking. Besides making fallback candidates more relevant, this prevents
-     * a 512-neighbor search over the whole category from being emptied later
-     * by MIME/person/date/place intersection.
+     * ranking. This prevents a 512-neighbor search over the whole category from
+     * being emptied later by MIME/person/date/place intersection.
      */
     private fun evaluateIntersection(
         node: ExecutionNode.Binary,
         categoryAllowlist: Set<Long>,
-        allowSemanticFallback: Boolean,
         allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet {
         val leftHasSemantic = containsScoredRetrieval(node.left)
@@ -182,7 +174,6 @@ class StructuredSearchExecutor(
                 val left = evaluate(
                     node.left,
                     categoryAllowlist,
-                    allowSemanticFallback,
                     allowOcrlessPhotoKeywordBypass,
                 )
                 val scopedIds = left.scores.keys.intersect(categoryAllowlist)
@@ -195,7 +186,6 @@ class StructuredSearchExecutor(
                     evaluate(
                         node.right,
                         scopedIds,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
                 }
@@ -205,7 +195,6 @@ class StructuredSearchExecutor(
                 val right = evaluate(
                     node.right,
                     categoryAllowlist,
-                    allowSemanticFallback,
                     allowOcrlessPhotoKeywordBypass,
                 )
                 val scopedIds = right.scores.keys.intersect(categoryAllowlist)
@@ -215,7 +204,6 @@ class StructuredSearchExecutor(
                     evaluate(
                         node.left,
                         scopedIds,
-                        allowSemanticFallback,
                         allowOcrlessPhotoKeywordBypass,
                     )
                 }
@@ -225,13 +213,11 @@ class StructuredSearchExecutor(
                 val left = evaluate(
                     node.left,
                     categoryAllowlist,
-                    allowSemanticFallback,
                     allowOcrlessPhotoKeywordBypass,
                 )
                 val right = evaluate(
                     node.right,
                     categoryAllowlist,
-                    allowSemanticFallback,
                     allowOcrlessPhotoKeywordBypass,
                 )
                 // The gallery hybrid contract is a true intersection: the
@@ -255,7 +241,6 @@ class StructuredSearchExecutor(
     private fun evaluatePredicate(
         predicate: ExecutionNode.Predicate,
         categoryAllowlist: Set<Long>,
-        allowSemanticFallback: Boolean,
         allowOcrlessPhotoKeywordBypass: Boolean,
     ): EvaluatedSet =
         when (predicate.field) {
@@ -290,10 +275,20 @@ class StructuredSearchExecutor(
                     ?: emptySet()
                 hardSet(ids.intersect(categoryAllowlist))
             }
+            ExecutionField.TRAVEL -> {
+                require(predicate.value == "outside_normal") { "travel must be outside_normal" }
+                val travel = database.mediaStoreIdsOutsideNormalLocation()
+                Log.i(
+                    TAG,
+                    "Travel scope: locatedEpisodes=${travel.locatedEpisodeCount}, " +
+                        "normalEpisodes=${travel.normalEpisodeCount}, " +
+                        "travelEpisodes=${travel.travelEpisodeCount}, media=${travel.mediaStoreIds.size}",
+                )
+                hardSet(travel.mediaStoreIds.intersect(categoryAllowlist))
+            }
             ExecutionField.SEMANTIC -> evaluateSemantic(
                 predicate.value,
                 categoryAllowlist,
-                allowSemanticFallback,
             )
             ExecutionField.KEYWORD -> evaluateOcrKeywords(
                 predicate.value,
@@ -341,58 +336,50 @@ class StructuredSearchExecutor(
     private fun evaluateSemantic(
         value: String,
         categoryAllowlist: Set<Long>,
-        allowSemanticFallback: Boolean,
     ): EvaluatedSet {
         if (categoryAllowlist.isEmpty()) return EvaluatedSet()
-        val nearest = runCatching {
+        val nearestResult = runCatching {
             semanticIndexer.searchNearestScoredBlocking(
                 listOf(value),
                 SEMANTIC_CANDIDATE_LIMIT,
                 categoryAllowlist.toLongArray(),
             )
-        }.getOrDefault(emptyList())
-        val strictSemantic = nearest.filter {
+        }
+        nearestResult.exceptionOrNull()?.let { error ->
+            Log.w(
+                TAG,
+                "Scoped semantic search failed: term=${value.take(MAX_DIAGNOSTIC_TERM_CHARS)}, " +
+                    "scope=${categoryAllowlist.size}",
+                error,
+            )
+        }
+        val nearest = nearestResult.getOrDefault(emptyList())
+        val semantic = nearest.filter {
             GallerySemanticIndexer.isAcceptedSemanticScore(it.score)
         }
+        val highestScore = nearest.maxOfOrNull(SemanticMatch::score)
+        val highestScoreText = highestScore?.let { String.format(Locale.US, "%.6f", it) } ?: "none"
+        Log.i(
+            TAG,
+            "Scoped semantic: term=${value.take(MAX_DIAGNOSTIC_TERM_CHARS)}, " +
+                "scope=${categoryAllowlist.size}, neighbors=${nearest.size}, " +
+                "highest=$highestScoreText, " +
+                "threshold=${GallerySemanticIndexer.MIN_SEMANTIC_COSINE_SCORE}, accepted=${semantic.size}",
+        )
         val metadata = database.searchMetadataRanked(
             value,
             SEMANTIC_CANDIDATE_LIMIT,
             allowedMediaStoreIds = categoryAllowlist,
         )
             .filter { it.media.mediaStoreId in categoryAllowlist }
-        val semantic = SemanticFallbackPolicy.select(
-            strictMatches = strictSemantic,
-            nearestMatches = nearest,
-            hasMetadataMatches = metadata.isNotEmpty(),
-            allowFallback = allowSemanticFallback,
-            limit = SEMANTIC_FALLBACK_LIMIT,
-        )
-        if (strictSemantic.isEmpty() && semantic.isNotEmpty()) {
-            Log.i(
-                TAG,
-                "No semantic neighbor met the " +
-                    "${GallerySemanticIndexer.MIN_SEMANTIC_COSINE_SCORE} cutoff; " +
-                    "publishing ${semantic.size} " +
-                    "structured-scope nearest matches (top=${semantic.first().score})",
-            )
-        }
-        val scores = LinkedHashMap<Long, Float>()
-        semantic.forEach { match ->
-            // Zero is reserved for hard-scope sets in the executor.
-            val score = match.score.takeUnless { it == HARD_SCOPE_SCORE } ?: FALLBACK_ZERO_SCORE
-            scores[match.mediaStoreId] = maxOf(scores[match.mediaStoreId] ?: score, score)
-        }
-        val maximumMetadata = metadata.maxOfOrNull { it.score }?.coerceAtLeast(1.0e-6f) ?: 1f
-        metadata.forEach { match ->
-            val normalized = (match.score / maximumMetadata).coerceIn(0f, 1f)
-            val existing = scores[match.media.mediaStoreId]
-            scores[match.media.mediaStoreId] = if (existing == null) {
-                normalized
-            } else {
-                existing * SEMANTIC_WEIGHT + normalized * METADATA_WEIGHT
-            }
-        }
         val cosineScores = semantic.associate { it.mediaStoreId to it.score }
+        val metadataScores = metadata.associate { it.media.mediaStoreId to it.score }
+        val scores = SemanticMetadataFusion.rerank(
+            semanticScores = cosineScores,
+            metadataScores = metadataScores,
+            semanticWeight = SEMANTIC_WEIGHT,
+            metadataWeight = METADATA_WEIGHT,
+        )
         return EvaluatedSet(scores = scores, cosineScores = cosineScores)
     }
 
@@ -568,14 +555,33 @@ class StructuredSearchExecutor(
         // Exact structured predicates remain exhaustive.
         const val SEMANTIC_CANDIDATE_LIMIT = 512
         const val OCR_CANDIDATE_LIMIT = 512
-        // The public gallery has a 200-item browsing window. On a strict
-        // semantic miss, fill that window with the nearest candidates from
-        // the already-applied category and structured scope.
-        const val SEMANTIC_FALLBACK_LIMIT = 200
         const val HARD_SCOPE_SCORE = 0f
-        const val FALLBACK_ZERO_SCORE = 1.0e-6f
         const val SEMANTIC_WEIGHT = 0.68f
         const val METADATA_WEIGHT = 0.32f
+        const val MAX_DIAGNOSTIC_TERM_CHARS = 80
+    }
+}
+
+/**
+ * Metadata may rerank a real semantic hit, but it must not manufacture one.
+ * Keeping membership anchored to [semanticScores] preserves the cosine cutoff
+ * and makes `semantic + keyword` a genuine two-channel intersection.
+ */
+internal object SemanticMetadataFusion {
+    fun rerank(
+        semanticScores: Map<Long, Float>,
+        metadataScores: Map<Long, Float>,
+        semanticWeight: Float,
+        metadataWeight: Float,
+    ): Map<Long, Float> {
+        if (semanticScores.isEmpty()) return emptyMap()
+        val retainedMetadata = metadataScores.filterKeys(semanticScores::containsKey)
+        val maximumMetadata = retainedMetadata.values.maxOrNull()?.coerceAtLeast(1.0e-6f) ?: 1f
+        return semanticScores.mapValuesTo(LinkedHashMap()) { (id, semanticScore) ->
+            val metadataScore = retainedMetadata[id] ?: return@mapValuesTo semanticScore
+            val normalizedMetadata = (metadataScore / maximumMetadata).coerceIn(0f, 1f)
+            semanticScore * semanticWeight + normalizedMetadata * metadataWeight
+        }
     }
 }
 
@@ -648,27 +654,4 @@ internal object RetrievalScoreFusion {
     }
 
     private const val FUSION_BONUS = 0.05f
-}
-
-/**
- * Confidence-aware search contract: retain the 0.10 cutoff whenever it finds
- * anything, but never turn a valid positive semantic search into an empty
- * gallery solely because every nearest neighbor sits just below that cutoff.
- */
-internal object SemanticFallbackPolicy {
-    fun select(
-        strictMatches: List<SemanticMatch>,
-        nearestMatches: List<SemanticMatch>,
-        hasMetadataMatches: Boolean,
-        allowFallback: Boolean,
-        limit: Int,
-    ): List<SemanticMatch> {
-        if (strictMatches.isNotEmpty()) return strictMatches
-        if (!allowFallback || hasMetadataMatches || limit <= 0) return emptyList()
-        return nearestMatches.asSequence()
-            .filter { it.score.isFinite() }
-            .distinctBy { it.mediaStoreId }
-            .take(limit)
-            .toList()
-    }
 }

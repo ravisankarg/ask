@@ -127,6 +127,11 @@ object QueryScopeParser {
     private val OPEN_BOUNDARY_OPERATOR = Regex(
         "(?i)\\b(after|since|before|until|through)\\b",
     )
+    private val ROLLING_DURATION = Regex(
+        "(?i)\\b(last|past|previous|since)\\s+" +
+            "(a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\\d+)\\s+" +
+            "(days?|weeks?|months?|years?)\\b",
+    )
     // A bare integer is not a clock time: "top 3 photos" must not become a
     // 03:00 hard scope. Require either a colon or an explicit meridiem.
     private val CLOCK = Regex("(?i)(?<!\\d)(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?\\b")
@@ -140,11 +145,20 @@ object QueryScopeParser {
         val explicitFrom = parseIsoLocalDate(fromDate)
         val explicitTo = parseIsoLocalDate(toDate)
         val parsedTime = parseTime(timeHint)
+        // TIME is model-authored QP intent. Resolving its supported temporal
+        // language into concrete bounds belongs to execution, not planning.
+        val hintedBounds = if (explicitFrom == null && explicitTo == null) {
+            explicitDateBoundsFromQuery(timeHint)
+        } else {
+            null
+        }
+        val effectiveFrom = explicitFrom ?: hintedBounds?.first?.let(::parseIsoLocalDate)
+        val effectiveTo = explicitTo ?: hintedBounds?.second?.let(::parseIsoLocalDate)
         return QueryScope(
-            time = if (explicitFrom != null || explicitTo != null) {
+            time = if (effectiveFrom != null || effectiveTo != null) {
                 (parsedTime ?: QueryTimeScope()).copy(
-                    fromDateInclusive = explicitFrom,
-                    toDateInclusive = explicitTo,
+                    fromDateInclusive = effectiveFrom,
+                    toDateInclusive = effectiveTo,
                 )
             } else {
                 parsedTime
@@ -153,7 +167,7 @@ object QueryScopeParser {
         )
     }
 
-    /** Returns canonical ISO bounds for deterministic planner output. */
+    /** Resolves an accepted model-authored time predicate into executable ISO bounds. */
     fun dateBounds(
         value: String,
         zoneId: ZoneId = ZoneId.systemDefault(),
@@ -204,7 +218,24 @@ object QueryScopeParser {
     }
 
     /** Extracts an explicit from/to range before falling back to one date window. */
-    fun explicitDateBoundsFromQuery(query: String): Pair<String, String>? {
+    fun explicitDateBoundsFromQuery(
+        query: String,
+        zoneId: ZoneId = ZoneId.systemDefault(),
+    ): Pair<String, String>? {
+        ROLLING_DURATION.find(query)?.let { match ->
+            val operator = match.groupValues[1].lowercase(Locale.ROOT)
+            val amount = durationAmount(match.groupValues[2]) ?: return@let
+            if (amount !in 1..100) return@let
+            val today = LocalDate.now(zoneId)
+            val start = when (match.groupValues[3].lowercase(Locale.ROOT).removeSuffix("s")) {
+                "day" -> today.minusDays(amount.toLong())
+                "week" -> today.minusWeeks(amount.toLong())
+                "month" -> today.minusMonths(amount.toLong())
+                "year" -> today.minusYears(amount.toLong())
+                else -> return@let
+            }
+            return start.toString() to if (operator == "since") "" else today.toString()
+        }
         MONTH_RANGE.find(query)?.let { match ->
             val firstMonth = monthNumber(match.groupValues[1]) ?: return@let
             val secondMonth = monthNumber(match.groupValues[2]) ?: return@let
@@ -376,6 +407,24 @@ object QueryScopeParser {
         "october" -> 10
         "november" -> 11
         "december" -> 12
+        else -> null
+    }
+
+    private fun durationAmount(value: String): Int? = value.toIntOrNull() ?: when (
+        value.lowercase(Locale.ROOT)
+    ) {
+        "a", "an", "one" -> 1
+        "two" -> 2
+        "three" -> 3
+        "four" -> 4
+        "five" -> 5
+        "six" -> 6
+        "seven" -> 7
+        "eight" -> 8
+        "nine" -> 9
+        "ten" -> 10
+        "eleven" -> 11
+        "twelve" -> 12
         else -> null
     }
 }

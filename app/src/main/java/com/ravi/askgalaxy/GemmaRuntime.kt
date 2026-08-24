@@ -535,7 +535,7 @@ class GemmaRuntime private constructor(
          * Keep only one prefilled KV session resident, and invalidate a queued
          * planner task so it cannot repopulate the cache behind an answer.
          */
-        private fun releasePlannerPrefillForAnswer() {
+        fun invalidatePlannerPrefill() {
             plannerPrefillGeneration.incrementAndGet()
             plannerPrefillRequested.set(false)
             plannerReady.set(false)
@@ -543,6 +543,10 @@ class GemmaRuntime private constructor(
                 prefilledPlanner.also { prefilledPlanner = null }
             }
             stale?.close()
+        }
+
+        private fun releasePlannerPrefillForAnswer() {
+            invalidatePlannerPrefill()
         }
 
         private fun releaseAnswerPrefillForPlanner() {

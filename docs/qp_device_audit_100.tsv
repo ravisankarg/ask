@@ -1,0 +1,101 @@
+id	group	query	expected_intent	expected_plan_characteristics
+001	travel	recent trip	browse	travel outside_normal; sort newest; no semantic trip; no person
+002	self_time	my photos last 3 years	browse	self; media photos; date 2023-08-22..2026-08-22
+003	event_time	birthday photos since 3 months	browse	semantic birthday; media photos; date 2026-05-22..2026-08-22
+004	compound_semantic	cycling in rain	browse	one semantic cycling in rain; no location/date
+005	compound_time	cycling in rain this year	browse	semantic cycling in rain; date 2026-01-01..2026-08-22
+006	person_activity	Ramani dancing photos	browse	person Ramani; semantic dancing; media photos
+007	person_event	Ramani birthday photos	browse	person Ramani; semantic birthday; media photos
+008	person_place	Ravi photos at BR Hills	browse	person Ravi; media photos; location BR Hills
+009	person_place_time	Ravi photos at Goa since 3 years	browse	person Ravi; media photos; location Goa; date 2023-08-22..2026-08-22
+010	self_scene	my videos in rain	browse	self; media videos; semantic rain; no location
+011	scene	photos of sunset	browse	media photos; semantic sunset
+012	activity	videos of dogs running	browse	media videos; semantic dogs running
+013	scene_not_place	beach photos	browse	media photos; semantic beach; no location
+014	calendar_year	snow videos last year	browse	media videos; semantic snow; previous calendar year range
+015	scene_timeword	photos indoors at night	browse	media photos; semantic indoors at night; no explicit clock
+016	two_people	me and Ramani photos	browse	self; person Ramani; media photos
+017	people_only	me only photos	browse	self; people_only; media photos
+018	people_only	me with Ramani alone	browse	self; person Ramani; people_only
+019	person_exclusion	Ravi without Ramani photos	browse	person Ravi; not_person Ramani; media photos
+020	semantic_exclusion	photos without selfies	browse	media photos; not_term selfies
+021	unknown_person	Anita photos	browse	media photos; term Anita; no person
+022	person_activity	Ramani sleeping	browse	person Ramani; semantic sleeping
+023	compound_person_place	Ravi cycling in rain at Goa	browse	person Ravi; semantic cycling in rain; location Goa
+024	recent_event	recent birthday photos	browse	semantic birthday; media photos; sort newest
+025	recent_place	latest photos from BR Hills	browse	media photos; location BR Hills; sort newest
+026	document_answer	Ravi passport number	answer:text	term Ravi all; passport semantic+all; no person/media
+027	follow_up	expiry date	answer:date	prev true; inherit Ravi passport; no date filter
+028	document_answer	passport number	answer:text	passport semantic+all; no person/media
+029	self_document	my passport number	answer:text	self owner Ravi all; passport semantic+all; no face
+030	identity_answer	Ramani Aadhaar number	answer:text	Ramani all; Aadhaar semantic+all; no face
+031	identity_answer	driving licence number	answer:text	driving licence semantic+all
+032	bill_answer	electricity bill amount	answer:text	electricity bill semantic+all; omit amount retrieval
+033	recent_document	latest electricity bill	browse	electricity bill semantic+all; sort newest
+034	booking_answer	hotel booking confirmation number	answer:text	hotel booking semantic+all; omit confirmation number retrieval
+035	ticket_answer	flight ticket departure time	answer:date	flight ticket semantic+all; omit departure time retrieval
+036	receipt_place	receipt total from Goa trip	answer:text	receipt semantic+all; Goa grounded; omit total
+037	identity_answer	insurance policy number	answer:text	insurance policy semantic+all
+038	identity_answer	PAN card number	answer:text	PAN card semantic+all
+039	certificate_answer	vaccination certificate date	answer:date	vaccination certificate semantic+all
+040	receipt_answer	school fee receipt amount	answer:text	school fee receipt semantic+all; omit amount
+041	contact_answer	Ravi phone number	answer:text	Ravi all; phone/contact concept; no face
+042	contact_answer	Ramani email address	answer:text	Ramani all; email concept; no face
+043	person_answer	who sent passport photo	answer:person	passport photo retrieval; no invented person
+044	location_answer	where is my passport	answer:location	self owner all; passport semantic+all; no face
+045	date_answer	when was passport scanned	answer:date	passport semantic+all; scanned content if needed; no date filter
+046	messages	messages about cycling	browse	media messages; semantic cycling
+047	messages	latest message from Ramani	browse	media messages; Ramani all; sort newest
+048	sms	SMS containing OTP	browse	media sms; OTP semantic+all
+049	calendar	calendar events for Christmas	browse	media calendar; semantic Christmas
+050	calendar_future	next calendar appointment	browse	media calendar; future/upcoming constraint; no invented past range
+051	contacts	contacts named Ravi	browse	media contacts; Ravi all
+052	calls	call logs with Ramani	browse	media call_logs; Ramani all
+053	calls	latest call from Ravi	browse	media call_logs; Ravi all; sort newest
+054	pdf	PDF passport copy	browse	media pdf; passport semantic+all
+055	files	files about tax return	browse	media files; semantic tax return
+056	documents	documents about insurance	browse	media doc; semantic insurance
+057	messages	messages mentioning Goa	browse	media messages; Goa literal/semantic term
+058	calendar	calendar birthday events	browse	media calendar; semantic birthday
+059	calls_time	calls yesterday	browse	media call_logs; date 2026-08-21..2026-08-21
+060	sms_time	SMS from last 7 days	browse	media sms; date 2026-08-15..2026-08-22
+061	files_time	files modified this year	browse	media files; date 2026-01-01..2026-08-22
+062	pdf_recent	latest PDF receipt	browse	media pdf; receipt semantic+all; sort newest
+063	contacts_content	contacts with Bangalore address	browse	media contacts; Bangalore/address content
+064	calendar_clock	appointments at 10 am	browse	media calendar; clock 10 am
+065	messages_before	messages before 2025-01-01	browse	media messages; open-from date ending 2025-01-01
+066	photos_after	photos after 2025-01-01	browse	media photos; date starting 2025-01-01 open-to
+067	files_person_time	files from Ravi since 2 years	browse	media files; Ravi all; date 2024-08-22..2026-08-22
+068	calendar_place	calendar events in Goa	browse	media calendar; Goa content/place without gallery-only narrowing
+069	calls_condition	missed calls from Ramani	browse	media call_logs; Ramani all; missed-call content
+070	cross_source_media	videos received in messages	browse	video content constrained to messages; no duplicate media/source corruption
+071	followup_base	Ravi passport number	answer:text	Ravi all; passport semantic+all
+072	followup	expiry date	answer:date	prev true; inherit Ravi passport
+073	followup_base	Ramani birthday photos	browse	person Ramani; semantic birthday; media photos
+074	followup	where were these taken	answer:location	prev true; inherit Ramani birthday photos
+075	followup_chain	who else was there	answer:person	retain relevant prior subject without importing answer value
+076	today	photos from today	browse	media photos; date 2026-08-22..2026-08-22
+077	yesterday	photos from yesterday	browse	media photos; date 2026-08-21..2026-08-21
+078	this_year	photos this year	browse	media photos; date 2026-01-01..2026-08-22
+079	relative_days	photos last 30 days	browse	media photos; date 2026-07-23..2026-08-22
+080	relative_months	photos since 6 months	browse	media photos; date 2026-02-22..2026-08-22
+081	before	photos before 2024-01-01	browse	media photos; open-from date ending 2024-01-01
+082	after	photos after 2025-12-31	browse	media photos; date starting 2025-12-31 open-to
+083	newest	newest videos	browse	media videos; sort newest
+084	oldest	oldest photos	browse	media photos; oldest sort or explicit unsupported result
+085	clock	photos at 7 pm	browse	media photos; clock 7 pm
+086	daypart	morning photos	browse	media photos; morning temporal/semantic intent
+087	between	photos between 2025-01-01 and 2025-12-31	browse	media photos; closed date range
+088	named_trip	trip to Goa	browse	location Goa; no semantic trip; no outside_normal
+089	unnamed_travel	recent vacation	browse	travel outside_normal; sort newest
+090	outing	latest outing photos	browse	travel/episode intent; media photos; sort newest
+091	typo_semantic	cyclcing in raain	browse	q corrected; one semantic cycling in rain with literal evidence
+092	typo_composite	Ramani birhtday fotos since 2 mnths	browse	person Ramani; corrected birthday/media/date with literal evidence
+093	typo_document	Ravi passprot numbr	answer:text	Ravi all; corrected passport semantic+all with evidence
+094	typo_receipt	reciept total ammount	answer:text	corrected receipt semantic+all; omit answer attribute
+095	typo_calendar	calender evnts tomorrow	browse	corrected calendar source; tomorrow constraint
+096	typo_messages	messges from Ramani yesterdy	browse	corrected messages; Ramani all; yesterday date
+097	typo_self_place	my fotos at BR Hils	browse	self; corrected media photos; corrected BR Hills location
+098	mixed_exclusion	Ravi dancing but not Ramani	browse	person Ravi; semantic dancing; not_person Ramani
+099	place_exclusion	photos at Goa excluding beach	browse	media photos; location Goa; not_term beach
+100	max_composition	recent photos of Ramani cycling in rain at Goa since 3 months	browse	person Ramani; media photos; semantic cycling in rain; location Goa; date 2026-05-22..2026-08-22; sort newest

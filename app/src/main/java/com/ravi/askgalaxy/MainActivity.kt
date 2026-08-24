@@ -68,6 +68,8 @@ class MainActivity : Activity() {
     private lateinit var answerPipelinePanel: LinearLayout
     private lateinit var answerPipelineLabel: TextView
     private lateinit var answerPipelineProgress: ProgressBar
+    private lateinit var featuredResultCount: TextView
+    private lateinit var featuredResultGrid: GridView
     private lateinit var resultCount: TextView
     private lateinit var resultGrid: GridView
     private lateinit var timeStatsPanel: LinearLayout
@@ -82,6 +84,7 @@ class MainActivity : Activity() {
     private var searchReady = false
     /** Launch warmup is one-shot; later planner warmups follow answer completion. */
     private var launchPlannerWarmupRequested = false
+    private var featuredResultAdapter: SearchResultAdapter? = null
     private var resultAdapter: SearchResultAdapter? = null
     private var lastSubmittedQuery = ""
     private var lastSubmittedAtMs = 0L
@@ -259,6 +262,9 @@ class MainActivity : Activity() {
         DocumentIndexRuntimeGate.removeReleaseListener(documentIndexReleasedListener)
         GemmaRuntime.setPlannerWarmupStateListener(null)
         if (::resultGrid.isInitialized) {
+            featuredResultGrid.adapter = null
+            featuredResultAdapter?.dispose()
+            featuredResultAdapter = null
             resultGrid.adapter = null
             resultAdapter?.dispose()
             resultAdapter = null
@@ -695,24 +701,28 @@ class MainActivity : Activity() {
             },
         )
         resultPanel.addView(answerPipelinePanel, matchWrap())
-        resultCount = TextView(this).apply {
+        featuredResultCount = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.rgb(63, 66, 78))
             setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(6), dp(4), dp(6), dp(2))
             visibility = View.GONE
         }
-        resultPanel.addView(resultCount, matchWrap())
-        resultGrid = GridView(this).apply {
-            numColumns = 4
-            horizontalSpacing = dp(8)
-            verticalSpacing = dp(6)
-            stretchMode = GridView.STRETCH_COLUMN_WIDTH
-            isVerticalScrollBarEnabled = true
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-            setPadding(0, dp(2), 0, dp(2))
-            clipToPadding = false
+        resultPanel.addView(featuredResultCount, matchWrap())
+        featuredResultGrid = createResultGrid()
+        resultPanel.addView(
+            featuredResultGrid,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(260)),
+        )
+        resultCount = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.rgb(63, 66, 78))
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(6), dp(10), dp(6), dp(2))
+            visibility = View.GONE
         }
+        resultPanel.addView(resultCount, matchWrap())
+        resultGrid = createResultGrid()
         resultPanel.addView(
             resultGrid,
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(456)),
@@ -724,11 +734,21 @@ class MainActivity : Activity() {
         root.addView(searchPanel, matchWrap())
 
         // The page is the primary scroll surface, so the query, QP output,
-        // history, and follow-up turns all move naturally together. The
-        // bounded grid keeps thumbnail virtualization rather than expanding
-        // every one of the 30 result cards at once.
+        // history, and follow-up turns all move naturally together.
         return conversationScroll
     }
+
+    private fun createResultGrid(): GridView = GridView(this).apply {
+            numColumns = 4
+            horizontalSpacing = dp(8)
+            verticalSpacing = dp(6)
+            stretchMode = GridView.STRETCH_COLUMN_WIDTH
+            isVerticalScrollBarEnabled = true
+            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
+            setPadding(0, dp(2), 0, dp(2))
+            clipToPadding = false
+            visibility = View.GONE
+        }
 
     /** @return true only while preparation progress needs periodic polling. */
     private fun refreshPreparation(): Boolean {
@@ -887,7 +907,7 @@ class MainActivity : Activity() {
                 launchPlannerWarmupRequested = true
                 GemmaRuntime.preloadPlannerAsync(
                     this,
-                    QueryPlannerRuntime.plannerSystemInstruction(),
+                    QueryPlannerRuntime.plannerSystemInstruction(this),
                 )
             }
         }
@@ -924,7 +944,7 @@ class MainActivity : Activity() {
                 query.alpha = 0.62f
                 GemmaRuntime.preloadPlannerAfterAnswerAsync(
                     this,
-                    QueryPlannerRuntime.plannerSystemInstruction(),
+                    QueryPlannerRuntime.plannerSystemInstruction(this),
                 )
             }
             if (::gemmaWarmupStatus.isInitialized) {
@@ -944,6 +964,7 @@ class MainActivity : Activity() {
         lastSubmittedQuery = text
         lastSubmittedAtMs = now
         val generation = ++searchGeneration
+        val answerFeatureEnabledForSearch = AnswerFeaturePreferences.isEnabled(this)
         activeSearchResponse = null
         followUpInFlight = false
         // The consumed QP KV is now unavailable by design. Keep the field
@@ -966,6 +987,11 @@ class MainActivity : Activity() {
             conversationPanel.removeAllViews()
             conversationPanel.visibility = View.GONE
         }
+        featuredResultGrid.adapter = null
+        featuredResultAdapter?.dispose()
+        featuredResultAdapter = null
+        featuredResultGrid.visibility = View.GONE
+        featuredResultCount.visibility = View.GONE
         resultGrid.adapter = null
         resultAdapter?.dispose()
         resultAdapter = null
@@ -988,11 +1014,12 @@ class MainActivity : Activity() {
             onMatches = { matches, totalMatches ->
                 runOnUiThread {
                     if (generation != searchGeneration || matches.isEmpty()) return@runOnUiThread
-                    renderResults(
-                        matches.map { it.toSearchResultItem() },
-                        generation,
-                        totalMatches,
-                    )
+                    val items = matches.map { it.toSearchResultItem() }
+                    if (answerFeatureEnabledForSearch) {
+                        renderResults(items.take(ANSWER_ENABLED_RESULT_LIMIT), generation, totalMatches)
+                    } else {
+                        renderAnswerDisabledResults(items, generation, totalMatches)
+                    }
                 }
             },
             onProgress = { progress ->
@@ -1007,7 +1034,9 @@ class MainActivity : Activity() {
                             }
                             SearchStage.QUERY_PLANNED -> {
                                 showAnswerPipeline(PipelineUiStage.SEARCHING)
-                                renderQpOutput(progress.effectivePlanJson)
+                                renderQpOutput(
+                                    progress.plannerJson.ifBlank { progress.effectivePlanJson },
+                                )
                                 renderTimeStats(progress.timings, "Planning")
                                 "QP ready. Searching image, OCR, and metadata indexes…"
                             }
@@ -1046,7 +1075,7 @@ class MainActivity : Activity() {
                     resultCount.visibility = View.VISIBLE
                     return@runOnUiThread
                 }
-                renderQpOutput(response.effectivePlanJson)
+                renderQpOutput(response.plannerJson.ifBlank { response.effectivePlanJson })
                 renderTimeStats(response.timings, "Search")
                 if (response.gallery.isEmpty() && response.documentMatches.isEmpty()) {
                     activeSearchResponse = null
@@ -1054,6 +1083,14 @@ class MainActivity : Activity() {
                     setModelLoading(false, "")
                     hideAnswerPipeline()
                     warmPlannerForNextSearch()
+                    featuredResultGrid.adapter = null
+                    featuredResultAdapter?.dispose()
+                    featuredResultAdapter = null
+                    featuredResultGrid.visibility = View.GONE
+                    featuredResultCount.visibility = View.GONE
+                    resultGrid.adapter = null
+                    resultAdapter?.dispose()
+                    resultAdapter = null
                     resultGrid.visibility = View.GONE
                     resultCount.text = "No matching records found."
                     resultCount.visibility = View.VISIBLE
@@ -1071,14 +1108,19 @@ class MainActivity : Activity() {
                             add(SearchResultItem.Document(match))
                         }
                     }
-                renderResults(
-                    combinedResults,
-                    generation,
-                    maxOf(
-                        combinedResults.size,
-                        response.totalGalleryMatches + response.documentMatches.size,
-                    ),
+                val totalMatches = maxOf(
+                    combinedResults.size,
+                    response.totalGalleryMatches + response.totalDocumentMatches,
                 )
+                if (response.answerFeatureEnabled) {
+                    renderResults(
+                        combinedResults.take(ANSWER_ENABLED_RESULT_LIMIT),
+                        generation,
+                        totalMatches,
+                    )
+                } else {
+                    renderAnswerDisabledResults(combinedResults, generation, totalMatches)
+                }
                 answer.visibility = View.GONE
                 if (!preserveConversation) conversationPanel.visibility = View.GONE
                 followUpPanel.visibility = View.GONE
@@ -1228,7 +1270,7 @@ class MainActivity : Activity() {
     private fun warmPlannerForNextSearch() {
         GemmaRuntime.preloadPlannerAfterAnswerAsync(
             this,
-            QueryPlannerRuntime.plannerSystemInstruction(),
+            QueryPlannerRuntime.plannerSystemInstruction(this),
         )
     }
 
@@ -1377,31 +1419,87 @@ class MainActivity : Activity() {
         generation: Long,
         totalMatches: Int = items.size,
     ) {
-        // Search-result mode shows one bounded mixed window: at most sixteen
-        // gallery or private records in a four-column, four-row grid.
-        val visibleRows = ((items.size + 3) / 4).coerceIn(1, 4)
-        resultGrid.layoutParams = resultGrid.layoutParams.apply {
-            height = dp(visibleRows * 128 + 4)
-        }
-        resultGrid.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
-        val current = resultAdapter
-        if (
-            current == null ||
-            current.generation != generation ||
-            !current.hasSameItems(items)
-        ) {
-            resultGrid.adapter = null
-            current?.dispose()
-            resultAdapter = SearchResultAdapter(items, generation).also {
-                resultGrid.adapter = it
-            }
-        }
+        featuredResultAdapter?.dispose()
+        featuredResultAdapter = null
+        featuredResultGrid.adapter = null
+        featuredResultGrid.visibility = View.GONE
+        featuredResultCount.visibility = View.GONE
+        resultAdapter = bindResultGrid(
+            grid = resultGrid,
+            current = resultAdapter,
+            items = items,
+            generation = generation,
+            maxRows = 4,
+        )
         resultCount.text = if (totalMatches > items.size) {
             "Showing top ${items.size} of $totalMatches matches"
         } else {
             "Top ${items.size} match${if (items.size == 1) "" else "es"}"
         }
         resultCount.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    /** Search-only comparison: Top 8 is intentionally repeated inside the full Top 24 below. */
+    private fun renderAnswerDisabledResults(
+        items: List<SearchResultItem>,
+        generation: Long,
+        totalMatches: Int,
+    ) {
+        val overall = items.take(CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT)
+        val featured = overall.take(CrossEngineFusionPolicy.FEATURED_RESULT_LIMIT)
+        featuredResultAdapter = bindResultGrid(
+            grid = featuredResultGrid,
+            current = featuredResultAdapter,
+            items = featured,
+            generation = generation,
+            maxRows = 2,
+        )
+        resultAdapter = bindResultGrid(
+            grid = resultGrid,
+            current = resultAdapter,
+            items = overall,
+            generation = generation,
+            maxRows = 6,
+        )
+        featuredResultCount.text = "Top 8 • fused across enabled indexes (${featured.size} available)"
+        featuredResultCount.visibility = if (featured.isEmpty()) View.GONE else View.VISIBLE
+        resultCount.text = "Top 24 overall • ${overall.size} of $totalMatches matches"
+        resultCount.visibility = if (overall.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun bindResultGrid(
+        grid: GridView,
+        current: SearchResultAdapter?,
+        items: List<SearchResultItem>,
+        generation: Long,
+        maxRows: Int,
+    ): SearchResultAdapter? {
+        if (items.isEmpty()) {
+            grid.adapter = null
+            grid.visibility = View.GONE
+            current?.dispose()
+            return null
+        }
+        val visibleRows = ((items.size + 3) / 4).coerceIn(1, maxRows)
+        grid.layoutParams = grid.layoutParams.apply {
+            height = dp(visibleRows * 128 + 4)
+        }
+        grid.visibility = View.VISIBLE
+        if (
+            current != null &&
+            current.generation == generation &&
+            current.hasSameItems(items)
+        ) {
+            return current
+        }
+        grid.adapter = null
+        current?.dispose()
+        val cacheKb = if (grid === featuredResultGrid) {
+            FEATURED_THUMBNAIL_CACHE_KB
+        } else {
+            RESULT_THUMBNAIL_CACHE_KB
+        }
+        return SearchResultAdapter(items, generation, cacheKb).also { grid.adapter = it }
     }
 
     /** Shows the answer's exact gallery inputs instead of the broad result set. */
@@ -1412,6 +1510,11 @@ class MainActivity : Activity() {
         resultAdapter = null
         resultGrid.adapter = null
         resultGrid.visibility = View.GONE
+        featuredResultAdapter?.dispose()
+        featuredResultAdapter = null
+        featuredResultGrid.adapter = null
+        featuredResultGrid.visibility = View.GONE
+        featuredResultCount.visibility = View.GONE
         resultCount.visibility = View.GONE
     }
 
@@ -1447,9 +1550,10 @@ class MainActivity : Activity() {
     private inner class SearchResultAdapter(
         private val items: List<SearchResultItem>,
         val generation: Long,
+        thumbnailCacheKb: Int,
     ) : BaseAdapter() {
         private val requested = HashSet<Long>()
-        private val thumbnails = object : LruCache<Long, Bitmap>(RESULT_THUMBNAIL_CACHE_KB) {
+        private val thumbnails = object : LruCache<Long, Bitmap>(thumbnailCacheKb) {
             override fun sizeOf(key: Long, value: Bitmap): Int =
                 (value.allocationByteCount / 1024).coerceAtLeast(1)
 
@@ -1619,7 +1723,10 @@ class MainActivity : Activity() {
     }
 
     private fun documentCaption(match: DocumentMatch): String = buildString {
-        append(match.cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) } ?: "Cosine —")
+        append(
+            match.cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) }
+                ?: "Keyword/direct match",
+        )
         append("\n")
         append(match.chunk.source.displayName)
         append(" • ")
@@ -1762,7 +1869,7 @@ class MainActivity : Activity() {
     private fun resultCaption(media: GalleryMedia, cosineScore: Float? = null): String = buildString {
         append(
             cosineScore?.let { "Cosine %.2f".format(java.util.Locale.US, it) }
-                ?: "Cosine —",
+                ?: "Metadata/OCR match",
         )
         append("\n")
         append(if (media.mimeType.startsWith("video/", ignoreCase = true)) "Video" else "Photo")
@@ -2219,7 +2326,9 @@ class MainActivity : Activity() {
     companion object {
         private const val GALLERY_PERMISSION_REQUEST = 1001
         private const val LOCATION_PERMISSION_REQUEST = 1002
+        private const val ANSWER_ENABLED_RESULT_LIMIT = 16
         private const val MAX_SOURCE_DETAIL_CHARS = 1_400
+        private const val FEATURED_THUMBNAIL_CACHE_KB = 8 * 1024
         private const val RESULT_THUMBNAIL_CACHE_KB = 24 * 1024
         private const val STALE_WORKER_TIMEOUT_MS = 2 * 60 * 1_000L
     }

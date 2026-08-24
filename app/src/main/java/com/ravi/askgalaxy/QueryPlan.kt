@@ -302,7 +302,9 @@ data class QueryPlan(
     val fromDate: String = "",
     val toDate: String = "",
     val locationHint: String = "",
+    val travelScope: String = "",
     val recentFirst: Boolean = false,
+    val oldestFirst: Boolean = false,
     val sortByLocation: Boolean = false,
     val needsAnswer: Boolean = true,
     val answerIntentExplicit: Boolean = false,
@@ -345,6 +347,9 @@ data class QueryPlan(
         locationHint.takeIf(String::isNotBlank)?.let {
             add(QueryOperation(QueryOperationKind.INTERSECT, "location", it))
         }
+        travelScope.takeIf(String::isNotBlank)?.let {
+            add(QueryOperation(QueryOperationKind.INTERSECT, "travel", it))
+        }
         timeHint.takeIf(String::isNotBlank)?.let {
             add(QueryOperation(QueryOperationKind.INTERSECT, "time", it))
         }
@@ -359,6 +364,7 @@ data class QueryPlan(
         negativeSemanticQueries.forEach { add(QueryOperation(QueryOperationKind.SUBTRACT, "semantic", it)) }
         excludedOcrTerms.forEach { add(QueryOperation(QueryOperationKind.SUBTRACT, "ocr", it)) }
         if (recentFirst) add(QueryOperation(QueryOperationKind.SORT, "time", "latest"))
+        if (oldestFirst) add(QueryOperation(QueryOperationKind.SORT, "time", "oldest"))
         if (sortByLocation) add(QueryOperation(QueryOperationKind.SORT, "location", "ascending"))
     }
 
@@ -374,6 +380,9 @@ data class QueryPlan(
             }
             locationHint.takeIf(String::isNotBlank)?.let {
                 add(ExecutionNode.Predicate(ExecutionField.LOCATION, it))
+            }
+            travelScope.takeIf(String::isNotBlank)?.let {
+                add(ExecutionNode.Predicate(ExecutionField.TRAVEL, it))
             }
             mediaType?.let {
                 add(ExecutionNode.Predicate(ExecutionField.MIME_TYPE, it.label()))
@@ -432,6 +441,7 @@ data class QueryPlan(
             )
         }
         if (recentFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.DATE)
+        if (oldestFirst && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.OLDEST)
         if (sortByLocation && root != null) root = ExecutionNode.Sorted(root, ExecutionSort.LOCATION)
         return root?.let(::QueryExecutionSpec)
     }
