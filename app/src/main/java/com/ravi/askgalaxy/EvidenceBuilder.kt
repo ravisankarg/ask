@@ -116,7 +116,8 @@ class EvidenceBuilder(
 
     private companion object {
         const val MAX_EPISODE_CANDIDATES = 100
-        const val MAX_CONTEXT_EPISODES = 32
+        // Standout selection may inspect any accepted result in the fused Top 100.
+        const val MAX_CONTEXT_EPISODES = CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT
         const val MAX_ANSWER_EPISODES = 12
     }
 }

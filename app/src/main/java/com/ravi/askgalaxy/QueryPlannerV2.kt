@@ -2,6 +2,7 @@ package com.ravi.askgalaxy
 
 import android.content.Context
 import java.time.LocalDate
+import java.util.Locale
 
 internal enum class QueryPlannerProtocol {
     V1,
@@ -11,11 +12,13 @@ internal enum class QueryPlannerProtocol {
 /** Persisted rollback switch. Existing installs start on V2; V1 remains intact. */
 internal object QueryPlannerProtocolPreferences {
     private const val PREFERENCES = "query_planner_protocol"
-    private const val USE_V2 = "use_v2"
+    // New key intentionally makes AST the default on existing installs that
+    // previously persisted the retired typed-planner trial as enabled.
+    private const val USE_TYPED_PLANNER = "use_typed_planner_experimental"
 
     fun selected(context: Context): QueryPlannerProtocol =
         if (context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                .getBoolean(USE_V2, true)
+                .getBoolean(USE_TYPED_PLANNER, false)
         ) {
             QueryPlannerProtocol.V2
         } else {
@@ -25,7 +28,7 @@ internal object QueryPlannerProtocolPreferences {
     fun setV2Enabled(context: Context, enabled: Boolean) {
         context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             .edit()
-            .putBoolean(USE_V2, enabled)
+            .putBoolean(USE_TYPED_PLANNER, enabled)
             .apply()
     }
 }
@@ -142,6 +145,7 @@ internal object V2FaceCatalog {
             require(it.isNotBlank()) { "Face reference '$reference' is blank" }
         }
     }
+
 }
 
 /** Model-authored typed IR. Kotlin validates provenance and compiles it mechanically. */
@@ -153,86 +157,65 @@ internal object QueryPlannerV2 {
     private const val MAX_OPERATIONS = 8
 
     val systemInstruction: String = """
-        You are Ask Galaxy Query Planner V2.5. Return one compact JSON object only.
-        You author all meaning. Kotlin validates fixed shapes, resolves references you selected, and executes the operations unchanged.
+        You are Ask Galaxy Query Planner V2.10. Compile the request into one compact JSON object only.
+        You alone author the plan. Kotlin only validates and executes your operations unchanged. Never output prose, markdown, tool tags, comments, or an operation not listed below.
 
         ROOT
-        {"v":2,"q":"standalone corrected query","intent":"browse|answer:text|answer:person|answer:location|answer:date","ops":[OP]}
-        Add "prev":true only for a real follow-up whose subject is absent from current_query. Emit 1-8 operations. No extra keys, prose, nulls, or duplicate concepts.
+        {"v":2,"q":"standalone typo-corrected query","intent":"browse|answer:text|answer:person|answer:location|answer:date","ops":[OP]}
+        Use 1-8 operations. Add "prev":true only when current_query lacks the subject and previous_query supplies it. Otherwise omit prev. No extra keys.
 
-        EXACT FIXED-ARITY OPERATIONS
+        EXACT OPERATION FORMS
         ["term",VALUE,"semantic|all|semantic+all"]
-        ["person_ref","F#"] visual face only; ["self"] visual me/my; ["self_term"] written me/my owner; ["people_only"]
+        ["person_ref","F#"] ["self"] ["self_term"] ["people_only"] ["not_person_ref","F#"]
         ["media","photos|videos|pdf|doc|messages|sms|calendar|contacts|call_logs|files"]
-        ["location",VALUE]
-        ["travel","outside_normal"] unnamed trip/vacation only
+        ["location",VALUE] ["travel","outside_normal"] ["not_term",VALUE]
         ["relative_date","this_year"]
         ["relative_date","last|past|since","N#|PN#","days|weeks|months|years"]
         ["calendar_period","this|last","week|month|year"]
         ["calendar_date","today|yesterday|tomorrow|future"]
         ["date_ref","on|after|from|since|before|until|through","D#|PD#"]
         ["date_between","D#|PD#","D#|PD#"]
-        ["clock_ref","C#|PC#"]
-        ["daypart","morning|afternoon|evening|night"]
+        ["clock_ref","C#|PC#"] ["daypart","morning|afternoon|evening|night"]
         ["sort","newest|oldest|location"]
-        ["not_term",VALUE]
-        ["not_person_ref","F#"]
 
-        REFERENCES
-        face_refs are lookup choices, never defaults. Use person_ref only when the query explicitly names that visual person. current_literal_refs and previous_literal_refs are exact user literals. Select their IDs instead of copying digits. Never output a reference not supplied by the task.
+        SILENTLY BUILD A COVERAGE LEDGER BEFORE JSON
+        MEDIA | INCLUDED PEOPLE/SELF | PEOPLE_ONLY | EXCLUDED PERSON | LOCATION OR TRAVEL | DATE/DAYPART | SORT | POSITIVE CONTENT | EXCLUDED CONTENT
+        Scan the whole current_query and fill every applicable column. Then emit one operation for every filled column. Do not stop after the first operation. Media, person, place, date, sort, and content are independent constraints and must coexist. A media-only plan is wrong whenever any meaningful word remains after removing generic media words. Finally re-read the query and JSON: no meaningful requested content may be missing.
 
-        ANSWER-SLOT GATE
-        For every answer:* intent, q keeps the full standalone question, but each term VALUE contains only the evidence subject to retrieve. Remove the requested value/field span from every term and not_term. Words such as number, amount, total, cost, price, balance, date, time, expiry/expiration, departure/arrival time, confirmation/reference number, phone number, email address, who, where, and when describe the answer slot; they are not evidence subjects. Keep the meaningful owner and document/concept words. This rule overrides compound preservation.
-        Correct reductions: driving licence number -> driving licence; electricity bill amount -> electricity bill; hotel booking confirmation number -> hotel booking; flight ticket departure time -> flight ticket; vaccination certificate date -> vaccination certificate; Ravi phone number -> Ravi + phone; Ramani email address -> Ramani + email. Do not remove these words when they are actual browse content or constraints rather than an answer slot, e.g. SMS containing OTP or contacts with Bangalore address.
+        GALLERY RULES
+        - A search, command, or noun phrase that asks to find/show/browse gallery items has intent browse. answer:* is only for extracting a who/where/when/written value.
+        - photo/picture/pic/image/snap/shot, including obvious typos and plurals, fills MEDIA=photos and is not content. video/clip fills MEDIA=videos and is not content. selfie and portrait fill MEDIA=photos but also remain visual content. Descriptors such as blurry also remain visual content.
+        - In a gallery query, a named person fills INCLUDED PEOPLE with the F# beside that exact label in this task's face_refs. The second value of person_ref/not_person_ref must be an F# ID, never a name. me/my/myself fills SELF using ["self"]. A typo that clearly matches one face label is corrected in q and uses that label's F#. Never turn a gallery person's name into a term.
+        - only/alone/just fills PEOPLE_ONLY in addition to every included person/self. together includes every named person. without/no/excluding NAME fills EXCLUDED PERSON with that NAME's exact F#; it does not delete included people.
+        - A proper named place or home fills LOCATION. beach, rain, snow, mountain, forest, sunset, party, birthday, indoor are visual content, not locations. An unnamed trip/vacation/travel fills TRAVEL. If a destination is named, use LOCATION and omit TRAVEL.
+        - After removing all filled structural columns and connector words, preserve all remaining visual meaning in exactly one compound ["term",VALUE,"semantic"]. Keep modifiers and relations together: "food on a table", "cycling in rain", "dogs running on beach", "night city lights". Never split a scene into word terms. Never use all or semantic+all for an ordinary visual scene.
+        - Explicit written/text/containing/says/reads content uses ["term",VALUE,"all"]. A photographed receipt, ticket, bill, certificate, or document may use one semantic+all term. Keep the requested written phrase; "screenshots containing payment failed" needs photos plus semantic screenshot plus all "payment failed".
 
-        SOURCE-INTENT GATE
-        Routing words select a phone source and never become term text: call/called/calling/dialed -> media call_logs; text/texted/SMS -> media sms; message/messaged/chat/chatted -> media messages; calendar/event/appointment/meeting/scheduled -> media calendar. Apply this mapping only when the user's intent is those phone records, not when the word is actual content. Keep searchable payload such as person, topic, missed/incoming/outgoing status, and date in separate operations. A query without source intent emits no media and searches all sources. Emit media photos/videos/pdf/files only when the user explicitly asks to browse only that type; never guess one as the evidence source of an answer.
+        TIME, SORT, AND NEGATION
+        - today/yesterday/tomorrow -> calendar_date. this/last week/month/year -> calendar_period. Exact phrase "this year" may instead use relative_date this_year.
+        - last/past/since NUMBER units -> relative_date with the N# or PN# whose value is that NUMBER, plus the exact unit. Copy reference IDs; never copy, invent, edit, or merge raw digits. ISO dates use supplied D# or PD# references.
+        - morning/afternoon/evening/night fills DAYPART only when it independently limits media, as in "night videos". Keep it inside one compound semantic when it describes a scene, as in "fireworks at night" or "night city lights".
+        - latest/recent/newest fills SORT=newest; oldest fills SORT=oldest. A sort never replaces any other column.
+        - except/excluding/without/not visual content fills EXCLUDED CONTENT using exactly ["not_term",VALUE]. Keep every positive column. Never make an excluded place a positive location.
 
-        PLAN
-        1. Decide follow-up and intent. Browse shows records. answer:* extracts a fact; person=who, location=where, date=when.
-        2. Assign each meaningful span once: source/type, visual person/self, place, travel, time, sort, exclusion, requested answer attribute, or content.
-        3. Preserve a compound concept as one term: "cycling in rain", "dogs running", "indoors at night", "driving licence", "hotel booking", "vaccination certificate".
-        4. semantic is conceptual/visual. all is mandatory written text. semantic+all is one written document concept requiring both. Never split one concept to assign multiple roles.
-        5. In visual photo/video queries use person_ref/self. In written records or cross-source facts use term NAME all; written me/my uses self_term. Never use a face operator for a document owner or sender.
-        6. Apply SOURCE-INTENT GATE. The routed phone source is the only media scope; keep its searchable payload. Contained media is content, e.g. videos received in messages -> media messages + term video semantic.
-        7. Apply ANSWER-SLOT GATE before emitting operations. Never copy an answer attribute into a term just because it appears next to the subject.
-        8. For gallery queries, scene/weather words rain, snow, beach, forest, and indoors are semantic, not locations; named places are location. In written/private records, a mentioned place is content term, not gallery location. A standalone daypart constraining records uses daypart, but preserve compounds such as "indoors at night" as one semantic scene.
-        9. An unnamed trip/vacation/outing uses travel outside_normal. A named destination uses location and omits travel. recent/latest/newest adds sort newest; oldest adds sort oldest.
-        10. Correct typos in q and VALUE. Do not alter supplied literal references.
+        OTHER SOURCES
+        call/dialed -> media call_logs; text/SMS -> media sms; message/chat -> media messages; appointment/meeting/calendar -> media calendar. In written records use term NAME all rather than a face, and written me/my uses self_term. For answer:* keep the question in q but remove answer-slot words such as number, amount, cost, date, time, expiry, who, where, when from retrieval terms.
 
-        EXAMPLES
-        current_query=cycling in rain
-        {"v":2,"q":"cycling in rain","intent":"browse","ops":[["term","cycling in rain","semantic"]]}
-        current_query=Ramani dancing photos; face_refs=F1=Ramani
-        {"v":2,"q":"Ramani dancing photos","intent":"browse","ops":[["person_ref","F1"],["term","dancing","semantic"],["media","photos"]]}
-        current_query=my photos last 3 years; current_literal_refs=N0=3
-        {"v":2,"q":"my photos last 3 years","intent":"browse","ops":[["self"],["media","photos"],["relative_date","last","N0","years"]]}
-        current_query=messages from Ramani yesterday
-        {"v":2,"q":"messages from Ramani yesterday","intent":"browse","ops":[["media","messages"],["term","Ramani","all"],["calendar_date","yesterday"]]}
-        current_query=next appointment
-        {"v":2,"q":"next appointment","intent":"browse","ops":[["media","calendar"],["calendar_date","future"],["sort","oldest"]]}
-        current_query=Ravi called me yesterday
-        {"v":2,"q":"Ravi called me yesterday","intent":"browse","ops":[["media","call_logs"],["term","Ravi","all"],["calendar_date","yesterday"]]}
-        current_query=Ravi passport number
-        {"v":2,"q":"Ravi passport number","intent":"answer:text","ops":[["term","Ravi","all"],["term","passport","semantic+all"]]}
-        current_query=electricity bill amount
-        {"v":2,"q":"electricity bill amount","intent":"answer:text","ops":[["term","electricity bill","semantic+all"]]}
-        current_query=flight ticket departure time
-        {"v":2,"q":"flight ticket departure time","intent":"answer:date","ops":[["term","flight ticket","semantic+all"]]}
-        previous_query=Ravi passport number; current_query=expiry date
-        {"v":2,"q":"Ravi passport expiry date","intent":"answer:date","ops":[["term","Ravi","all"],["term","passport","semantic+all"]],"prev":true}
-        current_query=recent vacation
-        {"v":2,"q":"recent vacation","intent":"browse","ops":[["travel","outside_normal"],["sort","newest"]]}
-        current_query=my passport number
-        {"v":2,"q":"my passport number","intent":"answer:text","ops":[["self_term"],["term","passport","semantic+all"]]}
-        current_query=who sent passport photo
-        {"v":2,"q":"who sent passport photo","intent":"answer:person","ops":[["term","passport photo","semantic+all"]]}
-        current_query=where is my passport
-        {"v":2,"q":"where is my passport","intent":"answer:location","ops":[["self_term"],["term","passport","semantic+all"]]}
-        previous_query=Ramani birthday photos; current_query=where were these taken; face_refs=F1=Ramani
-        {"v":2,"q":"where were Ramani birthday photos taken","intent":"answer:location","ops":[["person_ref","F1"],["term","birthday","semantic"],["media","photos"]],"prev":true}
-        current_query=photos at Goa excluding beach
-        {"v":2,"q":"photos at Goa excluding beach","intent":"browse","ops":[["media","photos"],["location","Goa"],["not_term","beach"]]}
+        EXACT EXAMPLES
+        food on a table -> {"v":2,"q":"food on a table","intent":"browse","ops":[["term","food on a table","semantic"]]}
+        beach photos in Chennai -> {"v":2,"q":"beach photos in Chennai","intent":"browse","ops":[["media","photos"],["location","Chennai"],["term","beach","semantic"]]}
+        videos of dancing -> {"v":2,"q":"videos of dancing","intent":"browse","ops":[["media","videos"],["term","dancing","semantic"]]}
+        blurry photos -> {"v":2,"q":"blurry photos","intent":"browse","ops":[["media","photos"],["term","blurry","semantic"]]}
+        fireworks at night -> {"v":2,"q":"fireworks at night","intent":"browse","ops":[["term","fireworks at night","semantic"]]}
+        me only -> {"v":2,"q":"me only","intent":"browse","ops":[["self"],["people_only"]]}
+        If face_refs=F7=Alice|F9=Bob, Alice and Bob together -> {"v":2,"q":"Alice and Bob together","intent":"browse","ops":[["person_ref","F7"],["person_ref","F9"]]}
+        If face_refs=F7=Alice|F9=Bob, Alice photos without Bob -> {"v":2,"q":"Alice photos without Bob","intent":"browse","ops":[["person_ref","F7"],["not_person_ref","F9"],["media","photos"]]}
+        If face_refs=F7=Alice, Alice alone -> {"v":2,"q":"Alice alone","intent":"browse","ops":[["person_ref","F7"],["people_only"]]}
+        screenshots containing payment failed -> {"v":2,"q":"screenshots containing payment failed","intent":"browse","ops":[["media","photos"],["term","screenshot","semantic"],["term","payment failed","all"]]}
+        photos this week -> {"v":2,"q":"photos this week","intent":"browse","ops":[["media","photos"],["calendar_period","this","week"]]}
+        photos last 3 years; current_literal_refs=N0=3 -> {"v":2,"q":"photos last 3 years","intent":"browse","ops":[["media","photos"],["relative_date","last","N0","years"]]}
+        latest vacation pictures -> {"v":2,"q":"latest vacation pictures","intent":"browse","ops":[["media","photos"],["travel","outside_normal"],["sort","newest"]]}
+        photos at Goa excluding beach -> {"v":2,"q":"photos at Goa excluding beach","intent":"browse","ops":[["media","photos"],["location","Goa"],["not_term","beach"]]}
     """.trimIndent()
 
     fun userPrompt(
@@ -266,8 +249,9 @@ internal object QueryPlannerV2 {
         previous_query=${context.previousQuery.ifBlank { "none" }}
         current_query=${context.currentQuery}
         validator_error=$validatorError
-        The prior answer was rejected and is intentionally omitted. Start over from current_query. Return only one V2.5 JSON object.
-        Use the exact fixed-arity grammar from the system instruction. person_ref/not_person_ref select one supplied F#. Dates, numbers, and clocks select supplied D#/N#/C# references; never copy their digits. Keep compound content in one term. Route call/text/message/calendar intent to its media source and omit routing words from terms. Use self only for visual presence and self_term for written ownership. For answer:* keep the requested field in q but remove it from every term VALUE. A complete current query omits prev.
+        The prior answer was rejected and omitted. Start from current_query again; do not patch or imitate it. Return one V2.10 JSON object only.
+        Build this ledger and emit every filled column: MEDIA | INCLUDED PEOPLE/SELF | PEOPLE_ONLY | EXCLUDED PERSON | LOCATION OR TRAVEL | DATE/DAYPART | SORT | POSITIVE CONTENT | EXCLUDED CONTENT. Do not stop after one operation. Gallery search uses browse. Visual me/my uses self. only/alone/just adds people_only without deleting included people. person_ref/not_person_ref must copy the F# ID beside the requested face label, never the label text. Copy supplied D#/N#/C# IDs; never invent or alter digits. Use only exact operation forms. Keep all remaining visual meaning in one compound semantic, without generic media words. Ordinary scenes never use all. A complete current query omits prev.
+        Fix validator_error literally: missing media -> add media; missing self -> add ["self"]; named people -> map every included/excluded name to its F#; face not named after a typo -> correct q to that face label; fragmented scene -> merge the full phrase; visual scene used as location -> move it to semantic; wrong operation size -> copy its exact form, especially ["not_term",VALUE]. Preserve every already requested constraint while fixing it.
     """.trimIndent()
 
     fun parseAndCompile(raw: String, context: V2PlannerContext): V2CompiledPlannerOutput {
@@ -294,6 +278,11 @@ internal object QueryPlannerV2 {
             "intent",
             setOf("browse", "answer:text", "answer:person", "answer:location", "answer:date"),
         )
+        if (!ANSWER_EXTRACTION_WORDING.containsMatchIn(normalizeGrounding(context.currentQuery))) {
+            require(intent == "browse") {
+                "A non-question search without an answer-slot cue requires intent browse"
+            }
+        }
         val operations = root.requireArray("ops").values
         require(operations.isNotEmpty()) { "ops must contain a retrieval operation" }
         require(operations.size <= MAX_OPERATIONS) { "ops may contain at most $MAX_OPERATIONS operations" }
@@ -314,6 +303,13 @@ internal object QueryPlannerV2 {
         val uniqueOperations = LinkedHashSet<String>()
         val uniqueTerms = LinkedHashSet<String>()
         val literalReferences = V2LiteralCatalog.fromContext(context)
+        val groundingQuery = buildString {
+            append(context.currentQuery).append(' ').append(resolvedQuery)
+            if (usedPrevious) append(' ').append(context.previousQuery)
+        }
+        require(digitTokens(context.currentQuery).all { it in digitTokens(resolvedQuery) }) {
+            "q must preserve every digit sequence from current_query exactly"
+        }
 
         fun literal(reference: String, kind: V2LiteralKind, path: String): V2LiteralReference {
             val resolved = literalReferences.singleOrNull { it.id == reference && it.kind == kind }
@@ -357,12 +353,18 @@ internal object QueryPlannerV2 {
                         V2FaceCatalog.resolve(operation.requireString(1, path), context.knownPeople),
                         path,
                     )
+                    require(mentionsGroundedLabel(groundingQuery, grounded.value)) {
+                        "$path selected face '${grounded.value}' that is not named by the query"
+                    }
                     accept("person:${grounded.value}")
                     people += grounded
                     canonicalOperation = listOf("person", grounded.value)
                 }
                 "self" -> {
                     operation.requireSize(1..1, path)
+                    require(hasExplicitSelfReference(groundingQuery)) {
+                        "$path self requires explicit me/my/mine/myself wording"
+                    }
                     val label = requireNotNull(context.selfPerson?.takeIf(String::isNotBlank)) {
                         "$path self face is unavailable"
                     }
@@ -373,6 +375,9 @@ internal object QueryPlannerV2 {
                 }
                 "self_term" -> {
                     operation.requireSize(1..1, path)
+                    require(hasExplicitSelfReference(groundingQuery)) {
+                        "$path self_term requires explicit me/my/mine/myself wording"
+                    }
                     val label = requireNotNull(context.selfPerson?.takeIf(String::isNotBlank)) {
                         "$path self identity is unavailable"
                     }
@@ -425,6 +430,9 @@ internal object QueryPlannerV2 {
                         V2FaceCatalog.resolve(operation.requireString(1, path), context.knownPeople),
                         path,
                     )
+                    require(mentionsGroundedLabel(groundingQuery, grounded.value)) {
+                        "$path excluded face '${grounded.value}' is not named by the query"
+                    }
                     accept("not_person:${grounded.value}")
                     excludedPeople += grounded
                     canonicalOperation = listOf("not_person", grounded.value)
@@ -583,6 +591,70 @@ internal object QueryPlannerV2 {
             canonicalOperations += canonicalOperation ?: originalOperation
         }
         require(peopleOnly == null || people.isNotEmpty()) { "people_only requires a person operation" }
+        require(peopleOnly == null || EXCLUSIVE_PERSON_WORDING.containsMatchIn(groundingQuery)) {
+            "people_only requires only/alone/just/no-other wording"
+        }
+        require(location == null || travel == null) {
+            "A named location and outside_normal travel cannot both be mandatory"
+        }
+        location?.let { groundedLocation ->
+            require(normalizeGrounding(groundedLocation.value) !in VISUAL_SCENE_NOT_LOCATIONS) {
+                "location '${groundedLocation.value}' is a visual scene, not a named place"
+            }
+        }
+        val normalizedCurrent = normalizeGrounding(context.currentQuery)
+        val mediaType = media?.value?.let(QueryMediaType::fromToken)
+        val galleryBrowse = intent == "browse" && (
+            mediaType?.isGalleryType() == true ||
+                (mediaType == null && !WRITTEN_EVIDENCE_WORDING.containsMatchIn(normalizedCurrent))
+            )
+        if (intent == "browse") {
+            if (PHOTO_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(mediaType == QueryMediaType.PHOTOS) {
+                    "Explicit photo/picture/pic/image/snap wording requires media photos"
+                }
+            }
+            if (VIDEO_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(mediaType == QueryMediaType.VIDEOS) {
+                    "Explicit video wording requires media videos"
+                }
+            }
+            if (galleryBrowse && !WRITTEN_EVIDENCE_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(lexical.isEmpty()) {
+                    "Ordinary gallery scenes cannot require written-text matching"
+                }
+            }
+            if (galleryBrowse) {
+                require(semantic.size <= 1) {
+                    "Gallery visual meaning was fragmented; emit one compound term semantic"
+                }
+            }
+            if (DATE_CONSTRAINT_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(date != null) { "Explicit date wording requires one date operation" }
+            }
+            if (NEWEST_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(sort?.value == "newest") { "latest/recent/newest requires sort newest" }
+            }
+            if (OLDEST_WORDING.containsMatchIn(normalizedCurrent)) {
+                require(sort?.value == "oldest") { "oldest requires sort oldest" }
+            }
+        }
+        val namedPeople = context.knownPeople.filter { mentionsGroundedLabel(groundingQuery, it) }
+        val plannedPeople = (people + excludedPeople).map { normalizeGrounding(it.value) }.toSet()
+        if (galleryBrowse) {
+            require(namedPeople.all { normalizeGrounding(it) in plannedPeople }) {
+                "Every explicitly named gallery person must use its matching person_ref or not_person_ref"
+            }
+        }
+        if (
+            galleryBrowse &&
+            hasExplicitSelfReference(groundingQuery)
+        ) {
+            val self = context.selfPerson?.let(::normalizeGrounding)
+            require(self != null && self in people.map { normalizeGrounding(it.value) }) {
+                "Explicit me/my gallery presence requires self"
+            }
+        }
         require(semantic.map { it.value.lowercase() }.intersect(excludedSemantic.map { it.value.lowercase() }.toSet()).isEmpty()) {
             "The same semantic term cannot be both included and excluded"
         }
@@ -598,57 +670,65 @@ internal object QueryPlannerV2 {
             "answer:date" -> QueryCategory.TIME
             else -> error("unreachable")
         }
-        val positive = ArrayList<ExecutionNode>()
-        positive += ExecutionNode.Predicate(ExecutionField.QUERY_CATEGORY, category.wireName)
-        positive += ExecutionNode.Predicate(ExecutionField.ANSWER_NEEDED, (intent != "browse").toString())
-        people.forEach { positive += ExecutionNode.Predicate(ExecutionField.PERSON, it.value) }
+        val envelope = ExecutionNode.Binary(
+            ExecutionNode.Predicate(ExecutionField.QUERY_CATEGORY, category.wireName),
+            ExecutionBinaryOperator.INTERSECT,
+            ExecutionNode.Predicate(ExecutionField.ANSWER_NEEDED, (intent != "browse").toString()),
+        )
+        val retrieval = ArrayList<ExecutionNode>()
+        people.forEach { retrieval += ExecutionNode.Predicate(ExecutionField.PERSON, it.value) }
         if (peopleOnly != null) {
-            positive += ExecutionNode.Predicate(
+            retrieval += ExecutionNode.Predicate(
                 ExecutionField.PEOPLE_ONLY,
                 people.joinToString(",") { it.value },
             )
         }
-        media?.let { positive += ExecutionNode.Predicate(ExecutionField.MIME_TYPE, it.value) }
-        location?.let { positive += ExecutionNode.Predicate(ExecutionField.LOCATION, it.value) }
-        travel?.let { positive += ExecutionNode.Predicate(ExecutionField.TRAVEL, it.value) }
+        media?.let { retrieval += ExecutionNode.Predicate(ExecutionField.MIME_TYPE, it.value) }
+        location?.let { retrieval += ExecutionNode.Predicate(ExecutionField.LOCATION, it.value) }
+        travel?.let { retrieval += ExecutionNode.Predicate(ExecutionField.TRAVEL, it.value) }
         date?.from?.takeIf(String::isNotBlank)?.let {
-            positive += ExecutionNode.Predicate(ExecutionField.FROM_DATE, it)
+            retrieval += ExecutionNode.Predicate(ExecutionField.FROM_DATE, it)
         }
         date?.to?.takeIf(String::isNotBlank)?.let {
-            positive += ExecutionNode.Predicate(ExecutionField.TO_DATE, it)
+            retrieval += ExecutionNode.Predicate(ExecutionField.TO_DATE, it)
         }
-        clock?.let { positive += ExecutionNode.Predicate(ExecutionField.TIME, it.value) }
-        semantic.forEach { positive += ExecutionNode.Predicate(ExecutionField.SEMANTIC, it.value) }
+        clock?.let { retrieval += ExecutionNode.Predicate(ExecutionField.TIME, it.value) }
+        semantic.forEach { retrieval += ExecutionNode.Predicate(ExecutionField.SEMANTIC, it.value) }
         if (lexical.isNotEmpty()) {
-            positive += ExecutionNode.Predicate(
+            retrieval += ExecutionNode.Predicate(
                 ExecutionField.KEYWORD,
                 lexical.joinToString(" && ") { "{${it.value}}" },
             )
         }
-        require(positive.size > 2) { "V2 plan must contain at least one retrieval field" }
-        var expression = positive.reduce { left, right ->
+        require(retrieval.isNotEmpty()) { "V2 plan must contain at least one retrieval field" }
+        var retrievalExpression = retrieval.reduce { left, right ->
             ExecutionNode.Binary(left, ExecutionBinaryOperator.INTERSECT, right)
         }
         excludedSemantic.forEach { excluded ->
-            expression = ExecutionNode.Binary(
-                expression,
+            retrievalExpression = ExecutionNode.Binary(
+                retrievalExpression,
                 ExecutionBinaryOperator.SUBTRACT,
                 ExecutionNode.Predicate(ExecutionField.SEMANTIC, excluded.value),
             )
         }
         excludedPeople.forEach { excluded ->
-            expression = ExecutionNode.Binary(
-                expression,
+            retrievalExpression = ExecutionNode.Binary(
+                retrievalExpression,
                 ExecutionBinaryOperator.SUBTRACT,
                 ExecutionNode.Predicate(ExecutionField.PERSON, excluded.value),
             )
         }
-        expression = when (sort?.value) {
-            "newest" -> ExecutionNode.Sorted(expression, ExecutionSort.DATE)
-            "oldest" -> ExecutionNode.Sorted(expression, ExecutionSort.OLDEST)
-            "location" -> ExecutionNode.Sorted(expression, ExecutionSort.LOCATION)
-            else -> expression
+        retrievalExpression = when (sort?.value) {
+            "newest" -> ExecutionNode.Sorted(retrievalExpression, ExecutionSort.DATE)
+            "oldest" -> ExecutionNode.Sorted(retrievalExpression, ExecutionSort.OLDEST)
+            "location" -> ExecutionNode.Sorted(retrievalExpression, ExecutionSort.LOCATION)
+            else -> retrievalExpression
         }
+        val expression = ExecutionNode.Binary(
+            envelope,
+            ExecutionBinaryOperator.INTERSECT,
+            retrievalExpression,
+        )
         val plan = ModelAuthoredPlanStructure.compile(QueryExecutionSpec(expression))
         return V2CompiledPlannerOutput(
             resolvedQuery = resolvedQuery,
@@ -705,6 +785,62 @@ internal object QueryPlannerV2 {
         }
         append('"')
     }
+
+    private fun normalizeGrounding(value: String): String = value
+        .lowercase(Locale.ROOT)
+        .replace(Regex("[^\\p{L}\\p{N}]+"), " ")
+        .trim()
+        .replace(Regex("\\s+"), " ")
+
+    private fun mentionsGroundedLabel(query: String, label: String): Boolean {
+        val normalizedQuery = " ${normalizeGrounding(query)} "
+        val normalizedLabel = normalizeGrounding(label)
+        return normalizedLabel.isNotBlank() && normalizedQuery.contains(" $normalizedLabel ")
+    }
+
+    private fun hasExplicitSelfReference(query: String): Boolean =
+        Regex("(?i)(?<![\\p{L}\\p{N}])(me|my|mine|myself)(?![\\p{L}\\p{N}])")
+            .containsMatchIn(query)
+
+    private fun digitTokens(value: String): Set<String> = Regex("\\d+")
+        .findAll(value)
+        .map { it.value }
+        .toSet()
+
+    private val EXCLUSIVE_PERSON_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(only|alone|just|no\\s+other\\s+people)(?![\\p{L}\\p{N}])",
+    )
+    private val ANSWER_EXTRACTION_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:who|where|when|what|which|how\\s+many|number|amount|total|" +
+            "cost|price|balance|expiry|expiration|phone\\s+number|email\\s+address)(?![\\p{L}\\p{N}])",
+    )
+    private val PHOTO_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:photos?|pictures?|pics?|images?|snaps?|shots?|selfies?|portraits?|" +
+            "picturs?|fotoss?)(?![\\p{L}\\p{N}])|(?<![\\p{L}\\p{N}])photographed(?![\\p{L}\\p{N}])",
+    )
+    private val VIDEO_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:videos?|vidoes?|vido)(?![\\p{L}\\p{N}])",
+    )
+    private val WRITTEN_EVIDENCE_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:text|written|containing|contains|says|reads|receipt|receipts|" +
+            "ticket|tickets|document|documents|passport|licence|license|bill|bills|certificate|certificates|screenshot|screenshots|" +
+            "error\\s+message)(?![\\p{L}\\p{N}])",
+    )
+    private val DATE_CONSTRAINT_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:today|yesterday|tomorrow|week|month|year|years|before|after|" +
+            "since|between|past|summer|winter|spring|autumn|fall|january|february|march|april|may|" +
+            "june|july|august|september|october|november|december|\\d{4})(?![\\p{L}\\p{N}])",
+    )
+    private val NEWEST_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])(?:latest|recent|newest)(?![\\p{L}\\p{N}])",
+    )
+    private val OLDEST_WORDING = Regex(
+        "(?i)(?<![\\p{L}\\p{N}])oldest(?![\\p{L}\\p{N}])",
+    )
+    private val VISUAL_SCENE_NOT_LOCATIONS = setOf(
+        "beach", "rain", "snow", "mountain", "mountains", "forest", "sunset", "sunsets",
+        "party", "indoors", "indoor",
+    )
 
     private val EXPLICIT_CLOCK = Regex(
         "(?i)^(?:(?:[01]?\\d|2[0-3]):[0-5]\\d|(?:0?[1-9]|1[0-2])(?::[0-5]\\d)?\\s*(?:am|pm))$",

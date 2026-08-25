@@ -1,0 +1,101 @@
+id	family	query	expected
+001	scene	sunset pictures	browse; media photos; semantic sunset
+002	scene	beach photos	browse; media photos; semantic beach
+003	scene	dogs running	browse; one semantic dogs running
+004	scene	cycling in rain	browse; one semantic cycling in rain
+005	scene	snowy mountains	browse; one semantic snowy mountains
+006	scene	food on a table	browse; one semantic food on a table
+007	scene	indoor birthday party	browse; one semantic indoor birthday party
+008	scene	night city lights	browse; one semantic night city lights
+009	scene	kids playing football	browse; one semantic kids playing football
+010	scene	red car	browse; one semantic red car
+011	media_scene	videos of dancing	browse; media videos; semantic dancing
+012	media_scene	photos of swimming	browse; media photos; semantic swimming
+013	media_scene	videos of fireworks at night	browse; media videos; one semantic fireworks at night
+014	media_scene	selfies at the beach	browse; media photos; semantic selfie and beach; no self face
+015	media_scene	portrait photos	browse; media photos; semantic portrait
+016	media_ocr	screenshots with error message	browse; media photos; screenshot error message content preserved
+017	media_ocr	photos of receipts	browse; media photos; receipt content preserved
+018	media_ocr	pictures of movie tickets	browse; media photos; movie ticket content preserved
+019	media_scene	documents photographed on table	browse; photo scope; document on table content preserved
+020	media_scene	blurry photos	browse; media photos; semantic blurry
+021	people	Ramani photos	browse; person Ramani; media photos
+022	people	Ravi and Ramani together	browse; people Ravi and Ramani
+023	people	photos of me	browse; self; media photos
+024	people	me only	browse; self; people_only
+025	people	Ramani only	browse; person Ramani; people_only
+026	people	me with Ramani alone	browse; self; person Ramani; people_only
+027	people	Ramani dancing	browse; person Ramani; semantic dancing
+028	people	Ravi cycling in rain	browse; person Ravi; one semantic cycling in rain
+029	people	photos of Ramani without Ravi	browse; person Ramani; not_person Ravi; media photos
+030	people	family photos without me	browse; semantic family; not self; media photos
+031	location	photos in Goa	browse; media photos; location Goa
+032	location	pictures taken at BR Hills	browse; media photos; location BR Hills
+033	location	videos from Bangalore	browse; media videos; location Bangalore
+034	location	beach photos in Chennai	browse; media photos; semantic beach; location Chennai
+035	location	Ravi photos at Goa	browse; person Ravi; media photos; location Goa
+036	location	Ramani dancing in Mysore	browse; person Ramani; semantic dancing; location Mysore
+037	location	sunsets from Kerala	browse; semantic sunset; location Kerala
+038	location	photos near Eiffel Tower	browse; media photos; location Eiffel Tower
+039	location	trip to Ooty	browse; location Ooty; no travel outside_normal
+040	travel	vacation photos	browse; travel outside_normal; media photos
+041	time	photos from today	browse; media photos; calendar today
+042	time	yesterday videos	browse; media videos; calendar yesterday
+043	time	photos this week	browse; media photos; calendar period this week
+044	time	pictures last month	browse; media photos; calendar period last month
+045	time	videos this year	browse; media videos; relative this year
+046	time	photos last 3 years	browse; media photos; relative last 3 years
+047	time	beach photos past 2 months	browse; media photos; semantic beach; relative past 2 months
+048	time	photos since 2024	browse; media photos; date since 2024
+049	time	photos before January 2025	browse; media photos; date before January 2025
+050	time	photos after 15 August 2023	browse; media photos; date after 15 August 2023
+051	time	photos between January 2024 and March 2024	browse; media photos; bounded date range
+052	time	morning photos	browse; media photos; daypart morning
+053	time	night videos	browse; media videos; daypart night
+054	sort	oldest sunset photo	browse; media photos; semantic sunset; sort oldest
+055	sort	latest vacation pictures	browse; media photos; travel outside_normal; sort newest
+056	combined	Ramani beach photos last month	browse; person Ramani; semantic beach; media photos; last month
+057	combined	me cycling in rain this year	browse; self; one semantic cycling in rain; this year
+058	combined	videos of Ravi dancing at Goa	browse; media videos; person Ravi; semantic dancing; location Goa
+059	combined	Ramani only photos in Ooty last year	browse; person Ramani; people_only; media photos; location Ooty; last year
+060	combined	photos of me and Ramani at BR Hills	browse; self; person Ramani; media photos; location BR Hills
+061	combined	sunset videos from Goa after 2023	browse; semantic sunset; media videos; location Goa; date after 2023
+062	combined	birthday photos from Bangalore excluding cake	browse; semantic birthday; media photos; location Bangalore; not_term cake
+063	combined	photos at Goa excluding beach	browse; media photos; location Goa; not_term beach
+064	combined	family trip videos past 6 months	browse; family content; travel outside_normal; media videos; past 6 months
+065	combined	latest photos of Ramani	browse; media photos; person Ramani; sort newest
+066	combined	oldest videos from Kerala	browse; media videos; location Kerala; sort oldest
+067	combined	red car photos before 2025	browse; semantic red car; media photos; date before 2025
+068	combined	dogs running on beach this week	browse; semantic dogs running on beach; this week
+069	combined	me alone at home yesterday	browse; self; people_only; location home; yesterday
+070	combined	photos of Ravi without Ramani in Mysore	browse; media photos; person Ravi; not_person Ramani; location Mysore
+071	combined	vacation pictures except mountains	browse; media photos; travel outside_normal; not_term mountains
+072	combined	night city videos in Delhi last month	browse; media videos; semantic night city; location Delhi; last month
+073	combined	receipts photographed this year	browse; receipt photo content; this year
+074	combined	screenshots containing payment failed	browse; screenshot scope; mandatory written payment failed content
+075	combined	photos with text happy birthday	browse; media photos; mandatory written happy birthday content
+076	ambiguous	Goa	browse; location Goa; no invented media or person
+077	ambiguous	rain	browse; semantic rain; no location
+078	ambiguous	last summer	browse; temporal summer intent retained conservatively; no invented exact event
+079	ambiguous	recent photos	browse; media photos; sort newest
+080	ambiguous	pics from there	browse; media photos; preserve unresolved there without invented location
+081	ambiguous	birthday	browse; semantic birthday
+082	ambiguous	travel memories	browse; travel outside_normal or equivalent travel semantic
+083	ambiguous	camera shots	browse; media photos; no invented content
+084	ambiguous	that blue thing	browse; semantic blue thing; no previous context
+085	ambiguous	photos around home	browse; media photos; location home
+086	ambiguous	Bangalore or Mysore photos	browse; media photos; both alternative locations preserved
+087	ambiguous	photos not in Goa	browse; media photos; negative Goa constraint preserved
+088	ambiguous	beach but not sunset photos	browse; media photos; semantic beach; not_term sunset
+089	ambiguous	Ramani maybe at Goa	browse; person Ramani; location Goa preserved without extra certainty
+090	ambiguous	photos from around 2024	browse; media photos; approximate 2024 temporal intent retained conservatively
+091	typo	sunset picturs	browse; correct pictures; media photos; semantic sunset
+092	typo	Ramni dancng photos	browse; correct Ramani dancing; person Ramani; semantic dancing; media photos
+093	typo	Goa vaccation pics	browse; correct vacation pictures; location Goa; media photos
+094	typo	vidoes of firewroks	browse; correct videos fireworks; media videos; semantic fireworks
+095	typo	fotoss of me at beach	browse; correct photos; self; media photos; semantic beach
+096	typo	pics frm yesterday	browse; correct from; media photos; yesterday
+097	colloquial	latest Ramani snaps	browse; person Ramani; media photos; sort newest
+098	colloquial	no Ravi just Ramani photos	browse; person Ramani; not_person Ravi; people_only; media photos
+099	colloquial	show beach pics	browse; media photos; semantic beach
+100	colloquial	find my night videos	browse; self; media videos; daypart night

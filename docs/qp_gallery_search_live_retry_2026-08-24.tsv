@@ -1,0 +1,6 @@
+id	family	query	expected
+021	people	Ramani photos	browse; person Ramani; media photos
+074	combined	screenshots containing payment failed	browse; screenshot scope; mandatory written payment failed content
+078	ambiguous	last summer	browse; temporal summer intent retained conservatively; no invented exact event
+080	ambiguous	pics from there	browse; media photos; preserve unresolved there without invented location
+098	colloquial	no Ravi just Ramani photos	browse; person Ramani; not_person Ravi; people_only; media photos

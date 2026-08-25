@@ -69,7 +69,8 @@ class MainActivity : Activity() {
     private lateinit var answerPipelineLabel: TextView
     private lateinit var answerPipelineProgress: ProgressBar
     private lateinit var featuredResultCount: TextView
-    private lateinit var featuredResultGrid: GridView
+    private lateinit var featuredResultSubtitle: TextView
+    private lateinit var featuredResultShowcase: LinearLayout
     private lateinit var resultCount: TextView
     private lateinit var resultGrid: GridView
     private lateinit var timeStatsPanel: LinearLayout
@@ -84,7 +85,7 @@ class MainActivity : Activity() {
     private var searchReady = false
     /** Launch warmup is one-shot; later planner warmups follow answer completion. */
     private var launchPlannerWarmupRequested = false
-    private var featuredResultAdapter: SearchResultAdapter? = null
+    private var standoutThumbnailLoader: StandoutThumbnailLoader? = null
     private var resultAdapter: SearchResultAdapter? = null
     private var lastSubmittedQuery = ""
     private var lastSubmittedAtMs = 0L
@@ -241,6 +242,26 @@ class MainActivity : Activity() {
         handler.post(refresh)
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (BuildConfig.DEBUG && intent.action == DEBUG_SUBMIT_SEARCH_ACTION) {
+            intent.getStringExtra(DEBUG_SUBMIT_SEARCH_QUERY_BASE64)
+                ?.let { encoded ->
+                    runCatching {
+                        String(android.util.Base64.decode(encoded, android.util.Base64.NO_WRAP), Charsets.UTF_8)
+                    }.getOrNull()
+                }
+                ?.trim()
+                ?.takeIf(String::isNotEmpty)
+                ?.let { text ->
+                    query.setText(text)
+                    query.setSelection(query.text.length)
+                    query.post { search(queryOverride = text) }
+                }
+        }
+    }
+
     override fun onPause() {
         handler.removeCallbacks(refresh)
         super.onPause()
@@ -262,9 +283,7 @@ class MainActivity : Activity() {
         DocumentIndexRuntimeGate.removeReleaseListener(documentIndexReleasedListener)
         GemmaRuntime.setPlannerWarmupStateListener(null)
         if (::resultGrid.isInitialized) {
-            featuredResultGrid.adapter = null
-            featuredResultAdapter?.dispose()
-            featuredResultAdapter = null
+            clearStandoutResults()
             resultGrid.adapter = null
             resultAdapter?.dispose()
             resultAdapter = null
@@ -709,11 +728,19 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         resultPanel.addView(featuredResultCount, matchWrap())
-        featuredResultGrid = createResultGrid()
-        resultPanel.addView(
-            featuredResultGrid,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(260)),
-        )
+        featuredResultSubtitle = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.rgb(91, 95, 110))
+            setPadding(dp(6), 0, dp(6), dp(8))
+            visibility = View.GONE
+        }
+        resultPanel.addView(featuredResultSubtitle, matchWrap())
+        featuredResultShowcase = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(6), 0, dp(6), dp(4))
+        }
+        resultPanel.addView(featuredResultShowcase, matchWrap())
         resultCount = TextView(this).apply {
             textSize = 14f
             setTextColor(Color.rgb(63, 66, 78))
@@ -987,11 +1014,7 @@ class MainActivity : Activity() {
             conversationPanel.removeAllViews()
             conversationPanel.visibility = View.GONE
         }
-        featuredResultGrid.adapter = null
-        featuredResultAdapter?.dispose()
-        featuredResultAdapter = null
-        featuredResultGrid.visibility = View.GONE
-        featuredResultCount.visibility = View.GONE
+        clearStandoutResults()
         resultGrid.adapter = null
         resultAdapter?.dispose()
         resultAdapter = null
@@ -1018,7 +1041,10 @@ class MainActivity : Activity() {
                     if (answerFeatureEnabledForSearch) {
                         renderResults(items.take(ANSWER_ENABLED_RESULT_LIMIT), generation, totalMatches)
                     } else {
-                        renderAnswerDisabledResults(items, generation, totalMatches)
+                        // The final response carries the validated QP intent and
+                        // episode joins. Until then, show rank only—never guess
+                        // the Standout 8 philosophy from result captions.
+                        renderResults(items.take(CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT), generation, totalMatches)
                     }
                 }
             },
@@ -1083,11 +1109,7 @@ class MainActivity : Activity() {
                     setModelLoading(false, "")
                     hideAnswerPipeline()
                     warmPlannerForNextSearch()
-                    featuredResultGrid.adapter = null
-                    featuredResultAdapter?.dispose()
-                    featuredResultAdapter = null
-                    featuredResultGrid.visibility = View.GONE
-                    featuredResultCount.visibility = View.GONE
+                    clearStandoutResults()
                     resultGrid.adapter = null
                     resultAdapter?.dispose()
                     resultAdapter = null
@@ -1119,7 +1141,7 @@ class MainActivity : Activity() {
                         totalMatches,
                     )
                 } else {
-                    renderAnswerDisabledResults(combinedResults, generation, totalMatches)
+                    renderAnswerDisabledResults(response, generation, totalMatches)
                 }
                 answer.visibility = View.GONE
                 if (!preserveConversation) conversationPanel.visibility = View.GONE
@@ -1325,7 +1347,7 @@ class MainActivity : Activity() {
         val phaseRows = listOf(
             "Query planning" to timings.queryPlanningMs,
             "Search / hybrid retrieval" to timings.searchMs,
-            "Top 8 context selection" to timings.diverseRerankingMs,
+            "Standout 8 selection" to timings.diverseRerankingMs,
             "Evidence curation" to timings.evidenceCurationMs,
             "Answer image preparation" to timings.answerImagePreparationMs,
             "Answer generation" to timings.answerGenerationMs,
@@ -1419,11 +1441,7 @@ class MainActivity : Activity() {
         generation: Long,
         totalMatches: Int = items.size,
     ) {
-        featuredResultAdapter?.dispose()
-        featuredResultAdapter = null
-        featuredResultGrid.adapter = null
-        featuredResultGrid.visibility = View.GONE
-        featuredResultCount.visibility = View.GONE
+        clearStandoutResults()
         resultAdapter = bindResultGrid(
             grid = resultGrid,
             current = resultAdapter,
@@ -1439,32 +1457,199 @@ class MainActivity : Activity() {
         resultCount.visibility = if (items.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    /** Search-only comparison: Top 8 is intentionally repeated inside the full Top 24 below. */
+    /** Intent-aware showcase selected from the complete fused Top 100. */
     private fun renderAnswerDisabledResults(
-        items: List<SearchResultItem>,
+        response: SearchResponse,
         generation: Long,
         totalMatches: Int,
     ) {
-        val overall = items.take(CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT)
-        val featured = overall.take(CrossEngineFusionPolicy.FEATURED_RESULT_LIMIT)
-        featuredResultAdapter = bindResultGrid(
-            grid = featuredResultGrid,
-            current = featuredResultAdapter,
-            items = featured,
-            generation = generation,
-            maxRows = 2,
+        val overallHybrid = response.mergedResults
+            .take(CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT)
+        val overall = overallHybrid.map {
+            it.toSearchResultItem(response.galleryCosineScores)
+        }
+        val standout = StandoutResultPolicy.select(
+            overall = overallHybrid,
+            profile = response.standoutIntent,
+            episodeGroups = response.standoutGroups,
         )
+        renderStandoutShowcase(standout, response.standoutIntent, generation)
         resultAdapter = bindResultGrid(
             grid = resultGrid,
             current = resultAdapter,
             items = overall,
             generation = generation,
-            maxRows = 6,
+            maxRows = 25,
         )
-        featuredResultCount.text = "Top 8 • fused across enabled indexes (${featured.size} available)"
-        featuredResultCount.visibility = if (featured.isEmpty()) View.GONE else View.VISIBLE
-        resultCount.text = "Top 24 overall • ${overall.size} of $totalMatches matches"
+        resultCount.text = "All results • ${overall.size} of $totalMatches matches"
         resultCount.visibility = if (overall.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun renderStandoutShowcase(
+        standouts: List<StandoutSearchResult>,
+        profile: StandoutIntentProfile,
+        generation: Long,
+    ) {
+        clearStandoutResults()
+        if (standouts.isEmpty()) return
+        standoutThumbnailLoader = StandoutThumbnailLoader(generation)
+        featuredResultCount.text = when (profile.primary) {
+            StandoutIntent.SCENERY -> "${standouts.size} standout moments"
+            StandoutIntent.PEOPLE -> "${standouts.size} standout people moments"
+            StandoutIntent.DOCUMENT -> "${standouts.size} strongest records"
+            StandoutIntent.LOCATION -> "${standouts.size} standout place moments"
+            StandoutIntent.TIME -> "${standouts.size} standout moments in time"
+        }
+        featuredResultSubtitle.text = when (profile.primary) {
+            StandoutIntent.SCENERY -> "Strong visual matches across different moments, settings and dates"
+            StandoutIntent.PEOPLE -> "Identity-matched moments across occasions, companions, places and dates"
+            StandoutIntent.DOCUMENT -> "Strong text matches across distinct records, sources and useful dates"
+            StandoutIntent.LOCATION -> "Representative coverage of the requested place across moments and dates"
+            StandoutIntent.TIME -> "Representative coverage of the requested period across places and moments"
+        }
+        featuredResultCount.visibility = View.VISIBLE
+        featuredResultSubtitle.visibility = View.VISIBLE
+        featuredResultShowcase.visibility = View.VISIBLE
+
+        featuredResultShowcase.addView(
+            createStandoutCard(standouts.first(), generation, imageHeightDp = 210, hero = true),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(8) },
+        )
+        addStandoutRow(standouts.drop(1).take(3), generation, imageHeightDp = 112)
+        addStandoutRow(standouts.drop(4).take(4), generation, imageHeightDp = 82)
+    }
+
+    private fun addStandoutRow(
+        standouts: List<StandoutSearchResult>,
+        generation: Long,
+        imageHeightDp: Int,
+    ) {
+        if (standouts.isEmpty()) return
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.TOP
+        }
+        standouts.forEachIndexed { index, standout ->
+            row.addView(
+                createStandoutCard(standout, generation, imageHeightDp, hero = false),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (index > 0) leftMargin = dp(5)
+                },
+            )
+        }
+        featuredResultShowcase.addView(
+            row,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(7) },
+        )
+    }
+
+    private fun createStandoutCard(
+        standout: StandoutSearchResult,
+        generation: Long,
+        imageHeightDp: Int,
+        hero: Boolean,
+    ): View {
+        val badgeText = buildString {
+            append(standout.badge)
+            if (standout.relatedCount > 0) append(" • +${standout.relatedCount} nearby")
+        }
+        val badge = TextView(this).apply {
+            text = badgeText
+            textSize = if (hero) 12f else 10f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(Color.rgb(52, 68, 157))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(7), dp(5), dp(7), dp(4))
+        }
+        val preview: View = when (val result = standout.result) {
+            is HybridSearchResult.Gallery -> ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setBackgroundColor(Color.rgb(224, 226, 233))
+                tag = result.media.mediaStoreId
+                contentDescription = badgeText
+                standoutThumbnailLoader?.request(result.media, this, generation)
+            }
+            is HybridSearchResult.Document -> TextView(this).apply {
+                val chunk = result.match.chunk
+                val excerpt = chunk.text.replace(Regex("\\s+"), " ").trim()
+                text = "${documentIcon(chunk.source)}\n${chunk.title.take(if (hero) 72 else 28)}\n" +
+                    excerpt.take(if (hero) 180 else 64)
+                gravity = Gravity.CENTER
+                textSize = if (hero) 15f else 10f
+                maxLines = if (hero) 7 else 5
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(Color.rgb(45, 50, 72))
+                setPadding(dp(9), dp(7), dp(9), dp(7))
+                background = roundedBackground(Color.rgb(232, 235, 249), dp(12).toFloat())
+            }
+        }
+        val detail = TextView(this).apply {
+            text = standoutDetail(standout.result)
+            textSize = if (hero) 13f else 10f
+            setTextColor(Color.rgb(55, 58, 70))
+            maxLines = if (hero) 2 else 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(7), dp(6), dp(7), dp(7))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(4), dp(3), dp(4), dp(4))
+            background = roundedBackground(
+                color = if (hero) Color.rgb(244, 246, 255) else Color.rgb(248, 249, 252),
+                radius = dp(if (hero) 20 else 15).toFloat(),
+                strokeColor = if (hero) Color.rgb(197, 204, 239) else Color.rgb(229, 231, 239),
+            )
+            addView(badge, matchWrap())
+            addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(imageHeightDp)))
+            addView(detail, matchWrap())
+            contentDescription = "$badgeText. ${detail.text}"
+            setOnClickListener {
+                when (val result = standout.result) {
+                    is HybridSearchResult.Gallery -> showGalleryPopup(result.media)
+                    is HybridSearchResult.Document -> showDocumentPopup(result.match)
+                }
+            }
+        }
+    }
+
+    private fun standoutDetail(result: HybridSearchResult): String = when (result) {
+        is HybridSearchResult.Document -> {
+            val chunk = result.match.chunk
+            "${chunk.source.displayName} • ${chunk.title.ifBlank { "Personal record" }}"
+        }
+        is HybridSearchResult.Gallery -> buildString {
+            val media = result.media
+            append(if (media.mimeType.startsWith("video/", true)) "Video" else "Photo")
+            val timestamp = media.dateTakenMs
+                ?: media.dateModifiedSeconds.takeIf { it > 0L }?.times(1_000L)
+            timestamp?.let {
+                append(" • ")
+                append(
+                    java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy")
+                        .format(java.time.Instant.ofEpochMilli(it).atZone(java.time.ZoneId.systemDefault())),
+                )
+            }
+            (media.locationName ?: media.location)?.takeIf(String::isNotBlank)?.let {
+                append(" • ${it.take(36)}")
+            }
+            media.personLabel?.takeIf(String::isNotBlank)?.let {
+                append(" • ${it.take(28)}")
+            }
+        }
+    }
+
+    private fun clearStandoutResults() {
+        standoutThumbnailLoader?.dispose()
+        standoutThumbnailLoader = null
+        if (::featuredResultShowcase.isInitialized) {
+            featuredResultShowcase.removeAllViews()
+            featuredResultShowcase.visibility = View.GONE
+        }
+        if (::featuredResultCount.isInitialized) featuredResultCount.visibility = View.GONE
+        if (::featuredResultSubtitle.isInitialized) featuredResultSubtitle.visibility = View.GONE
     }
 
     private fun bindResultGrid(
@@ -1494,12 +1679,8 @@ class MainActivity : Activity() {
         }
         grid.adapter = null
         current?.dispose()
-        val cacheKb = if (grid === featuredResultGrid) {
-            FEATURED_THUMBNAIL_CACHE_KB
-        } else {
-            RESULT_THUMBNAIL_CACHE_KB
-        }
-        return SearchResultAdapter(items, generation, cacheKb).also { grid.adapter = it }
+        return SearchResultAdapter(items, generation, RESULT_THUMBNAIL_CACHE_KB)
+            .also { grid.adapter = it }
     }
 
     /** Shows the answer's exact gallery inputs instead of the broad result set. */
@@ -1510,11 +1691,7 @@ class MainActivity : Activity() {
         resultAdapter = null
         resultGrid.adapter = null
         resultGrid.visibility = View.GONE
-        featuredResultAdapter?.dispose()
-        featuredResultAdapter = null
-        featuredResultGrid.adapter = null
-        featuredResultGrid.visibility = View.GONE
-        featuredResultCount.visibility = View.GONE
+        clearStandoutResults()
         resultCount.visibility = View.GONE
     }
 
@@ -1544,6 +1721,58 @@ class MainActivity : Activity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { bottomMargin = dp(8) })
+        }
+    }
+
+    private inner class StandoutThumbnailLoader(
+        private val generation: Long,
+    ) {
+        private val requested = HashSet<Long>()
+        private val thumbnails = object : LruCache<Long, Bitmap>(STANDOUT_THUMBNAIL_CACHE_KB) {
+            override fun sizeOf(key: Long, value: Bitmap): Int =
+                (value.allocationByteCount / 1024).coerceAtLeast(1)
+
+            override fun entryRemoved(
+                evicted: Boolean,
+                key: Long,
+                oldValue: Bitmap,
+                newValue: Bitmap?,
+            ) {
+                if (oldValue !== newValue && !oldValue.isRecycled) oldValue.recycle()
+            }
+        }
+        private var disposed = false
+
+        fun request(media: GalleryMedia, target: ImageView, requestGeneration: Long) {
+            val cached = thumbnails.get(media.mediaStoreId)
+            if (cached != null && !cached.isRecycled) {
+                target.setImageBitmap(cached)
+                return
+            }
+            if (disposed || requestGeneration != generation || !requested.add(media.mediaStoreId)) return
+            galleryIndexer.loadThumbnailAsync(media) { result ->
+                val bitmap = result.getOrNull()
+                runOnUiThread {
+                    requested -= media.mediaStoreId
+                    if (
+                        bitmap == null || disposed || generation != searchGeneration ||
+                        isFinishing || isDestroyed
+                    ) {
+                        if (bitmap != null && !bitmap.isRecycled) bitmap.recycle()
+                        return@runOnUiThread
+                    }
+                    thumbnails.put(media.mediaStoreId, bitmap)
+                    if (target.tag == media.mediaStoreId && !bitmap.isRecycled) {
+                        target.setImageBitmap(bitmap)
+                    }
+                }
+            }
+        }
+
+        fun dispose() {
+            disposed = true
+            requested.clear()
+            thumbnails.evictAll()
         }
     }
 
@@ -2324,11 +2553,13 @@ class MainActivity : Activity() {
     )
 
     companion object {
+        private const val DEBUG_SUBMIT_SEARCH_ACTION = "com.ravi.askgalaxy.DEBUG_SUBMIT_SEARCH"
+        private const val DEBUG_SUBMIT_SEARCH_QUERY_BASE64 = "query_base64"
         private const val GALLERY_PERMISSION_REQUEST = 1001
         private const val LOCATION_PERMISSION_REQUEST = 1002
         private const val ANSWER_ENABLED_RESULT_LIMIT = 16
         private const val MAX_SOURCE_DETAIL_CHARS = 1_400
-        private const val FEATURED_THUMBNAIL_CACHE_KB = 8 * 1024
+        private const val STANDOUT_THUMBNAIL_CACHE_KB = 12 * 1024
         private const val RESULT_THUMBNAIL_CACHE_KB = 24 * 1024
         private const val STALE_WORKER_TIMEOUT_MS = 2 * 60 * 1_000L
     }

@@ -196,10 +196,15 @@ class GalleryIndexer(context: Context) {
                             timings,
                         ),
                     )
-                    // The app is currently in QP + validator + search-result
-                    // mode. Do not spend time or memory building answer
-                    // evidence, diversity context, or follow-up state.
+                    // Search-only still needs the bounded episode join that
+                    // makes the Standout 8 represent different query-valid
+                    // moments. It does not build answer context or follow-up state.
                     if (!searchExecution.needsAnswer) {
+                        val standoutStarted = System.nanoTime()
+                        val standoutBuild = evidenceBuilder.build(query, globalWindow.gallery)
+                        timings = timings.copy(
+                            diverseRerankingMs = elapsedMs(standoutStarted, System.nanoTime()),
+                        )
                         return@runCatching SearchResponse(
                             gallery = globalWindow.gallery,
                             totalGalleryMatches = candidates.size,
@@ -211,6 +216,8 @@ class GalleryIndexer(context: Context) {
                             answerFeatureEnabled = searchExecution.answerFeatureEnabled,
                             needsAnswer = false,
                             answerEvidenceScope = searchExecution.answerEvidenceScope,
+                            standoutGroups = standoutBuild.contextGroups,
+                            standoutIntent = searchExecution.standoutIntent,
                             timings = timings,
                             documentMatches = globalWindow.documents,
                             totalDocumentMatches = searchExecution.documentMatches.size,
@@ -288,6 +295,8 @@ class GalleryIndexer(context: Context) {
                                 it.media.mediaStoreId == group.representative.mediaStoreId
                             }
                         },
+                        standoutGroups = evidenceBuild.contextGroups,
+                        standoutIntent = searchExecution.standoutIntent,
                         evidenceGroupingMode = evidenceBuild.groupingMode,
                         plannerSession = searchExecution.plannerSession,
                         plannerJson = searchExecution.plannerJson,
@@ -1106,8 +1115,9 @@ class GalleryIndexer(context: Context) {
         // applies to the next query and never mutates or rebuilds an index.
         val indexSearchScope = IndexSearchScopePreferences.selected(appContext)
         val answerFeatureEnabled = AnswerFeaturePreferences.isEnabled(appContext)
-        val plannerProtocol = QueryPlannerProtocolPreferences.selected(appContext)
-        val communicationIntent = CallLogQueryPolicy.legacyPlanOverride(plannerProtocol, query)
+        // Both retained planner syntaxes are fully model-authored. No local
+        // intent router may replace or rewrite E2B's validated plan.
+        val communicationIntent: CallLogQueryPolicy.Intent? = null
         val plannerQuery = communicationIntent?.let {
             CallLogQueryPolicy.canonicalPlannerQuery(query)
         } ?: query
@@ -1249,30 +1259,11 @@ class GalleryIndexer(context: Context) {
         }
         run {
             val scopedSemanticQueries = (plan.semanticQueries + plan.assertions)
-                .map {
-                    sanitizeSemanticQuery(
-                        it,
-                        personLabels + excludedPersonLabels,
-                        plan.locationHint,
-                        plan.mediaType,
-                    )
-                }
+                .map(String::trim)
                 .filter(String::isNotBlank)
                 .distinctBy { it.lowercase() }
             val negativeSemanticQueries = plan.negativeSemanticQueries
-                .filterNot { containsAnyPlanTerm(it, excludedPersonLabels) }
-            val resolvedExecutionSpec = plan.executionSpec?.let { spec ->
-                normalizeExecutionSpec(
-                    spec = spec,
-                    includedPeople = personLabels,
-                    excludedPeople = excludedPersonLabels,
-                    locationHint = plan.locationHint,
-                    mediaType = plan.mediaType,
-                )
-            }
-            val identitySafeExecutionSpec = resolvedExecutionSpec?.let {
-                ensureIdentityOcrTerms(it, resolvedSearchQuery)
-            }
+            val identitySafeExecutionSpec = plan.executionSpec
             val effectivePlan = plan.copy(
                 semanticQueries = scopedSemanticQueries,
                 personNames = personLabels,
@@ -1304,6 +1295,7 @@ class GalleryIndexer(context: Context) {
                     answerEvidenceScope = effectivePlan.answerEvidenceScope,
                     ocrKeywords = effectivePlan.keywordTerms.flatMap(OcrKeywordPolicy::keywords),
                     documentMatches = emptyList(),
+                    standoutIntent = StandoutIntentProfile.fromPlan(effectivePlan),
                 )
             }
             val renderedExecutionSpec = executionSpec.render()
@@ -1445,6 +1437,7 @@ class GalleryIndexer(context: Context) {
                 answerEvidenceScope = effectivePlan.answerEvidenceScope,
                 ocrKeywords = effectivePlan.keywordTerms.flatMap(OcrKeywordPolicy::keywords),
                 documentMatches = documentMatches,
+                standoutIntent = StandoutIntentProfile.fromPlan(effectivePlan),
             )
         }
     }
@@ -2693,7 +2686,7 @@ class GalleryIndexer(context: Context) {
         // LiteRT-LM 0.14 has no per-request max-output-token control. This is
         // an explicit model contract, and the runtime records any overrun.
         private const val MAX_ANSWER_GENERATED_TOKENS = 50
-        private const val UI_RESULT_LIMIT = 16
+        private const val UI_RESULT_LIMIT = CrossEngineFusionPolicy.OVERALL_RESULT_LIMIT
         private const val MAX_EVIDENCE_LOG_CHARS = 600
         private const val MAX_FOLLOW_UPS = 2
         private const val MAX_NEXT_BRIEFS = 2
@@ -2772,6 +2765,7 @@ class GalleryIndexer(context: Context) {
         val answerEvidenceScope: AnswerEvidenceScope,
         val ocrKeywords: List<String>,
         val documentMatches: List<DocumentMatch>,
+        val standoutIntent: StandoutIntentProfile,
     )
 
     private data class GlobalSearchWindow(

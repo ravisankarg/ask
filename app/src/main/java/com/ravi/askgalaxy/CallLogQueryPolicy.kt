@@ -81,16 +81,9 @@ internal object CallLogQueryPolicy {
         )
     }
 
-    /**
-     * V1 compatibility only. V2 is a model-authored typed plan and must never
-     * be replaced by this legacy natural-language router after validation.
-     */
+    /** Retained for source compatibility; model-authored planners are never overridden. */
     fun legacyPlanOverride(protocol: QueryPlannerProtocol, query: String): Intent? =
-        if (protocol == QueryPlannerProtocol.V1) {
-            detect(query) ?: detectMessage(query)
-        } else {
-            null
-        }
+        null
 
     private fun temporalScope(normalized: String): String = Regex(
         "(?i)\\b(?:last|this|previous)\\s+(?:week|month|year|day)\\b|\\b(?:today|yesterday|tomorrow)\\b",

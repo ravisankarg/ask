@@ -223,11 +223,11 @@ class QueryAndDiversityContractTest {
         assertTrue(prompt.contains("exactly one [query_category == value]"))
         assertTrue(prompt.contains("exactly one [answer_needed == true|false]"))
         assertTrue(prompt.contains("Do not emit ocr"))
-        assertTrue(prompt.contains("Visual/gallery intent never uses keyword"))
-        assertTrue(prompt.contains("Phone/file lifecycle words"))
+        assertTrue(prompt.contains("Visual/gallery search never uses keyword"))
+        assertTrue(prompt.contains("OTHER SOURCES AND ANSWERS"))
         assertTrue(prompt.contains("Every predicate is exactly [field == value]"))
         assertTrue(prompt.contains("cycling in rain"))
-        assertTrue(prompt.contains("BR Hills"))
+        assertTrue(prompt.contains("beach photos in Chennai"))
         assertTrue(prompt.contains("Ravi passport number"))
         assertTrue(prompt.contains("[keyword == {Ravi} && {passport}]"))
         assertTrue(prompt.length < 8_000)
@@ -306,7 +306,7 @@ class QueryAndDiversityContractTest {
 
         assertTrue(prompt.contains("RESOLVED_QUERY: <the standalone"))
         assertTrue(prompt.contains("[from_date == 2023-08-22]"))
-        assertTrue(prompt.contains("current_query=recent trip"))
+        assertTrue(prompt.contains("An unnamed trip/vacation/travel uses [travel == outside_normal]"))
         assertTrue(prompt.contains("Every without/excluding/except/but not/not/no clause"))
 
         val groupedExclusion = ModelAuthoredPlanStructure.compile(

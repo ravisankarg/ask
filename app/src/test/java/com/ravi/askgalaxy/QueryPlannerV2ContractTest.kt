@@ -101,41 +101,21 @@ class QueryPlannerV2ContractTest {
     fun prompt_removes_requested_answer_slots_from_retrieval_terms() {
         val instruction = QueryPlannerV2.systemInstruction
 
-        assertTrue(instruction.contains("Ask Galaxy Query Planner V2.5"))
-        assertTrue(instruction.contains("ANSWER-SLOT GATE"))
-        assertTrue(instruction.contains("each term VALUE contains only the evidence subject to retrieve"))
-        assertTrue(instruction.contains("electricity bill amount -> electricity bill"))
-        assertTrue(instruction.contains("hotel booking confirmation number -> hotel booking"))
-        assertTrue(instruction.contains("flight ticket departure time -> flight ticket"))
-        assertTrue(instruction.contains("Ravi phone number -> Ravi + phone"))
-        assertTrue(instruction.contains("Ramani email address -> Ramani + email"))
-        assertTrue(
-            instruction.contains(
-                "{\"v\":2,\"q\":\"electricity bill amount\",\"intent\":\"answer:text\",\"ops\":[[\"term\",\"electricity bill\",\"semantic+all\"]]}",
-            ),
-        )
-        assertTrue(
-            instruction.contains(
-                "{\"v\":2,\"q\":\"flight ticket departure time\",\"intent\":\"answer:date\",\"ops\":[[\"term\",\"flight ticket\",\"semantic+all\"]]}",
-            ),
-        )
+        assertTrue(instruction.contains("Ask Galaxy Query Planner V2.10"))
+        assertTrue(instruction.contains("OTHER SOURCES"))
+        assertTrue(instruction.contains("remove answer-slot words"))
+        assertTrue(instruction.contains("written me/my uses self_term"))
     }
 
     @Test
     fun prompt_routes_phone_source_intent_without_searching_routing_verbs() {
         val instruction = QueryPlannerV2.systemInstruction
 
-        assertTrue(instruction.contains("SOURCE-INTENT GATE"))
-        assertTrue(instruction.contains("call/called/calling/dialed -> media call_logs"))
-        assertTrue(instruction.contains("text/texted/SMS -> media sms"))
-        assertTrue(instruction.contains("message/messaged/chat/chatted -> media messages"))
-        assertTrue(instruction.contains("calendar/event/appointment/meeting/scheduled -> media calendar"))
-        assertTrue(instruction.contains("A query without source intent emits no media and searches all sources"))
-        assertTrue(
-            instruction.contains(
-                "{\"v\":2,\"q\":\"Ravi called me yesterday\",\"intent\":\"browse\",\"ops\":[[\"media\",\"call_logs\"],[\"term\",\"Ravi\",\"all\"],[\"calendar_date\",\"yesterday\"]]}",
-            ),
-        )
+        assertTrue(instruction.contains("OTHER SOURCES"))
+        assertTrue(instruction.contains("call/dialed -> media call_logs"))
+        assertTrue(instruction.contains("text/SMS -> media sms"))
+        assertTrue(instruction.contains("message/chat -> media messages"))
+        assertTrue(instruction.contains("appointment/meeting/calendar -> media calendar"))
         assertFalse(instruction.contains("[\"term\",\"called\""))
     }
 
@@ -234,7 +214,7 @@ class QueryPlannerV2ContractTest {
         )
         assertFalse(repair.contains(bad))
         assertFalse(repair.contains("invalid_output="))
-        assertTrue(repair.contains("prior answer was rejected and is intentionally omitted"))
+        assertTrue(repair.contains("prior answer was rejected and omitted"))
         assertTrue(repair.contains("validator_error="))
     }
 
@@ -252,23 +232,138 @@ class QueryPlannerV2ContractTest {
     }
 
     @Test
-    fun v1_rollback_remains_available_beside_v25() {
+    fun gallery_prompt_encodes_live_failure_learnings_without_local_plan_authoring() {
+        val instruction = QueryPlannerV2.systemInstruction
+
+        assertTrue(instruction.contains("You alone author the plan"))
+        assertTrue(instruction.contains("executes your operations unchanged"))
+        assertTrue(instruction.contains("SILENTLY BUILD A COVERAGE LEDGER BEFORE JSON"))
+        assertTrue(instruction.contains("preserve all remaining visual meaning in exactly one compound"))
+        assertTrue(instruction.contains("only/alone/just fills PEOPLE_ONLY"))
+        assertTrue(instruction.contains("last/past/since NUMBER units"))
+        assertTrue(instruction.contains("no meaningful requested content may be missing"))
+    }
+
+    @Test
+    fun validator_rejects_wrong_face_invented_self_lost_media_and_scene_ocr() {
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"Ramani photos","intent":"browse","ops":[["person_ref","F0"],["media","photos"]]}""",
+                currentQuery = "Ramani photos",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"photos last 3 years","intent":"browse","ops":[["self"],["media","photos"],["relative_date","last","N0","years"]]}""",
+                currentQuery = "photos last 3 years",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"sunset pictures","intent":"browse","ops":[["term","sunset","semantic"]]}""",
+                currentQuery = "sunset pictures",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"cycling in rain","intent":"browse","ops":[["term","cycling in rain","semantic+all"]]}""",
+                currentQuery = "cycling in rain",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"cycling in rain","intent":"browse","ops":[["term","cycling","semantic"],["term","rain","semantic"]]}""",
+                currentQuery = "cycling in rain",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"red car","intent":"answer:text","ops":[["term","red car","semantic+all"]]}""",
+                currentQuery = "red car",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"beach photos","intent":"browse","ops":[["media","photos"],["location","beach"]]}""",
+                currentQuery = "beach photos",
+            )
+        }
+    }
+
+    @Test
+    fun validator_rejects_corrupted_digits_and_missing_date_or_sort_operations() {
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"photos before January 20","intent":"browse","ops":[["media","photos"]]}""",
+                currentQuery = "photos before January 2025",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"photos this week","intent":"browse","ops":[["media","photos"]]}""",
+                currentQuery = "photos this week",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            compile(
+                raw = """{"v":2,"q":"latest vacation pictures","intent":"browse","ops":[["media","photos"],["travel","outside_normal"]]}""",
+                currentQuery = "latest vacation pictures",
+            )
+        }
+    }
+
+    @Test
+    fun valid_e2b_gallery_operations_pass_validation_unchanged() {
+        val sunset = compile(
+            raw = """{"v":2,"q":"sunset pictures","intent":"browse","ops":[["media","photos"],["term","sunset","semantic"]]}""",
+            currentQuery = "sunset pictures",
+        )
+        assertEquals(listOf("sunset"), sunset.plan.semanticQueries)
+        assertEquals(QueryMediaType.PHOTOS, sunset.plan.mediaType)
+
+        val beachInChennai = compile(
+            raw = """{"v":2,"q":"beach photos in Chennai","intent":"browse","ops":[["media","photos"],["location","Chennai"],["term","beach","semantic"]]}""",
+            currentQuery = "beach photos in Chennai",
+        )
+        assertEquals("Chennai", beachInChennai.plan.locationHint)
+        assertEquals(listOf("beach"), beachInChennai.plan.semanticQueries)
+
+        val thisWeek = compile(
+            raw = """{"v":2,"q":"photos this week","intent":"browse","ops":[["media","photos"],["calendar_period","this","week"]]}""",
+            currentQuery = "photos this week",
+        )
+        assertEquals("2026-08-17", thisWeek.plan.fromDate)
+        assertEquals("2026-08-22", thisWeek.plan.toDate)
+
+        val excludedPerson = compile(
+            raw = """{"v":2,"q":"photos of Ramani without Ravi","intent":"browse","ops":[["media","photos"],["person_ref","F1"],["not_person_ref","F0"]]}""",
+            currentQuery = "photos of Ramani without Ravi",
+        )
+        assertEquals(listOf("Ramani"), excludedPerson.plan.personNames)
+        assertEquals(listOf("Ravi"), excludedPerson.plan.excludedPersonNames)
+
+        val excludedScene = compile(
+            raw = """{"v":2,"q":"photos at Goa excluding beach","intent":"browse","ops":[["media","photos"],["location","Goa"],["not_term","beach"]]}""",
+            currentQuery = "photos at Goa excluding beach",
+        )
+        assertEquals(listOf("beach"), excludedScene.plan.negativeSemanticQueries)
+    }
+
+    @Test
+    fun v1_rollback_remains_available_beside_v210() {
         val v1 = QueryPlannerRuntime.plannerSystemInstruction(QueryPlannerProtocol.V1)
         val v2 = QueryPlannerRuntime.plannerSystemInstruction(QueryPlannerProtocol.V2)
         assertTrue(v1.contains("RESOLVED_QUERY:"))
-        assertTrue(v2.contains("Query Planner V2.5"))
-        assertTrue(v2.contains("EXACT FIXED-ARITY OPERATIONS"))
+        assertTrue(v2.contains("Query Planner V2.10"))
+        assertTrue(v2.contains("EXACT OPERATION FORMS"))
         assertTrue(v2.contains("semantic+all"))
         assertTrue(v2.length < 8_000)
     }
 
     @Test
-    fun communication_router_cannot_replace_a_v2_model_plan() {
+    fun communication_router_cannot_replace_either_model_authored_plan() {
         assertNull(CallLogQueryPolicy.legacyPlanOverride(QueryPlannerProtocol.V2, "messages about cycling"))
-        assertEquals(
-            DocumentSource.MESSAGES,
-            CallLogQueryPolicy.legacyPlanOverride(QueryPlannerProtocol.V1, "messages about cycling")?.source,
-        )
+        assertNull(CallLogQueryPolicy.legacyPlanOverride(QueryPlannerProtocol.V1, "messages about cycling"))
     }
 
     private fun compile(

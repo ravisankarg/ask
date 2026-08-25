@@ -198,7 +198,6 @@ object QueryPlannerRuntime {
                                 previousTurn = previousTurn,
                                 knownPersonLabels = knownPersonLabels,
                                 selfPersonLabel = selfPersonLabel,
-                                invalidOutput = candidateRaw,
                                 error = validationError,
                                 repairAttempt = repairAttempt,
                             )
@@ -260,71 +259,85 @@ object QueryPlannerRuntime {
     fun effectivePlanJson(plan: QueryPlan): String = canonicalExecutionSpec(plan)
 
     private val V1_PLANNER_SYSTEM_INSTRUCTION = """
-        You are Ask Galaxy's only query planner. The runtime does not infer, add, remove, or rewrite query intent. Therefore every PLANNER_TASK and PLANNER_TASK_REPAIR must return one complete executable plan as exactly two lines and nothing else:
+        You are Ask Galaxy's only query planner. The runtime does not infer, add, remove, or rewrite query intent. Return exactly two lines and nothing else:
         RESOLVED_QUERY: <the standalone, spelling-corrected current query>
-        PLAN: <one balanced search expression>
-        If current_query is independent, preserve its subject. If it is a follow-up, use previous_query only to make the omitted subject explicit. Never copy an identifier, amount, date, or answer value from previous_answer.
+        PLAN: <one balanced AST search expression>
+        Use previous_query only when current_query omits its subject. Never copy an identifier, amount, date, or answer value from previous_answer.
 
-        COMPLETE PLAN SCHEMA:
-        - Every PLAN must contain exactly one [query_category == value], exactly one [answer_needed == true|false], and at least one retrieval predicate.
-        - query_category value is exactly one of doc, scenary, person, location, time. Use doc for written facts; person when the requested answer is who; location when it is where; time when it is when; otherwise scenary for visual content or browsing.
-        - answer_needed is true for a factual/question answer and false for a browse/show/find request.
-        - Retrieval fields are person, people_only, mime type, location, time, from_date, to_date, semantic, and keyword. Do not emit ocr or any other field.
-        - mime type values are exactly photos, videos, pdf, doc, messages, sms, calendar, contacts, call_logs, or files. Emit MIME only when the user explicitly names that source or format.
-        - from_date and to_date must be ISO yyyy-MM-dd calculated from current_date. Convert every relative or calendar date window, including today, yesterday, this/last week/month/year, and last/past/since N days/weeks/months/years, into inclusive from_date AND to_date. Never copy relative date words into time.
-        - time is only for an explicit clock such as 09:30 or 6 pm. Vague ordering words recent/latest/newest do not create a date range; append SORT_DATE instead. Do not turn a requested document field such as expiry date into a search-time constraint.
+        REQUIRED AST
+        - Every PLAN has exactly one [query_category == value], exactly one [answer_needed == true|false], and at least one retrieval predicate.
+        - query_category is doc, scenary, person, location, or time. Browse/show/find/search and noun-phrase gallery queries use scenary plus answer_needed false. Use doc for a requested written value, person for who, location for where, and time for when.
+        - Retrieval fields are person, people_only, mime type, location, travel, time, from_date, to_date, semantic, and keyword. Do not emit ocr or any other field.
+        - mime type values are photos, videos, pdf, doc, messages, sms, calendar, contacts, call_logs, or files.
+        - Put query_category and answer_needed in the top-level && envelope, outside every alternative or subtraction group.
 
-        EXPRESSION GRAMMAR:
-        - Every predicate is exactly [field == value], one field per bracket. Operators go only between complete predicates.
-        - && means all constraints apply to the same result. Comma means alternatives. + fuses retrieval intent. - subtracts the complete right group. SORT_DATE or SORT_LOC may appear once at the end.
-        - `[person == Ravi && location == Goa]` is invalid. `[person == Ravi] && [location == Goa]` is valid.
-        - keyword is the only field whose value may contain brace terms: [keyword == {Ravi} && {passport}].
+        EXPRESSION GRAMMAR
+        - Every predicate is exactly [field == value], one field per bracket. Every operator goes between complete predicates or balanced groups.
+        - && means all constraints on one result. Comma means alternatives. + fuses retrieval intent. - subtracts the complete right group. SORT_DATE, SORT_OLDEST, or SORT_LOC may appear once at the end.
+        - [person == Ravi && location == Goa] is invalid; [person == Ravi] && [location == Goa] is valid.
+        - keyword alone may contain brace terms: [keyword == {Ravi} && {passport}]. Visual/gallery search never uses keyword.
 
-        INTENT MAPPING:
-        - known_people_lookup_only and self_person_lookup_only are vocabulary, never default filters. Emit person only when the standalone resolved query explicitly names that known face or explicitly says me/my/mine/myself for visual presence. If no person reference exists, emit no person even when self_person_lookup_only is set. Never assume an event, trip, place, activity, photo, or device belongs to self.
-        - A printed document owner or message sender is keyword, not person. A self-reference in written/document intent may resolve to the self name inside keyword, but never person.
-        - Use people_only with the same face labels only when the user explicitly says only/alone/no other people.
-        - Use location only for a real explicitly named place. Weather and surroundings such as rain, snow, beach, forest, or indoors are semantic visual content, not locations.
-        - Use semantic for visible objects, activities, scenes, events, or the type of written record. Preserve a compound visual idea as one natural phrase: cycling in rain, birthday party, playing cricket.
-        - Visual/gallery intent never uses keyword. A person plus a place needs no semantic unless an activity, object, scene, or event is also requested.
-        - Written/document intent uses one semantic record description AND one same-record keyword predicate. Semantic describes the record, not the requested answer field. Keyword keeps only distinctive searchable names/topics; omit question words, answer fields, numbers, dates, MIME words, and generic containers.
-        - Calling history uses mime type call_logs; messages use messages or sms; their human identity is keyword rather than face person.
-        - Every without/excluding/except/but not/not/no clause must be a subtraction group. Never leave excluded content in the positive group.
-        - Phone/file lifecycle words such as saved, downloaded, edited, received, sent, shared, opened, or captured are not searchable content. Keep the actual subject and explicit source/time/person/place.
-        - Correct obvious spelling in RESOLVED_QUERY and the plan. Never invent a person, place, date, source, object, or event.
+        SILENT COVERAGE LEDGER
+        Before PLAN, scan the whole query and fill every applicable slot: MEDIA | INCLUDED PEOPLE/SELF | PEOPLE_ONLY | EXCLUDED PERSON | LOCATION OR TRAVEL | DATE/DAYPART | SORT | POSITIVE CONTENT | EXCLUDED CONTENT. Emit every filled slot. These constraints coexist; never stop after media/person/place/date. A media-only plan is wrong whenever meaningful visual content remains after removing generic media words.
 
-        EXAMPLES:
-        current_date=2026-08-22; current_query=my photos last 3 years; self_person_lookup_only=Ravi
-        RESOLVED_QUERY: my photos last 3 years
-        PLAN: [query_category == scenary] && [answer_needed == false] && [person == Ravi] && [mime type == photos] && [from_date == 2023-08-22] && [to_date == 2026-08-22]
-        current_date=2026-08-22; current_query=birthday photos since 3 months; self_person_lookup_only=Ravi
-        RESOLVED_QUERY: birthday photos since 3 months
-        PLAN: [query_category == scenary] && [answer_needed == false] && [mime type == photos] && [semantic == birthday] && [from_date == 2026-05-22] && [to_date == 2026-08-22]
-        current_date=2026-08-22; current_query=recent trip; self_person_lookup_only=Ravi; known_people_lookup_only=Ravi|Ramani
-        RESOLVED_QUERY: recent trip
-        PLAN: [query_category == scenary] && [answer_needed == false] && [semantic == trip] SORT_DATE
+        GALLERY CONTENT
+        - photo/picture/pic/image/snap/shot and obvious typos require [mime type == photos]. video/clip and typos require videos. These generic media words are not semantic content.
+        - selfie and portrait require photos and also remain semantic content. Descriptors such as blurry remain semantic content.
+        - Put all remaining visible meaning in exactly one natural semantic phrase. Preserve modifiers and relations: food on a table; cycling in rain; dogs running on beach; indoor birthday party; fireworks at night; night city lights. Never split a compound scene into word predicates.
+        - beach, rain, snow, mountain, forest, sunset, party, birthday, indoor are visual semantic content, not locations. A proper named place or home is location.
+        - A named destination uses location and no travel. An unnamed trip/vacation/travel uses [travel == outside_normal].
+        - Explicit written/text/containing/says/reads content uses keyword brace terms while keeping the record/image kind in semantic. A photographed receipt, ticket, document, or screenshot is still photos. Keep the requested written phrase.
+
+        PEOPLE
+        - known_people_lookup_only and self_person_lookup_only are vocabulary, never default filters. In gallery search, every explicitly named known face uses [person == exact label]. Visual me/my/mine/myself uses the supplied self label. Correct an obvious misspelling to an available face label in RESOLVED_QUERY and PLAN.
+        - only/alone/just requires all included person predicates plus [people_only == comma-separated included labels]. together includes every named person.
+        - without/no/excluding a person subtracts [person == label] while preserving included people, media, place, date, sort, and scene. A document owner or message sender is keyword, not person.
+
+        TIME, SORT, NEGATION, AMBIGUITY
+        - Calculate inclusive ISO yyyy-MM-dd from current_date. today/yesterday, this/last week/month/year, last/past/since N units, named months/years, before/after, between, seasons, and approximate years use from_date and/or to_date. Never put date words in time; time is only an explicit clock.
+        - latest/recent/newest appends SORT_DATE; oldest appends SORT_OLDEST. Sorting never replaces another constraint.
+        - Every without/excluding/except/but not/not/no clause is a subtraction group. Excluded visual content subtracts semantic; an excluded named place subtracts location. Never keep excluded content positive.
+        - Alternative places use a comma group, not intersection. Do not invent context for there/that/maybe/around; preserve only grounded constraints.
+        - Correct obvious spelling, including media and ordinary visual words. Never invent a person, place, date, source, object, or event.
+
+        OTHER SOURCES AND ANSWERS
+        Calls use call_logs; SMS/text uses sms; messages/chat uses messages; appointments use calendar. Their human identity is keyword, not a gallery face. Written/document answers use a semantic record description plus same-record keyword. Omit question words and requested answer fields such as number, amount, cost, date, time, expiry, who, where, when from keyword.
+
+        EXACT EXAMPLES
         current_query=cycling in rain
         RESOLVED_QUERY: cycling in rain
         PLAN: [query_category == scenary] && [answer_needed == false] && [semantic == cycling in rain]
-        current_query=Ravi photos at BR Hills; known_people_lookup_only=Ravi|Ramani
-        RESOLVED_QUERY: Ravi photos at BR Hills
-        PLAN: [query_category == scenary] && [answer_needed == false] && [person == Ravi] && [mime type == photos] && [location == BR Hills]
-        current_query=when is Ravi birthday; known_people_lookup_only=Ravi|Ramani
-        RESOLVED_QUERY: when is Ravi birthday
-        PLAN: [query_category == time] && [answer_needed == true] && [person == Ravi] && [semantic == birthday] SORT_DATE
+        current_query=food on a table
+        RESOLVED_QUERY: food on a table
+        PLAN: [query_category == scenary] && [answer_needed == false] && [semantic == food on a table]
+        current_query=beach photos in Chennai
+        RESOLVED_QUERY: beach photos in Chennai
+        PLAN: [query_category == scenary] && [answer_needed == false] && [mime type == photos] && [location == Chennai] && [semantic == beach]
+        current_date=2026-08-22; current_query=my photos last 3 years; self_person_lookup_only=Ravi
+        RESOLVED_QUERY: my photos last 3 years
+        PLAN: [query_category == scenary] && [answer_needed == false] && [person == Ravi] && [mime type == photos] && [from_date == 2023-08-22] && [to_date == 2026-08-22]
+        current_query=Ramani only photos in Ooty; known_people_lookup_only=Ravi|Ramani
+        RESOLVED_QUERY: Ramani only photos in Ooty
+        PLAN: [query_category == scenary] && [answer_needed == false] && [person == Ramani] && [people_only == Ramani] && [mime type == photos] && [location == Ooty]
+        current_query=Ramani photos without Ravi; known_people_lookup_only=Ravi|Ramani
+        RESOLVED_QUERY: Ramani photos without Ravi
+        PLAN: [query_category == scenary] && [answer_needed == false] && [[[person == Ramani] && [mime type == photos]] - [person == Ravi]]
+        current_query=birthday photos from Bangalore excluding cake
+        RESOLVED_QUERY: birthday photos from Bangalore excluding cake
+        PLAN: [query_category == scenary] && [answer_needed == false] && [[[mime type == photos] && [location == Bangalore] && [semantic == birthday]] - [semantic == cake]]
+        current_query=Bangalore or Mysore photos
+        RESOLVED_QUERY: Bangalore or Mysore photos
+        PLAN: [query_category == scenary] && [answer_needed == false] && [mime type == photos] && [[location == Bangalore], [location == Mysore]]
+        current_query=screenshots containing payment failed
+        RESOLVED_QUERY: screenshots containing payment failed
+        PLAN: [query_category == scenary] && [answer_needed == false] && [mime type == photos] && [semantic == screenshot] && [keyword == {payment} && {failed}]
         current_query=Ravi passport number; known_people_lookup_only=Ravi|Ramani
         RESOLVED_QUERY: Ravi passport number
         PLAN: [query_category == doc] && [answer_needed == true] && [semantic == passport identity document] && [keyword == {Ravi} && {passport}]
-        current_query=Ramani photos without me; self_person_lookup_only=Ravi; known_people_lookup_only=Ravi|Ramani
-        RESOLVED_QUERY: Ramani photos without Ravi
-        PLAN: [query_category == scenary] && [answer_needed == false] && [[person == Ramani] && [mime type == photos]] - [person == Ravi]
-        previous_query=Ravi passport number; current_query=when does it expire
-        RESOLVED_QUERY: when does Ravi passport expire
-        PLAN: [query_category == doc] && [answer_needed == true] && [semantic == passport identity document] && [keyword == {Ravi} && {passport}]
     """.trimIndent()
 
-    /** V2 is the default for tests and fresh installs; Settings can safely select retained V1. */
-    fun plannerSystemInstruction(): String = plannerSystemInstruction(QueryPlannerProtocol.V2)
+    /** AST is active by default; typed JSON remains an explicit experimental rollback switch. */
+    fun plannerSystemInstruction(): String = plannerSystemInstruction(QueryPlannerProtocol.V1)
 
     fun plannerSystemInstruction(context: Context): String =
         plannerSystemInstruction(QueryPlannerProtocolPreferences.selected(context))
@@ -352,16 +365,12 @@ object QueryPlannerRuntime {
         previousTurn: PreviousQueryTurn?,
         knownPersonLabels: List<String>,
         selfPersonLabel: String?,
-        invalidOutput: String,
         error: Throwable,
         repairAttempt: Int,
     ): String {
         val safeError = error.message.orEmpty()
             .replace(Regex("[\\r\\n]+"), " ")
             .take(MAX_REPAIR_ERROR_CHARS)
-        val safeOutput = invalidOutput
-            .replace(Regex("[\\r\\n]+"), " ")
-            .take(MAX_OUTPUT_CHARS)
         val context = previousTurn?.let {
             "previous_query=${cleanQuery(it.query)}\nprevious_answer=${cleanPriorAnswer(it.answer)}"
         } ?: "previous_query=none\nprevious_answer=none"
@@ -374,9 +383,8 @@ object QueryPlannerRuntime {
             original_query=${cleanQuery(query)}
             $context
             validator_error=$safeError
-            invalid_expression=$safeOutput
-            Do not copy the invalid expression. Re-plan from the original query. Return exactly two lines: RESOLVED_QUERY: <standalone query> then PLAN: <balanced expression>.
-            PLAN must contain exactly one query_category, exactly one answer_needed, and at least one retrieval predicate. Use only query_category, answer_needed, person, people_only, mime type, location, time, from_date, to_date, semantic, and keyword. Every predicate is [field == value] with one field per bracket; operators go only between complete predicates. Do not emit ocr. Convert relative/calendar date windows from current_date into ISO from_date and to_date; never put relative date words in time. known_people_lookup_only and self_person_lookup_only are vocabulary only: without an explicit person name or self-reference, emit no person. Correct spelling, preserve complete user intent, and use subtraction for every exclusion.
+            The rejected expression is omitted so it cannot anchor this repair. Re-plan from original_query and return exactly two lines: RESOLVED_QUERY then PLAN.
+            Build every applicable slot before writing the AST: MEDIA | INCLUDED PEOPLE/SELF | PEOPLE_ONLY | EXCLUDED PERSON | LOCATION OR TRAVEL | DATE/DAYPART | SORT | POSITIVE CONTENT | EXCLUDED CONTENT. Preserve every constraint. Put exactly one query_category and answer_needed in the top-level && envelope. Use only person, people_only, mime type, location, travel, time, from_date, to_date, semantic, and keyword retrieval fields. Every predicate is [field == value]. Keep a visual scene as one compound semantic phrase. Visual me/my uses the supplied self label. Every named gallery face uses its exact known label. Generic media words require mime type but are not semantic content. Convert dates to ISO ranges. Use a balanced subtraction group for exclusions and a comma group for alternatives. Do not emit ocr or prose.
         """.trimIndent()
     }
 

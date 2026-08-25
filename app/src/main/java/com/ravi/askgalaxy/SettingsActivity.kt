@@ -174,7 +174,7 @@ class SettingsActivity : Activity() {
             setPadding(0, 6, 0, 4)
         }, wrap())
         root.addView(Switch(this).apply {
-            text = "Use QP V2 typed planner"
+            text = "Use experimental typed JSON planner"
             textSize = 15f
             setTextColor(Color.rgb(32, 34, 42))
             isChecked = QueryPlannerProtocolPreferences.selected(this@SettingsActivity) ==
@@ -185,13 +185,13 @@ class SettingsActivity : Activity() {
                 QueryPlannerRuntime.preloadAsync(this@SettingsActivity)
                 Toast.makeText(
                     this@SettingsActivity,
-                    if (enabled) "QP V2 enabled" else "QP V1 restored",
+                    if (enabled) "Typed JSON planner enabled" else "AST planner restored",
                     Toast.LENGTH_SHORT,
                 ).show()
             }
         }, wrap())
         root.addView(TextView(this).apply {
-            text = "V2 emits fixed-shape typed JSON with face and literal references. Turn this off to restore the retained V1 planner without changing indexes or models."
+            text = "AST is the default E2B query-plan format. The typed JSON trial remains available only as an explicit rollback experiment; changing this does not touch indexes or models."
             textSize = 13f
             setTextColor(Color.rgb(72, 75, 85))
             setPadding(0, 0, 0, 12)
@@ -224,7 +224,7 @@ class SettingsActivity : Activity() {
             }
         }, wrap())
         root.addView(TextView(this).apply {
-            text = "When off, E2B still plans every query. Search highlights the fused Top 8, then repeats them inside the full Top 24 below for comparison."
+            text = "When off, E2B still plans every query. Search curates 8 intent-aware standouts from the fused Top 100, then shows all ranked results below."
             textSize = 13f
             setTextColor(Color.rgb(72, 75, 85))
             setPadding(0, 0, 0, 12)
