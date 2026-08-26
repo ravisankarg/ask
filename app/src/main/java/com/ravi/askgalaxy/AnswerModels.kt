@@ -111,12 +111,12 @@ internal object CrossEngineFusionPolicy {
     )
 }
 
-enum class StandoutIntent {
-    SCENERY,
-    PEOPLE,
-    DOCUMENT,
-    LOCATION,
-    TIME,
+enum class StandoutIntent(val displayLabel: String) {
+    SCENERY("Visual / event"),
+    PEOPLE("Person"),
+    DOCUMENT("Document"),
+    LOCATION("Location"),
+    TIME("Time"),
 }
 
 /** Validated QP intent carried into presentation; the UI never guesses it from result text. */

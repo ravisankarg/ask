@@ -1493,31 +1493,13 @@ class MainActivity : Activity() {
         clearStandoutResults()
         if (standouts.isEmpty()) return
         standoutThumbnailLoader = StandoutThumbnailLoader(generation)
-        featuredResultCount.text = when (profile.primary) {
-            StandoutIntent.SCENERY -> "${standouts.size} standout moments"
-            StandoutIntent.PEOPLE -> "${standouts.size} standout people moments"
-            StandoutIntent.DOCUMENT -> "${standouts.size} strongest records"
-            StandoutIntent.LOCATION -> "${standouts.size} standout place moments"
-            StandoutIntent.TIME -> "${standouts.size} standout moments in time"
-        }
-        featuredResultSubtitle.text = when (profile.primary) {
-            StandoutIntent.SCENERY -> "Strong visual matches across different moments, settings and dates"
-            StandoutIntent.PEOPLE -> "Identity-matched moments across occasions, companions, places and dates"
-            StandoutIntent.DOCUMENT -> "Strong text matches across distinct records, sources and useful dates"
-            StandoutIntent.LOCATION -> "Representative coverage of the requested place across moments and dates"
-            StandoutIntent.TIME -> "Representative coverage of the requested period across places and moments"
-        }
+        featuredResultCount.text = "Top results • ${profile.primary.displayLabel}"
         featuredResultCount.visibility = View.VISIBLE
-        featuredResultSubtitle.visibility = View.VISIBLE
+        featuredResultSubtitle.visibility = View.GONE
         featuredResultShowcase.visibility = View.VISIBLE
 
-        featuredResultShowcase.addView(
-            createStandoutCard(standouts.first(), generation, imageHeightDp = 210, hero = true),
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-                .apply { bottomMargin = dp(8) },
-        )
-        addStandoutRow(standouts.drop(1).take(3), generation, imageHeightDp = 112)
-        addStandoutRow(standouts.drop(4).take(4), generation, imageHeightDp = 82)
+        addStandoutRow(standouts.take(4), generation, imageHeightDp = 92)
+        addStandoutRow(standouts.drop(4).take(4), generation, imageHeightDp = 92)
     }
 
     private fun addStandoutRow(
@@ -1532,7 +1514,7 @@ class MainActivity : Activity() {
         }
         standouts.forEachIndexed { index, standout ->
             row.addView(
-                createStandoutCard(standout, generation, imageHeightDp, hero = false),
+                createStandoutCard(standout, generation, imageHeightDp),
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                     if (index > 0) leftMargin = dp(5)
                 },
@@ -1549,19 +1531,20 @@ class MainActivity : Activity() {
         standout: StandoutSearchResult,
         generation: Long,
         imageHeightDp: Int,
-        hero: Boolean,
     ): View {
-        val badgeText = buildString {
-            append(standout.badge)
-            if (standout.relatedCount > 0) append(" • +${standout.relatedCount} nearby")
+        val reasonText = standout.badge
+        val detailText = buildString {
+            if (standout.relatedCount > 0) append("+${standout.relatedCount} nearby")
+            val resultDetail = standoutDetail(standout.result)
+            if (isNotEmpty() && resultDetail.isNotEmpty()) append(" • ")
+            append(resultDetail)
         }
         val badge = TextView(this).apply {
-            text = badgeText
-            textSize = if (hero) 12f else 10f
+            text = reasonText
+            textSize = 10f
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.rgb(52, 68, 157))
-            maxLines = 1
-            ellipsize = android.text.TextUtils.TruncateAt.END
+            minLines = 2
             setPadding(dp(7), dp(5), dp(7), dp(4))
         }
         val preview: View = when (val result = standout.result) {
@@ -1569,17 +1552,16 @@ class MainActivity : Activity() {
                 scaleType = ImageView.ScaleType.CENTER_CROP
                 setBackgroundColor(Color.rgb(224, 226, 233))
                 tag = result.media.mediaStoreId
-                contentDescription = badgeText
+                contentDescription = reasonText
                 standoutThumbnailLoader?.request(result.media, this, generation)
             }
             is HybridSearchResult.Document -> TextView(this).apply {
                 val chunk = result.match.chunk
                 val excerpt = chunk.text.replace(Regex("\\s+"), " ").trim()
-                text = "${documentIcon(chunk.source)}\n${chunk.title.take(if (hero) 72 else 28)}\n" +
-                    excerpt.take(if (hero) 180 else 64)
+                text = "${documentIcon(chunk.source)}\n${chunk.title.take(28)}\n" + excerpt.take(64)
                 gravity = Gravity.CENTER
-                textSize = if (hero) 15f else 10f
-                maxLines = if (hero) 7 else 5
+                textSize = 10f
+                maxLines = 5
                 ellipsize = android.text.TextUtils.TruncateAt.END
                 setTextColor(Color.rgb(45, 50, 72))
                 setPadding(dp(9), dp(7), dp(9), dp(7))
@@ -1587,10 +1569,10 @@ class MainActivity : Activity() {
             }
         }
         val detail = TextView(this).apply {
-            text = standoutDetail(standout.result)
-            textSize = if (hero) 13f else 10f
+            text = detailText
+            textSize = 10f
             setTextColor(Color.rgb(55, 58, 70))
-            maxLines = if (hero) 2 else 2
+            maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(7), dp(6), dp(7), dp(7))
         }
@@ -1598,14 +1580,14 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(4), dp(3), dp(4), dp(4))
             background = roundedBackground(
-                color = if (hero) Color.rgb(244, 246, 255) else Color.rgb(248, 249, 252),
-                radius = dp(if (hero) 20 else 15).toFloat(),
-                strokeColor = if (hero) Color.rgb(197, 204, 239) else Color.rgb(229, 231, 239),
+                color = Color.rgb(248, 249, 252),
+                radius = dp(15).toFloat(),
+                strokeColor = Color.rgb(229, 231, 239),
             )
             addView(badge, matchWrap())
             addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(imageHeightDp)))
             addView(detail, matchWrap())
-            contentDescription = "$badgeText. ${detail.text}"
+            contentDescription = "$reasonText. ${detail.text}"
             setOnClickListener {
                 when (val result = standout.result) {
                     is HybridSearchResult.Gallery -> showGalleryPopup(result.media)

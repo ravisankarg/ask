@@ -120,6 +120,15 @@ class AnswerFeatureAndFusionPolicyTest {
     }
 
     @Test
+    fun standout_intents_have_clear_user_facing_query_type_labels() {
+        assertEquals("Visual / event", StandoutIntent.SCENERY.displayLabel)
+        assertEquals("Person", StandoutIntent.PEOPLE.displayLabel)
+        assertEquals("Document", StandoutIntent.DOCUMENT.displayLabel)
+        assertEquals("Location", StandoutIntent.LOCATION.displayLabel)
+        assertEquals("Time", StandoutIntent.TIME.displayLabel)
+    }
+
+    @Test
     fun fusion_drops_non_personal_files_before_document_score_normalization() {
         val machineFile = document(
             index = 1,
